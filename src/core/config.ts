@@ -45,11 +45,15 @@ type ConfigPatch = Partial<{
   mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>> }>;
 }>;
 
+export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
+
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
 export const DEFAULT_CONFIG: OrchestratorConfig = {
   roles: {
-    planner: { provider: "fable", model: "fable", thinking: "xhigh" },
-    coder: { provider: "openai", model: "gpt-5.5", thinking: "xhigh" },
-    judge: { provider: "fable", model: "fable", thinking: "xhigh" },
+    planner: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    coder: { provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
+    judge: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
   },
   loop: {
     maxCoderIterations: 3,
@@ -64,7 +68,9 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   mcp: {
     providers: {
       fable: {
-        baseUrl: "https://api.fable.co/v1",
+        // Intentionally invalid until the user supplies the real Fable endpoint in config.
+        // The exact Fable API URL must be verified during Milestone 2.
+        baseUrl: UNCONFIGURED_FABLE_BASE_URL,
         api: "anthropic-messages",
         apiKey: "$FABLE_API_KEY",
       },
@@ -84,9 +90,9 @@ export function loadConfig(cwd: string): OrchestratorConfig {
   const merged = deepMerge(
     deepMerge(cloneConfig(DEFAULT_CONFIG), readJsonIfPresent(userPath)),
     readJsonIfPresent(projectPath),
-  ) as OrchestratorConfig;
+  );
 
-  return interpolateMcpApiKeys(merged);
+  return validateConfig(interpolateMcpApiKeys(validateConfig(merged)));
 }
 
 export function loopConfigFrom(config: OrchestratorConfig): {
@@ -118,18 +124,83 @@ function interpolateMcpApiKeys(config: OrchestratorConfig): OrchestratorConfig {
   const next = cloneConfig(config);
   for (const provider of Object.values(next.mcp.providers)) {
     if (typeof provider.apiKey === "string") {
-      provider.apiKey = interpolateEnvVar(provider.apiKey);
+      const interpolated = interpolateEnvVar(provider.apiKey);
+      if (interpolated === undefined) {
+        delete provider.apiKey;
+      } else {
+        provider.apiKey = interpolated;
+      }
     }
   }
   return next;
 }
 
-function interpolateEnvVar(value: string): string {
+function interpolateEnvVar(value: string): string | undefined {
   const match = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (!match) {
     return value;
   }
-  return process.env[match[1]] ?? "";
+  return process.env[match[1]];
+}
+
+function validateConfig(value: unknown): OrchestratorConfig {
+  const config = requirePlainObject(value, "config");
+  const roles = requirePlainObject(config.roles, "roles");
+  const loop = requirePlainObject(config.loop, "loop");
+  const approval = requirePlainObject(config.approval, "approval");
+  const judge = requirePlainObject(config.judge, "judge");
+  const mcp = requirePlainObject(config.mcp, "mcp");
+  const providers = requirePlainObject(mcp.providers, "mcp.providers");
+
+  for (const roleName of ["planner", "coder", "judge"] as const) {
+    const role = requirePlainObject(roles[roleName], `roles.${roleName}`);
+    requireNonEmptyString(role.provider, `roles.${roleName}.provider`);
+    requireNonEmptyString(role.model, `roles.${roleName}.model`);
+    if (!THINKING_LEVELS.includes(role.thinking as ThinkingLevel)) {
+      throw new Error(`roles.${roleName}.thinking must be one of ${THINKING_LEVELS.join(", ")}`);
+    }
+  }
+
+  requirePositiveInteger(loop.maxCoderIterations, "loop.maxCoderIterations");
+  requirePositiveInteger(loop.plannerEscalationAfterRejections, "loop.plannerEscalationAfterRejections");
+  requireBoolean(approval.requirePlanApproval, "approval.requirePlanApproval");
+  requireBoolean(judge.runTests, "judge.runTests");
+
+  for (const [providerName, providerValue] of Object.entries(providers)) {
+    const provider = requirePlainObject(providerValue, `mcp.providers.${providerName}`);
+    requireNonEmptyString(provider.baseUrl, `mcp.providers.${providerName}.baseUrl`);
+    requireNonEmptyString(provider.api, `mcp.providers.${providerName}.api`);
+    if (provider.apiKey !== undefined && typeof provider.apiKey !== "string") {
+      throw new Error(`mcp.providers.${providerName}.apiKey must be a string when provided`);
+    }
+  }
+
+  return config as unknown as OrchestratorConfig;
+}
+
+function requirePlainObject(value: unknown, path: string): Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    throw new Error(`${path} must be an object`);
+  }
+  return value;
+}
+
+function requireNonEmptyString(value: unknown, path: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+function requirePositiveInteger(value: unknown, path: string): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new Error(`${path} must be a positive integer`);
+  }
+}
+
+function requireBoolean(value: unknown, path: string): void {
+  if (typeof value !== "boolean") {
+    throw new Error(`${path} must be a boolean`);
+  }
 }
 
 function deepMerge<T>(base: T, patch: unknown): T {

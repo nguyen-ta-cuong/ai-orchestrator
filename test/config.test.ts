@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG, loadConfig, loopConfigFrom } from "../src/core/config.js";
+import { DEFAULT_CONFIG, UNCONFIGURED_FABLE_BASE_URL, loadConfig, loopConfigFrom } from "../src/core/config.js";
 
 const tempDirs: string[] = [];
 
@@ -92,7 +92,7 @@ describe("loadConfig", () => {
     expect(config.mcp.providers.custom.baseUrl).toBe("$CUSTOM_BASE_URL");
   });
 
-  it("returns an empty string for missing apiKey environment variables", () => {
+  it("omits missing apiKey environment variables instead of silently using an empty string", () => {
     const home = makeTempDir();
     const project = makeTempDir();
     vi.stubEnv("HOME", home);
@@ -102,7 +102,28 @@ describe("loadConfig", () => {
       mcp: { providers: { custom: { baseUrl: "https://example.test", api: "openai-responses", apiKey: "$MISSING_API_KEY" } } },
     });
 
-    expect(loadConfig(project).mcp.providers.custom.apiKey).toBe("");
+    expect(loadConfig(project).mcp.providers.custom.apiKey).toBeUndefined();
+  });
+
+  it("uses an intentionally invalid placeholder until the Fable MCP endpoint is configured", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    expect(loadConfig(project).mcp.providers.fable.baseUrl).toBe(UNCONFIGURED_FABLE_BASE_URL);
+  });
+
+  it("rejects invalid config values with precise paths", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      roles: { planner: { thinking: "maximum" } },
+      loop: { maxCoderIterations: "3" },
+    });
+
+    expect(() => loadConfig(project)).toThrow("roles.planner.thinking must be one of");
   });
 
   it("maps shared config to loop config", () => {

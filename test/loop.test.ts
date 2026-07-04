@@ -116,6 +116,27 @@ describe("nextPhase", () => {
     expect(failed.judgeReports.at(-1)?.reasons).toBe("still broken");
   });
 
+  it("prioritizes the total iteration cap over planner escalation", () => {
+    const stateAtThirdJudging: OrchestratorState = {
+      phase: "judging",
+      task: "add a feature",
+      plan: "plan",
+      coderIterations: 3,
+      consecutiveRejections: 1,
+      judgeReports: [{ verdict: "reject", reasons: "previous" }],
+      yolo: false,
+    };
+
+    const failed = nextPhase(
+      stateAtThirdJudging,
+      { type: "verdict", verdict: "reject", reasons: "still broken" },
+      config,
+    );
+
+    expect(failed.phase).toBe("failed");
+    expect(failed.consecutiveRejections).toBe(2);
+  });
+
   it("skips awaiting approval when yolo is enabled", () => {
     const next = nextPhase(
       planningState({ yolo: true }),
@@ -149,8 +170,12 @@ describe("nextPhase", () => {
     expect(coding.plan).toBe("revised plan");
   });
 
-  it("cancels back to idle", () => {
-    const idle = nextPhase(approvePlan(), { type: "cancelled" }, config);
+  it("cancels back to idle while preserving the original model for restoration", () => {
+    const idle = nextPhase(
+      approvePlan(planningState({ originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" } })),
+      { type: "cancelled" },
+      config,
+    );
 
     expect(idle).toMatchObject({
       phase: "idle",
@@ -159,6 +184,7 @@ describe("nextPhase", () => {
       consecutiveRejections: 0,
       yolo: false,
       judgeReports: [],
+      originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" },
     });
   });
 });

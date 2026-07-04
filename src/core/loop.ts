@@ -75,7 +75,9 @@ export function nextPhase(
   validateLoopConfig(config);
 
   if (event.type === "cancelled") {
-    return createIdleState();
+    return createIdleState({
+      originalModel: state.originalModel ? { ...state.originalModel } : undefined,
+    });
   }
 
   const next = cloneState(state);
@@ -150,7 +152,14 @@ export function nextPhase(
       next.phase = "coding";
       return next;
     }
+
+    default:
+      return assertNever(event);
   }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled loop event: ${JSON.stringify(value)}`);
 }
 
 function cloneState(state: OrchestratorState): OrchestratorState {
