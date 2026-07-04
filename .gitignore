@@ -1,0 +1,8 @@
+# ExecPlans are local working documents — never commit
+plans/
+
+node_modules/
+dist/
+*.tsbuildinfo
+.pi-loop.json.lock
+.DS_Store
