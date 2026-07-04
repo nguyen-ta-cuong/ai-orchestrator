@@ -1,0 +1,41 @@
+{
+  "name": "ai-orchestrator",
+  "version": "0.1.0",
+  "description": "Plan-code-judge AI orchestration for Pi and Cursor.",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nguyen-ta-cuong/ai-orchestrator.git"
+  },
+  "keywords": [
+    "pi-package",
+    "mcp",
+    "cursor"
+  ],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/nguyen-ta-cuong/ai-orchestrator/issues"
+  },
+  "homepage": "https://github.com/nguyen-ta-cuong/ai-orchestrator#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-ai": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
