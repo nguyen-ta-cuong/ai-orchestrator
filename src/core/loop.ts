@@ -1,3 +1,5 @@
+import type { ThinkingLevel } from "./config.js";
+
 export type Phase =
   | "idle"
   | "planning"
@@ -19,7 +21,7 @@ export interface JudgeReport {
 export interface OriginalModelState {
   provider: string;
   id: string;
-  thinking: string;
+  thinking: ThinkingLevel;
 }
 
 export interface OrchestratorState {
@@ -40,6 +42,7 @@ export interface LoopConfig {
 }
 
 export type LoopEvent =
+  | { type: "start"; task: string; yolo: boolean }
   | { type: "plan_produced"; plan?: string }
   | { type: "plan_approved" }
   | { type: "plan_rejected_by_user" }
@@ -73,6 +76,13 @@ export function nextPhase(
   config: LoopConfig = DEFAULT_LOOP_CONFIG,
 ): OrchestratorState {
   validateLoopConfig(config);
+
+  if (event.type === "start") {
+    if (state.phase !== "idle" && state.phase !== "done" && state.phase !== "failed") {
+      return cloneState(state);
+    }
+    return createIdleState({ phase: "planning", task: event.task, yolo: event.yolo });
+  }
 
   if (event.type === "cancelled") {
     return createIdleState({

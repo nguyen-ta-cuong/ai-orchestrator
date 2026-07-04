@@ -1,10 +1,10 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { DEFAULT_CONFIG, loadConfig, loopConfigFrom, type OrchestratorConfig, type RoleConfig, type ThinkingLevel } from "../src/core/config.js";
+import { DEFAULT_CONFIG, loadConfig, loopConfigFrom, type OrchestratorConfig, type RoleConfig } from "../src/core/config.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
-import { createIdleState, nextPhase, type JudgeReport, type OrchestratorState, type Verdict } from "../src/core/loop.js";
+import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
 
 const STATE_TYPE = "ai-orchestrator";
 const STATUS_KEY = "ai-orchestrator";
@@ -166,6 +166,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
 
     const parsed = parseCommandArgs(args);
+    if (parsed.warning) {
+      notifyUser(ctx, parsed.warning, "warning");
+    }
     if (!parsed.task) {
       notifyUser(ctx, "Usage: /orchestrate [--yolo] <task>", "error");
       return;
@@ -190,15 +193,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
     const yolo = parsed.yolo || pi.getFlag("orchestrate-yolo") === true;
     const currentThinking = pi.getThinkingLevel();
-    state = createRuntimeState({
+    state = {
+      ...(nextPhase(createIdleState(), { type: "start", task: parsed.task, yolo }, loopConfigFrom(config)) as RuntimeState),
       runId: createRunId(),
-      phase: "planning",
-      task: parsed.task,
-      yolo,
       originalModel: ctx.model
         ? { provider: String(ctx.model.provider), id: String(ctx.model.id), thinking: currentThinking }
         : undefined,
-    });
+    };
     persist();
 
     const ok = await switchToRole("planner", ctx);
@@ -227,7 +228,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
     const wasReplanning = state.phase === "replanning";
     state = {
-      ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig(ctx)) as RuntimeState),
+      ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig()) as RuntimeState),
       judgeReminderSent: false,
       plannerReminderSent: false,
       latestJudgeFeedback: wasReplanning ? undefined : state.latestJudgeFeedback,
@@ -264,7 +265,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     if (!isSameApprovalRun(approvalRunId)) return;
 
     if (choice === "Approve and code") {
-      state = nextPhase(state, { type: "plan_approved" }, loopConfig(ctx)) as RuntimeState;
+      state = nextPhase(state, { type: "plan_approved" }, loopConfig()) as RuntimeState;
       persist();
       if (state.phase === "coding") {
         await enterCoding(ctx);
@@ -280,7 +281,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      state = nextPhase(state, { type: "plan_rejected_by_user" }, loopConfig(ctx)) as RuntimeState;
+      state = nextPhase(state, { type: "plan_rejected_by_user" }, loopConfig()) as RuntimeState;
       persist();
       if (state.phase !== "planning") return;
       const ok = await switchToRole("planner", ctx);
@@ -308,7 +309,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function handleCodeProduced(ctx: ExtensionContext): Promise<void> {
-    state = nextPhase(state, { type: "code_produced" }, loopConfig(ctx)) as RuntimeState;
+    state = nextPhase(state, { type: "code_produced" }, loopConfig()) as RuntimeState;
     state.judgeReminderSent = false;
     state.pendingVerdict = undefined;
     persist();
@@ -321,7 +322,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     runtime = runtime ?? { config: loadPiConfig(ctx.cwd) };
     state = { ...state, toolsBeforeJudge: pi.getActiveTools() };
     persist();
-    pi.setActiveTools(uniqueToolNames(JUDGE_TOOLS));
+    pi.setActiveTools(JUDGE_TOOLS);
     updateUi(ctx);
 
     const command = runtime.config.judge.runTests ? detectTestCommand(ctx.cwd) : undefined;
@@ -342,8 +343,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
       state.pendingVerdict = {
         verdict: "reject",
-        reasons: "Judge failed to return a structured verdict after a reminder.",
-        requiredFixes: "Run the judge review again and return a judge_verdict tool call.",
+        reasons: "The judge did not produce a structured verdict; treat this attempt as unverified.",
+        requiredFixes: "Re-verify the implementation against the plan, re-run the project's tests, and fix any failures.",
       };
     }
 
@@ -361,7 +362,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         reasons: verdict.reasons,
         requiredFixes: verdict.requiredFixes,
       },
-      loopConfig(ctx),
+      loopConfig(),
     ) as RuntimeState;
     state.pendingVerdict = undefined;
     state.judgeReminderSent = false;
@@ -438,7 +439,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         ctx.abort();
       }
       restoreToolsAfterJudge();
-      state = nextPhase(stoppedState, { type: "cancelled" }, loopConfigFrom(runtime?.config ?? DEFAULT_CONFIG)) as RuntimeState;
+      state = nextPhase(stoppedState, { type: "cancelled" }, loopConfig()) as RuntimeState;
       state.runId = undefined;
       persist();
 
@@ -491,7 +492,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: API key is unavailable.`, "warning");
       }
     }
-    pi.setThinkingLevel(original.thinking as ThinkingLevel);
+    pi.setThinkingLevel(original.thinking);
   }
 
   function restoreToolsAfterJudge(): void {
@@ -519,7 +520,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     pi.appendEntry(STATE_TYPE, state);
   }
 
-  function loopConfig(ctx: ExtensionContext) {
+  function loopConfig() {
     return loopConfigFrom(runtime?.config ?? DEFAULT_CONFIG);
   }
 
@@ -578,10 +579,23 @@ function createRunId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function parseCommandArgs(args: string): { yolo: boolean; task: string } {
+function parseCommandArgs(args: string): { yolo: boolean; task: string; warning?: string } {
   const parts = args.trim().split(/\s+/).filter(Boolean);
-  const yolo = parts[0] === "--yolo";
-  return { yolo, task: (yolo ? parts.slice(1) : parts).join(" ").trim() };
+  let index = 0;
+  let yolo = false;
+  while (parts[index] === "--yolo") {
+    yolo = true;
+    index += 1;
+  }
+
+  const taskParts = parts.slice(index);
+  return {
+    yolo,
+    task: taskParts.join(" ").trim(),
+    warning: taskParts.includes("--yolo")
+      ? "Ignoring non-leading --yolo token in task text. Put --yolo before the task to skip plan approval."
+      : undefined,
+  };
 }
 
 function findMissingRole(ctx: ExtensionContext, config: OrchestratorConfig): string | undefined {
@@ -595,8 +609,8 @@ function findMissingRole(ctx: ExtensionContext, config: OrchestratorConfig): str
 }
 
 function latestPersistedState(ctx: ExtensionContext): RuntimeState | undefined {
-  const entries = ctx.sessionManager.getEntries() as Array<{ type: string; customType?: string; data?: unknown }>;
-  const entry = entries.filter((item) => item.type === "custom" && item.customType === STATE_TYPE).pop();
+  const branch = ctx.sessionManager.getBranch() as Array<{ type: string; customType?: string; data?: unknown }>;
+  const entry = branch.filter((item) => item.type === "custom" && item.customType === STATE_TYPE).pop();
   return isRuntimeState(entry?.data) ? entry.data : undefined;
 }
 
@@ -607,8 +621,12 @@ function isRuntimeState(value: unknown): value is RuntimeState {
 }
 
 function extractLastAssistantText(messages: unknown[]): string {
-  const message = findLastAssistant(messages);
-  return message ? extractText(message.content) : "";
+  for (const message of [...messages].reverse()) {
+    if (!isRecord(message) || message.role !== "assistant") continue;
+    const text = extractText(message.content);
+    if (text.trim().length > 0) return text;
+  }
+  return "";
 }
 
 function lastAssistantStopReason(messages: unknown[]): string | undefined {
@@ -674,10 +692,6 @@ function phaseRole(phase: OrchestratorState["phase"]): keyof OrchestratorConfig[
   if (phase === "coding") return "coder";
   if (phase === "judging") return "judge";
   return undefined;
-}
-
-function uniqueToolNames(names: string[]): string[] {
-  return [...new Set(names)];
 }
 
 function truncate(value: string, max: number): string {

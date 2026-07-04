@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type LoopConfig, type OrchestratorState, nextPhase } from "../src/core/loop.js";
+import { createIdleState, type LoopConfig, type OrchestratorState, nextPhase } from "../src/core/loop.js";
 
 const config: LoopConfig = {
   maxCoderIterations: 3,
@@ -30,6 +30,44 @@ function completeCoding(state: OrchestratorState): OrchestratorState {
 }
 
 describe("nextPhase", () => {
+  it("starts a run from idle/done/failed and ignores start mid-run", () => {
+    const startEvent = { type: "start" as const, task: "ship it", yolo: true };
+    const expectedStarted = {
+      phase: "planning",
+      task: "ship it",
+      coderIterations: 0,
+      consecutiveRejections: 0,
+      judgeReports: [],
+      yolo: true,
+    };
+
+    const dirtyIdle = createIdleState({
+      plan: "old plan",
+      coderIterations: 2,
+      consecutiveRejections: 1,
+      judgeReports: [{ verdict: "reject", reasons: "old" }],
+      originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" },
+    });
+    expect(nextPhase(dirtyIdle, startEvent, config)).toEqual(expectedStarted);
+
+    const doneState: OrchestratorState = {
+      ...dirtyIdle,
+      phase: "done",
+      task: "old task",
+    };
+    expect(nextPhase(doneState, startEvent, config)).toEqual(expectedStarted);
+
+    const failedState: OrchestratorState = {
+      ...dirtyIdle,
+      phase: "failed",
+      task: "old task",
+    };
+    expect(nextPhase(failedState, startEvent, config)).toEqual(expectedStarted);
+
+    const midRun = approvePlan();
+    expect(nextPhase(midRun, { type: "start", task: "new task", yolo: false }, config)).toEqual(midRun);
+  });
+
   it("moves from approved first attempt to done", () => {
     const judging = completeCoding(approvePlan());
     const done = nextPhase(judging, { type: "verdict", verdict: "approve", reasons: "looks good" }, config);

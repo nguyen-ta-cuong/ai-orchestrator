@@ -107,7 +107,7 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Orches
     sanitizeConfigPatch(projectConfig, options),
   );
 
-  return validateConfig(interpolateMcpApiKeys(validateConfig(merged)));
+  return interpolateMcpApiKeys(validateConfig(merged));
 }
 
 export function loopConfigFrom(config: OrchestratorConfig): {
