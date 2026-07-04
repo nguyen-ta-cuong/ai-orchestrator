@@ -101,7 +101,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     let latest = latestPersistedState(ctx);
     if (!latest) {
-      deactivateJudgeVerdictTool();
+      if (isActiveRunPhase(state.phase) || isRestorePending(state)) {
+        if (isRestorePending(state)) {
+          await restorePendingSessionState(ctx, state);
+        } else {
+          deactivateJudgeVerdictTool();
+        }
+        state = createRuntimeState();
+        runtime = undefined;
+        persist();
+        notifyUser(ctx, "Previous ai-orchestrator run belonged to another session; original model restored and state reset.", "warning");
+      } else {
+        deactivateJudgeVerdictTool();
+      }
       updateUi(ctx);
       return;
     }
