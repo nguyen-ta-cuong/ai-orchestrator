@@ -85,6 +85,7 @@ declare module "@earendil-works/pi-coding-agent" {
       handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void;
     }): void;
     on(event: "session_start", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "session_shutdown", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "agent_end", handler: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<{ block: boolean; reason: string } | void> | { block: boolean; reason: string } | void): void;
     getThinkingLevel(): ThinkingLevel;

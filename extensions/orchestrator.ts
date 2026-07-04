@@ -133,6 +133,24 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     updateUi(ctx);
   });
 
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (!isActiveRunPhase(state.phase) && !isRestorePending(state)) {
+      deactivateJudgeVerdictTool();
+      clearUi(ctx);
+      return;
+    }
+
+    if (isRestorePending(state)) {
+      await restorePendingSessionState(ctx, state);
+    } else {
+      deactivateJudgeVerdictTool();
+    }
+    clearUi(ctx);
+    state = createRuntimeState();
+    runtime = undefined;
+    persist();
+  });
+
   pi.on("tool_call", async (event) => {
     if (state.phase === "judging" && MUTATION_TOOLS.has(event.toolName)) {
       return { block: true, reason: "ai-orchestrator judge phase is read-only; edit/write are blocked." };
