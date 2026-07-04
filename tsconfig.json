@@ -15,6 +15,6 @@
     "sourceMap": true,
     "types": ["node", "vitest"]
   },
-  "include": ["src", "mcp", "extensions"],
+  "include": ["src", "mcp", "extensions", "types"],
   "exclude": ["node_modules", "dist"]
 }
