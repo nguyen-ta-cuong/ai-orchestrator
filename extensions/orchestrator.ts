@@ -99,17 +99,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    const latest = latestPersistedState(ctx);
+    let latest = latestPersistedState(ctx);
     if (!latest) {
       deactivateJudgeVerdictTool();
       updateUi(ctx);
       return;
     }
 
-    if (latest.phase !== "idle" && latest.phase !== "done" && latest.phase !== "failed") {
-      state = latest;
-      restoreToolsAfterJudge();
-      await restoreOriginalModel(ctx, latest);
+    if (isRestorePending(latest)) {
+      latest = await restorePendingSessionState(ctx, latest);
+    }
+
+    if (isActiveRunPhase(latest.phase)) {
       state = createRuntimeState();
       persist();
       notifyUser(ctx, "Previous ai-orchestrator run was interrupted; state reset.", "warning");
@@ -495,6 +496,15 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     pi.setThinkingLevel(original.thinking);
   }
 
+  async function restorePendingSessionState(ctx: ExtensionContext, persistedState: RuntimeState): Promise<RuntimeState> {
+    state = persistedState;
+    restoreToolsAfterJudge();
+    await restoreOriginalModel(ctx, persistedState);
+    state = { ...state, originalModel: undefined, toolsBeforeJudge: undefined };
+    persist();
+    return state;
+  }
+
   function restoreToolsAfterJudge(): void {
     if (state.toolsBeforeJudge) {
       pi.setActiveTools(state.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
@@ -636,6 +646,10 @@ function lastAssistantStopReason(messages: unknown[]): string | undefined {
 
 function isActiveRunPhase(phase: OrchestratorState["phase"]): boolean {
   return phase !== "idle" && phase !== "done" && phase !== "failed";
+}
+
+function isRestorePending(state: RuntimeState): boolean {
+  return Boolean(state.originalModel || state.toolsBeforeJudge);
 }
 
 function findLastAssistant(messages: unknown[]): Record<string, unknown> | undefined {
