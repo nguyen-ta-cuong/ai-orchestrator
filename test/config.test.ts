@@ -147,6 +147,17 @@ describe("loadConfig", () => {
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
   });
 
+  it("rejects non-object config roots with the config file path", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+    const projectConfigPath = join(project, ".ai-orchestrator.json");
+
+    writeJson(projectConfigPath, null);
+
+    expect(() => loadConfig(project)).toThrow(`Failed to read orchestrator config at ${projectConfigPath}: config root must be a JSON object`);
+  });
+
   it("rejects invalid config values with precise paths", () => {
     const home = makeTempDir();
     const project = makeTempDir();

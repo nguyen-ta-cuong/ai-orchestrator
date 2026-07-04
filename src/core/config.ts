@@ -128,7 +128,11 @@ function readJsonIfPresent(path: string): ConfigPatch {
   }
 
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as ConfigPatch;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isPlainObject(parsed)) {
+      throw new Error("config root must be a JSON object");
+    }
+    return parsed as ConfigPatch;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read orchestrator config at ${path}: ${message}`);
