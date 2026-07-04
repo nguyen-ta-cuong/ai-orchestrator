@@ -170,6 +170,27 @@ describe("nextPhase", () => {
     expect(coding.plan).toBe("revised plan");
   });
 
+  it("ignores phase-specific events received in the wrong phase", () => {
+    const awaitingApproval = nextPhase(planningState(), { type: "plan_produced", plan: "initial" }, config);
+    expect(nextPhase(awaitingApproval, { type: "plan_produced", plan: "late plan" }, config)).toEqual(awaitingApproval);
+    expect(nextPhase(awaitingApproval, { type: "code_produced" }, config)).toEqual(awaitingApproval);
+    expect(nextPhase(awaitingApproval, { type: "verdict", verdict: "approve", reasons: "late" }, config)).toEqual(
+      awaitingApproval,
+    );
+
+    const judging = completeCoding(approvePlan());
+    expect(nextPhase(judging, { type: "plan_approved" }, config)).toEqual(judging);
+  });
+
+  it("validates loop config", () => {
+    expect(() => nextPhase(planningState(), { type: "plan_produced", plan: "x" }, { ...config, maxCoderIterations: 0 })).toThrow(
+      "loop.maxCoderIterations must be a positive integer",
+    );
+    expect(() =>
+      nextPhase(planningState(), { type: "plan_produced", plan: "x" }, { ...config, plannerEscalationAfterRejections: 0 }),
+    ).toThrow("loop.plannerEscalationAfterRejections must be a positive integer");
+  });
+
   it("cancels back to idle while preserving the original model for restoration", () => {
     const idle = nextPhase(
       approvePlan(planningState({ originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" } })),

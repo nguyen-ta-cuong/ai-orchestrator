@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { loadConfig, loopConfigFrom, type OrchestratorConfig, type RoleConfig, type ThinkingLevel } from "../src/core/config.js";
+import { DEFAULT_CONFIG, loadConfig, loopConfigFrom, type OrchestratorConfig, type RoleConfig, type ThinkingLevel } from "../src/core/config.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type JudgeReport, type OrchestratorState, type Verdict } from "../src/core/loop.js";
@@ -19,19 +19,22 @@ interface JudgeVerdictParams {
 }
 
 interface RuntimeState extends OrchestratorState {
+  runId?: string;
   pendingVerdict?: JudgeVerdictParams;
   judgeReminderSent?: boolean;
+  plannerReminderSent?: boolean;
   latestJudgeFeedback?: string;
+  toolsBeforeJudge?: string[];
 }
 
 interface RuntimeConfig {
   config: OrchestratorConfig;
-  toolsBeforeJudge?: string[];
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
   let state: RuntimeState = createRuntimeState();
   let runtime: RuntimeConfig | undefined;
+  let stopping = false;
 
   pi.registerFlag("orchestrate-yolo", {
     description: "Skip the plan approval gate for /orchestrate runs",
@@ -104,7 +107,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
 
     if (latest.phase !== "idle" && latest.phase !== "done" && latest.phase !== "failed") {
-      state = { ...latest, phase: "idle" };
+      state = latest;
+      restoreToolsAfterJudge();
       await restoreOriginalModel(ctx, latest);
       state = createRuntimeState();
       persist();
@@ -167,7 +171,14 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    const config = loadConfig(ctx.cwd);
+    let config: OrchestratorConfig;
+    try {
+      config = loadPiConfig(ctx.cwd);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      notifyUser(ctx, `Invalid ai-orchestrator config: ${message}`, "error");
+      return;
+    }
     runtime = { config };
 
     const missingRole = findMissingRole(ctx, config);
@@ -180,6 +191,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const yolo = parsed.yolo || pi.getFlag("orchestrate-yolo") === true;
     const currentThinking = pi.getThinkingLevel();
     state = createRuntimeState({
+      runId: createRunId(),
       phase: "planning",
       task: parsed.task,
       yolo,
@@ -199,7 +211,17 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
   async function handlePlanProduced(ctx: ExtensionContext, planText: string): Promise<void> {
     if (!planText.trim()) {
-      await stopRun(ctx, "ai-orchestrator stopped because the planner did not produce a plan.");
+      if (!state.plannerReminderSent) {
+        state = { ...state, plannerReminderSent: true };
+        persist();
+        pi.sendUserMessage(
+          "You must finish the planning phase by writing a concrete implementation plan. Do not edit files yet.",
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
+
+      await stopRun(ctx, "ai-orchestrator stopped because the planner did not produce a plan after a reminder.");
       return;
     }
 
@@ -207,6 +229,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     state = {
       ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig(ctx)) as RuntimeState),
       judgeReminderSent: false,
+      plannerReminderSent: false,
+      latestJudgeFeedback: wasReplanning ? undefined : state.latestJudgeFeedback,
     };
     persist();
     updateUi(ctx);
@@ -222,10 +246,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function requestPlanApproval(ctx: ExtensionContext, wasReplanning: boolean): Promise<void> {
+    const approvalRunId = state.runId;
+
     if (!ctx.hasUI) {
-      state = nextPhase(state, { type: "plan_approved" }, loopConfig(ctx)) as RuntimeState;
-      persist();
-      await enterCoding(ctx);
+      await stopRun(
+        ctx,
+        "ai-orchestrator stopped: plan approval is required in non-interactive mode. Re-run with --yolo to skip approval explicitly.",
+      );
       return;
     }
 
@@ -234,16 +261,20 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       "Revise plan (give feedback)",
       "Cancel",
     ]);
+    if (!isSameApprovalRun(approvalRunId)) return;
 
     if (choice === "Approve and code") {
       state = nextPhase(state, { type: "plan_approved" }, loopConfig(ctx)) as RuntimeState;
       persist();
-      await enterCoding(ctx);
+      if (state.phase === "coding") {
+        await enterCoding(ctx);
+      }
       return;
     }
 
     if (choice === "Revise plan (give feedback)") {
       const feedback = await ctx.ui.editor("What should the planner revise?", "");
+      if (!isSameApprovalRun(approvalRunId)) return;
       if (!feedback?.trim()) {
         await stopRun(ctx, "ai-orchestrator cancelled during plan revision.");
         return;
@@ -251,6 +282,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
       state = nextPhase(state, { type: "plan_rejected_by_user" }, loopConfig(ctx)) as RuntimeState;
       persist();
+      if (state.phase !== "planning") return;
       const ok = await switchToRole("planner", ctx);
       if (!ok) return;
       updateUi(ctx);
@@ -265,6 +297,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function enterCoding(ctx: ExtensionContext): Promise<void> {
+    if (state.phase !== "coding") return;
+
     restoreToolsAfterJudge();
     const ok = await switchToRole("coder", ctx);
     if (!ok) return;
@@ -284,7 +318,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const ok = await switchToRole("judge", ctx);
     if (!ok) return;
 
-    runtime = { ...(runtime ?? { config: loadConfig(ctx.cwd) }), toolsBeforeJudge: pi.getActiveTools() };
+    runtime = runtime ?? { config: loadPiConfig(ctx.cwd) };
+    state = { ...state, toolsBeforeJudge: pi.getActiveTools() };
+    persist();
     pi.setActiveTools(uniqueToolNames(JUDGE_TOOLS));
     updateUi(ctx);
 
@@ -393,21 +429,33 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function stopRun(ctx: ExtensionContext, message: string): Promise<void> {
-    if (!ctx.isIdle()) {
-      ctx.abort();
+    if (stopping) return;
+    stopping = true;
+
+    const stoppedState = state;
+    try {
+      if (!ctx.isIdle()) {
+        ctx.abort();
+      }
+      restoreToolsAfterJudge();
+      state = nextPhase(stoppedState, { type: "cancelled" }, loopConfigFrom(runtime?.config ?? DEFAULT_CONFIG)) as RuntimeState;
+      state.runId = undefined;
+      persist();
+
+      await restoreOriginalModel(ctx, stoppedState);
+      clearUi(ctx);
+      pi.sendMessage({ customType: STATE_TYPE, content: message, display: true, details: stoppedState }, { triggerTurn: false });
+      state = createRuntimeState();
+      runtime = undefined;
+      persist();
+      deactivateJudgeVerdictTool();
+    } finally {
+      stopping = false;
     }
-    restoreToolsAfterJudge();
-    await restoreOriginalModel(ctx, state);
-    clearUi(ctx);
-    pi.sendMessage({ customType: STATE_TYPE, content: message, display: true, details: state }, { triggerTurn: false });
-    state = createRuntimeState();
-    runtime = undefined;
-    persist();
-    deactivateJudgeVerdictTool();
   }
 
   async function switchToRole(role: keyof OrchestratorConfig["roles"], ctx: ExtensionContext): Promise<boolean> {
-    const config = runtime?.config ?? loadConfig(ctx.cwd);
+    const config = runtime?.config ?? loadPiConfig(ctx.cwd);
     const roleConfig = config.roles[role];
     const model = ctx.modelRegistry.find(roleConfig.provider, roleConfig.model);
     if (!model) {
@@ -447,9 +495,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   function restoreToolsAfterJudge(): void {
-    if (runtime?.toolsBeforeJudge) {
-      pi.setActiveTools(runtime.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
-      runtime.toolsBeforeJudge = undefined;
+    if (state.toolsBeforeJudge) {
+      pi.setActiveTools(state.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
+      state = { ...state, toolsBeforeJudge: undefined };
+      persist();
     } else {
       deactivateJudgeVerdictTool();
     }
@@ -462,12 +511,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
   }
 
+  function isSameApprovalRun(runId: string | undefined): boolean {
+    return state.phase === "awaiting_approval" && state.runId === runId;
+  }
+
   function persist(): void {
     pi.appendEntry(STATE_TYPE, state);
   }
 
   function loopConfig(ctx: ExtensionContext) {
-    return loopConfigFrom(runtime?.config ?? loadConfig(ctx.cwd));
+    return loopConfigFrom(runtime?.config ?? DEFAULT_CONFIG);
   }
 
   function updateUi(ctx: ExtensionContext): void {
@@ -515,6 +568,14 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
 function createRuntimeState(overrides: Partial<RuntimeState> = {}): RuntimeState {
   return { ...(createIdleState(overrides) as RuntimeState), ...overrides };
+}
+
+function loadPiConfig(cwd: string): OrchestratorConfig {
+  return loadConfig(cwd, { ignoreMcpProviders: true });
+}
+
+function createRunId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function parseCommandArgs(args: string): { yolo: boolean; task: string } {

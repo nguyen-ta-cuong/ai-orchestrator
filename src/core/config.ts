@@ -87,13 +87,24 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
 };
 
-export function loadConfig(cwd: string): OrchestratorConfig {
+export interface LoadConfigOptions {
+  /**
+   * Pi resolves models and credentials through its own registry and ignores mcp.providers.
+   * Use this when loading config for the pi extension so partial MCP config intended for
+   * the future MCP surface cannot block /orchestrate.
+   */
+  ignoreMcpProviders?: boolean;
+}
+
+export function loadConfig(cwd: string, options: LoadConfigOptions = {}): OrchestratorConfig {
   const userPath = join(homedir(), ".ai-orchestrator", "config.json");
   const projectPath = join(cwd, ".ai-orchestrator.json");
 
+  const userConfig = readJsonIfPresent(userPath);
+  const projectConfig = readJsonIfPresent(projectPath);
   const merged = deepMerge(
-    deepMerge(cloneConfig(DEFAULT_CONFIG), readJsonIfPresent(userPath)),
-    readJsonIfPresent(projectPath),
+    deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options)),
+    sanitizeConfigPatch(projectConfig, options),
   );
 
   return validateConfig(interpolateMcpApiKeys(validateConfig(merged)));
@@ -207,6 +218,14 @@ function requireBoolean(value: unknown, path: string): void {
   }
 }
 
+function sanitizeConfigPatch(patch: ConfigPatch, options: LoadConfigOptions): ConfigPatch {
+  if (!options.ignoreMcpProviders || patch.mcp === undefined) {
+    return patch;
+  }
+  const { mcp: _ignoredMcp, ...rest } = patch;
+  return rest;
+}
+
 function deepMerge<T>(base: T, patch: unknown): T {
   if (!isPlainObject(base) || !isPlainObject(patch)) {
     return (patch === undefined ? base : patch) as T;
@@ -214,10 +233,17 @@ function deepMerge<T>(base: T, patch: unknown): T {
 
   const result: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(patch)) {
+    if (isUnsafeConfigKey(key)) {
+      continue;
+    }
     const existing = result[key];
     result[key] = isPlainObject(existing) && isPlainObject(value) ? deepMerge(existing, value) : value;
   }
   return result as T;
+}
+
+function isUnsafeConfigKey(key: string): boolean {
+  return key === "__proto__" || key === "constructor" || key === "prototype";
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

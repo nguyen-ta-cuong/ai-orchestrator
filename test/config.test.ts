@@ -115,6 +115,38 @@ describe("loadConfig", () => {
     expect(loadConfig(project).mcp.providers.fable.baseUrl).toBe(UNCONFIGURED_FABLE_BASE_URL);
   });
 
+  it("can ignore mcp provider overrides for the pi surface", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      roles: { planner: { model: "project-planner" } },
+      mcp: { providers: { custom: { apiKey: "$CUSTOM_API_KEY" } } },
+    });
+
+    expect(() => loadConfig(project)).toThrow("mcp.providers.custom.baseUrl must be a non-empty string");
+    const piConfig = loadConfig(project, { ignoreMcpProviders: true });
+    expect(piConfig.roles.planner.model).toBe("project-planner");
+    expect(piConfig.mcp.providers.custom).toBeUndefined();
+  });
+
+  it("does not merge prototype-pollution keys from config files", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeFileSync(
+      join(project, ".ai-orchestrator.json"),
+      '{"__proto__":{"polluted":true},"constructor":{"polluted":true},"roles":{"planner":{"model":"safe"}}}\n',
+    );
+
+    const config = loadConfig(project);
+    expect(config.roles.planner.model).toBe("safe");
+    expect((config as unknown as { polluted?: boolean }).polluted).toBeUndefined();
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+  });
+
   it("rejects invalid config values with precise paths", () => {
     const home = makeTempDir();
     const project = makeTempDir();
