@@ -45,11 +45,15 @@ type ConfigPatch = Partial<{
   mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>> }>;
 }>;
 
+export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
+
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
 export const DEFAULT_CONFIG: OrchestratorConfig = {
   roles: {
-    planner: { provider: "fable", model: "fable", thinking: "xhigh" },
-    coder: { provider: "openai", model: "gpt-5.5", thinking: "xhigh" },
-    judge: { provider: "fable", model: "fable", thinking: "xhigh" },
+    planner: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    coder: { provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
+    judge: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
   },
   loop: {
     maxCoderIterations: 3,
@@ -63,8 +67,14 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   mcp: {
     providers: {
+      anthropic: {
+        baseUrl: "https://api.anthropic.com/v1",
+        api: "anthropic-messages",
+        apiKey: "$ANTHROPIC_API_KEY",
+      },
       fable: {
-        baseUrl: "https://api.fable.co/v1",
+        // Intentionally invalid until the user supplies a dedicated Fable endpoint in config.
+        baseUrl: UNCONFIGURED_FABLE_BASE_URL,
         api: "anthropic-messages",
         apiKey: "$FABLE_API_KEY",
       },
@@ -77,16 +87,27 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
 };
 
-export function loadConfig(cwd: string): OrchestratorConfig {
+export interface LoadConfigOptions {
+  /**
+   * Pi resolves models and credentials through its own registry and ignores mcp.providers.
+   * Use this when loading config for the pi extension so partial MCP config intended for
+   * the future MCP surface cannot block /orchestrate.
+   */
+  ignoreMcpProviders?: boolean;
+}
+
+export function loadConfig(cwd: string, options: LoadConfigOptions = {}): OrchestratorConfig {
   const userPath = join(homedir(), ".ai-orchestrator", "config.json");
   const projectPath = join(cwd, ".ai-orchestrator.json");
 
+  const userConfig = readJsonIfPresent(userPath);
+  const projectConfig = readJsonIfPresent(projectPath);
   const merged = deepMerge(
-    deepMerge(cloneConfig(DEFAULT_CONFIG), readJsonIfPresent(userPath)),
-    readJsonIfPresent(projectPath),
-  ) as OrchestratorConfig;
+    deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options)),
+    sanitizeConfigPatch(projectConfig, options),
+  );
 
-  return interpolateMcpApiKeys(merged);
+  return interpolateMcpApiKeys(validateConfig(merged));
 }
 
 export function loopConfigFrom(config: OrchestratorConfig): {
@@ -107,7 +128,11 @@ function readJsonIfPresent(path: string): ConfigPatch {
   }
 
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as ConfigPatch;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isPlainObject(parsed)) {
+      throw new Error("config root must be a JSON object");
+    }
+    return parsed as ConfigPatch;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read orchestrator config at ${path}: ${message}`);
@@ -118,18 +143,91 @@ function interpolateMcpApiKeys(config: OrchestratorConfig): OrchestratorConfig {
   const next = cloneConfig(config);
   for (const provider of Object.values(next.mcp.providers)) {
     if (typeof provider.apiKey === "string") {
-      provider.apiKey = interpolateEnvVar(provider.apiKey);
+      const interpolated = interpolateEnvVar(provider.apiKey);
+      if (interpolated === undefined) {
+        delete provider.apiKey;
+      } else {
+        provider.apiKey = interpolated;
+      }
     }
   }
   return next;
 }
 
-function interpolateEnvVar(value: string): string {
+function interpolateEnvVar(value: string): string | undefined {
   const match = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (!match) {
     return value;
   }
-  return process.env[match[1]] ?? "";
+  return process.env[match[1]];
+}
+
+function validateConfig(value: unknown): OrchestratorConfig {
+  const config = requirePlainObject(value, "config");
+  const roles = requirePlainObject(config.roles, "roles");
+  const loop = requirePlainObject(config.loop, "loop");
+  const approval = requirePlainObject(config.approval, "approval");
+  const judge = requirePlainObject(config.judge, "judge");
+  const mcp = requirePlainObject(config.mcp, "mcp");
+  const providers = requirePlainObject(mcp.providers, "mcp.providers");
+
+  for (const roleName of ["planner", "coder", "judge"] as const) {
+    const role = requirePlainObject(roles[roleName], `roles.${roleName}`);
+    requireNonEmptyString(role.provider, `roles.${roleName}.provider`);
+    requireNonEmptyString(role.model, `roles.${roleName}.model`);
+    if (!THINKING_LEVELS.includes(role.thinking as ThinkingLevel)) {
+      throw new Error(`roles.${roleName}.thinking must be one of ${THINKING_LEVELS.join(", ")}`);
+    }
+  }
+
+  requirePositiveInteger(loop.maxCoderIterations, "loop.maxCoderIterations");
+  requirePositiveInteger(loop.plannerEscalationAfterRejections, "loop.plannerEscalationAfterRejections");
+  requireBoolean(approval.requirePlanApproval, "approval.requirePlanApproval");
+  requireBoolean(judge.runTests, "judge.runTests");
+
+  for (const [providerName, providerValue] of Object.entries(providers)) {
+    const provider = requirePlainObject(providerValue, `mcp.providers.${providerName}`);
+    requireNonEmptyString(provider.baseUrl, `mcp.providers.${providerName}.baseUrl`);
+    requireNonEmptyString(provider.api, `mcp.providers.${providerName}.api`);
+    if (provider.apiKey !== undefined && typeof provider.apiKey !== "string") {
+      throw new Error(`mcp.providers.${providerName}.apiKey must be a string when provided`);
+    }
+  }
+
+  return config as unknown as OrchestratorConfig;
+}
+
+function requirePlainObject(value: unknown, path: string): Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    throw new Error(`${path} must be an object`);
+  }
+  return value;
+}
+
+function requireNonEmptyString(value: unknown, path: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+function requirePositiveInteger(value: unknown, path: string): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new Error(`${path} must be a positive integer`);
+  }
+}
+
+function requireBoolean(value: unknown, path: string): void {
+  if (typeof value !== "boolean") {
+    throw new Error(`${path} must be a boolean`);
+  }
+}
+
+function sanitizeConfigPatch(patch: ConfigPatch, options: LoadConfigOptions): ConfigPatch {
+  if (!options.ignoreMcpProviders || patch.mcp === undefined) {
+    return patch;
+  }
+  const { mcp: _ignoredMcp, ...rest } = patch;
+  return rest;
 }
 
 function deepMerge<T>(base: T, patch: unknown): T {
@@ -139,10 +237,17 @@ function deepMerge<T>(base: T, patch: unknown): T {
 
   const result: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(patch)) {
+    if (isUnsafeConfigKey(key)) {
+      continue;
+    }
     const existing = result[key];
     result[key] = isPlainObject(existing) && isPlainObject(value) ? deepMerge(existing, value) : value;
   }
   return result as T;
+}
+
+function isUnsafeConfigKey(key: string): boolean {
+  return key === "__proto__" || key === "constructor" || key === "prototype";
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

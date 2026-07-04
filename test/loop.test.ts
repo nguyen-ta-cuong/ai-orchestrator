@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type LoopConfig, type OrchestratorState, nextPhase } from "../src/core/loop.js";
+import { createIdleState, type LoopConfig, type OrchestratorState, nextPhase } from "../src/core/loop.js";
 
 const config: LoopConfig = {
   maxCoderIterations: 3,
@@ -30,6 +30,44 @@ function completeCoding(state: OrchestratorState): OrchestratorState {
 }
 
 describe("nextPhase", () => {
+  it("starts a run from idle/done/failed and ignores start mid-run", () => {
+    const startEvent = { type: "start" as const, task: "ship it", yolo: true };
+    const expectedStarted = {
+      phase: "planning",
+      task: "ship it",
+      coderIterations: 0,
+      consecutiveRejections: 0,
+      judgeReports: [],
+      yolo: true,
+    };
+
+    const dirtyIdle = createIdleState({
+      plan: "old plan",
+      coderIterations: 2,
+      consecutiveRejections: 1,
+      judgeReports: [{ verdict: "reject", reasons: "old" }],
+      originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" },
+    });
+    expect(nextPhase(dirtyIdle, startEvent, config)).toEqual(expectedStarted);
+
+    const doneState: OrchestratorState = {
+      ...dirtyIdle,
+      phase: "done",
+      task: "old task",
+    };
+    expect(nextPhase(doneState, startEvent, config)).toEqual(expectedStarted);
+
+    const failedState: OrchestratorState = {
+      ...dirtyIdle,
+      phase: "failed",
+      task: "old task",
+    };
+    expect(nextPhase(failedState, startEvent, config)).toEqual(expectedStarted);
+
+    const midRun = approvePlan();
+    expect(nextPhase(midRun, { type: "start", task: "new task", yolo: false }, config)).toEqual(midRun);
+  });
+
   it("moves from approved first attempt to done", () => {
     const judging = completeCoding(approvePlan());
     const done = nextPhase(judging, { type: "verdict", verdict: "approve", reasons: "looks good" }, config);
@@ -116,6 +154,27 @@ describe("nextPhase", () => {
     expect(failed.judgeReports.at(-1)?.reasons).toBe("still broken");
   });
 
+  it("prioritizes the total iteration cap over planner escalation", () => {
+    const stateAtThirdJudging: OrchestratorState = {
+      phase: "judging",
+      task: "add a feature",
+      plan: "plan",
+      coderIterations: 3,
+      consecutiveRejections: 1,
+      judgeReports: [{ verdict: "reject", reasons: "previous" }],
+      yolo: false,
+    };
+
+    const failed = nextPhase(
+      stateAtThirdJudging,
+      { type: "verdict", verdict: "reject", reasons: "still broken" },
+      config,
+    );
+
+    expect(failed.phase).toBe("failed");
+    expect(failed.consecutiveRejections).toBe(2);
+  });
+
   it("skips awaiting approval when yolo is enabled", () => {
     const next = nextPhase(
       planningState({ yolo: true }),
@@ -149,8 +208,33 @@ describe("nextPhase", () => {
     expect(coding.plan).toBe("revised plan");
   });
 
-  it("cancels back to idle", () => {
-    const idle = nextPhase(approvePlan(), { type: "cancelled" }, config);
+  it("ignores phase-specific events received in the wrong phase", () => {
+    const awaitingApproval = nextPhase(planningState(), { type: "plan_produced", plan: "initial" }, config);
+    expect(nextPhase(awaitingApproval, { type: "plan_produced", plan: "late plan" }, config)).toEqual(awaitingApproval);
+    expect(nextPhase(awaitingApproval, { type: "code_produced" }, config)).toEqual(awaitingApproval);
+    expect(nextPhase(awaitingApproval, { type: "verdict", verdict: "approve", reasons: "late" }, config)).toEqual(
+      awaitingApproval,
+    );
+
+    const judging = completeCoding(approvePlan());
+    expect(nextPhase(judging, { type: "plan_approved" }, config)).toEqual(judging);
+  });
+
+  it("validates loop config", () => {
+    expect(() => nextPhase(planningState(), { type: "plan_produced", plan: "x" }, { ...config, maxCoderIterations: 0 })).toThrow(
+      "loop.maxCoderIterations must be a positive integer",
+    );
+    expect(() =>
+      nextPhase(planningState(), { type: "plan_produced", plan: "x" }, { ...config, plannerEscalationAfterRejections: 0 }),
+    ).toThrow("loop.plannerEscalationAfterRejections must be a positive integer");
+  });
+
+  it("cancels back to idle while preserving the original model for restoration", () => {
+    const idle = nextPhase(
+      approvePlan(planningState({ originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" } })),
+      { type: "cancelled" },
+      config,
+    );
 
     expect(idle).toMatchObject({
       phase: "idle",
@@ -159,6 +243,7 @@ describe("nextPhase", () => {
       consecutiveRejections: 0,
       yolo: false,
       judgeReports: [],
+      originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" },
     });
   });
 });

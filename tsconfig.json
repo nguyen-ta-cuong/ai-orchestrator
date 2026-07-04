@@ -4,6 +4,8 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
@@ -13,6 +15,6 @@
     "sourceMap": true,
     "types": ["node", "vitest"]
   },
-  "include": ["src", "mcp", "extensions"],
+  "include": ["src", "mcp", "extensions", "types"],
   "exclude": ["node_modules", "dist"]
 }
