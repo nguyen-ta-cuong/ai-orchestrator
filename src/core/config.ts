@@ -67,9 +67,13 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   mcp: {
     providers: {
+      anthropic: {
+        baseUrl: "https://api.anthropic.com/v1",
+        api: "anthropic-messages",
+        apiKey: "$ANTHROPIC_API_KEY",
+      },
       fable: {
-        // Intentionally invalid until the user supplies the real Fable endpoint in config.
-        // The exact Fable API URL must be verified during Milestone 2.
+        // Intentionally invalid until the user supplies a dedicated Fable endpoint in config.
         baseUrl: UNCONFIGURED_FABLE_BASE_URL,
         api: "anthropic-messages",
         apiKey: "$FABLE_API_KEY",

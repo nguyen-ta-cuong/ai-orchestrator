@@ -68,6 +68,7 @@ describe("loadConfig", () => {
     const home = makeTempDir();
     const project = makeTempDir();
     vi.stubEnv("HOME", home);
+    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-secret");
     vi.stubEnv("FABLE_API_KEY", "fable-secret");
     vi.stubEnv("OPENAI_API_KEY", "openai-secret");
     vi.stubEnv("CUSTOM_API_KEY", "custom-secret");
@@ -86,6 +87,7 @@ describe("loadConfig", () => {
 
     const config = loadConfig(project);
 
+    expect(config.mcp.providers.anthropic.apiKey).toBe("anthropic-secret");
     expect(config.mcp.providers.fable.apiKey).toBe("fable-secret");
     expect(config.mcp.providers.openai.apiKey).toBe("openai-secret");
     expect(config.mcp.providers.custom.apiKey).toBe("custom-secret");
