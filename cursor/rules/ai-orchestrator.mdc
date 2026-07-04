@@ -1,0 +1,22 @@
+---
+description: Use the ai-orchestrator Plan → Code → Judge loop for non-trivial implementation tasks.
+alwaysApply: false
+---
+
+# AI Orchestrator Cursor Workflow
+
+For any non-trivial implementation task, follow this loop:
+
+1. Tell the user to select the coder model in Cursor's model picker before implementation (for example, GPT-5.5 with high reasoning). Cursor rules cannot switch models automatically.
+2. Call `orchestrator_plan` with the task and any repository context you have gathered.
+3. Show the returned plan to the user and wait for explicit approval before editing files.
+4. Implement the approved plan as the coder. Keep an `iteration` counter for **total coding passes completed** and a `consecutiveRejections` counter starting at 0. The first judge call uses `iteration: 1`; increment `iteration` before every later `orchestrator_judge` call after another coding pass, including after a re-plan. Never reset `iteration`.
+5. Run the project's relevant tests. Gather `git diff` and `git diff --staged` output yourself; the MCP server deliberately does not read the filesystem.
+6. Call `orchestrator_judge` with `{ task, plan, diff, testOutput, iteration, consecutiveRejections }`.
+7. Obey the returned `nextAction` exactly:
+   - `done`: summarize the approved result.
+   - `retry_coding`: increment `consecutiveRejections`, address every `requiredFixes` item, run tests, gather the new diff, increment `iteration`, and judge again.
+   - `replan`: call `orchestrator_plan` again with `previousPlan`, `judgeReports`, and `diffSummary` from the last judged diff; reset `consecutiveRejections` to 0, show the revised plan, wait for user approval, implement it, run tests, gather the new diff, increment `iteration`, and judge again.
+   - `stop_failed`: stop, report the final judge reasons and required fixes, and leave the working tree as-is for the user.
+
+Loop policy: maximum 3 total coder iterations; escalate to re-plan after 2 consecutive rejections. Never skip the approval gate unless the user explicitly asks for yolo/no-approval behavior.

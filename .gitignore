@@ -4,5 +4,6 @@ plans/
 node_modules/
 dist/
 *.tsbuildinfo
+.pi-loop.json
 .pi-loop.json.lock
 .DS_Store
