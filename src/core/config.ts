@@ -161,10 +161,13 @@ function interpolateMcpApiKeys(config: OrchestratorConfig): OrchestratorConfig {
 
 function interpolateEnvVar(value: string): string | undefined {
   const match = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
-  if (!match) {
-    return value;
+  if (match) {
+    return process.env[match[1]];
   }
-  return process.env[match[1]];
+  if (value.startsWith("$") || value.includes("${")) {
+    throw new Error(`Invalid mcp provider apiKey environment reference ${JSON.stringify(value)}; use exact "$ENV_VAR" syntax or a literal key without a leading "$"`);
+  }
+  return value;
 }
 
 function validateConfig(value: unknown): OrchestratorConfig {
@@ -192,7 +195,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
 
   for (const [providerName, providerValue] of Object.entries(providers)) {
     const provider = requirePlainObject(providerValue, `mcp.providers.${providerName}`);
-    requireNonEmptyString(provider.baseUrl, `mcp.providers.${providerName}.baseUrl`);
+    requireHttpsUrl(provider.baseUrl, `mcp.providers.${providerName}.baseUrl`);
     requireNonEmptyString(provider.api, `mcp.providers.${providerName}.api`);
     if (provider.apiKey !== undefined && typeof provider.apiKey !== "string") {
       throw new Error(`mcp.providers.${providerName}.apiKey must be a string when provided`);
@@ -212,6 +215,19 @@ function requirePlainObject(value: unknown, path: string): Record<string, unknow
 function requireNonEmptyString(value: unknown, path: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+function requireHttpsUrl(value: unknown, path: string): void {
+  requireNonEmptyString(value, path);
+  let url: URL;
+  try {
+    url = new URL(value as string);
+  } catch {
+    throw new Error(`${path} must be a valid HTTPS URL`);
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`${path} must use https:`);
   }
 }
 

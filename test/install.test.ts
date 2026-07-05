@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const tempDirs: string[] = [];
 const binPath = resolve("bin/ai-orchestrator.js");
-const snippetPath = resolve("cursor/mcp.json");
+const mcpBinPath = resolve("bin/ai-orchestrator-mcp.js");
+const staticSnippetPath = resolve("cursor/mcp.json");
+const packageJsonPath = resolve("package.json");
 
 function makeTempDir(): string {
   const dir = join(tmpdir(), `ai-orchestrator-install-${process.pid}-${Math.random().toString(36).slice(2)}`);
@@ -32,17 +34,19 @@ function runInstaller(cwd: string, ...args: string[]): string {
   return execFileSync(process.execPath, [binPath, "install-cursor", ...args], installerOptions(cwd));
 }
 
-function runInstallerFailure(cwd: string, ...args: string[]): { stderr: string; stdout: string } {
-  try {
-    runInstaller(cwd, ...args);
-  } catch (error) {
-    const execError = error as { stderr?: Buffer; stdout?: Buffer };
-    return {
-      stderr: execError.stderr?.toString() ?? "",
-      stdout: execError.stdout?.toString() ?? "",
-    };
-  }
-  throw new Error("Expected installer to fail");
+function expectedLocalSnippet(): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        "ai-orchestrator": {
+          command: process.execPath,
+          args: [mcpBinPath],
+        },
+      },
+    },
+    null,
+    2,
+  );
 }
 
 afterEach(() => {
@@ -58,7 +62,7 @@ describe("ai-orchestrator install-cursor", () => {
     const stdout = runInstaller(cwd);
 
     const mcpPath = join(cwd, ".cursor", "mcp.json");
-    expect(readFileSync(mcpPath, "utf8")).toBe(`${readFileSync(snippetPath, "utf8").trim()}\n`);
+    expect(readFileSync(mcpPath, "utf8")).toBe(`${expectedLocalSnippet()}\n`);
     expect(existsSync(join(cwd, ".cursor", "rules", "ai-orchestrator.mdc"))).toBe(true);
     expect(existsSync(join(cwd, ".cursor", "skills", "orchestrate", "SKILL.md"))).toBe(true);
     expect(stdout).toContain(`Wrote MCP config: ${mcpPath}`);
@@ -75,17 +79,52 @@ describe("ai-orchestrator install-cursor", () => {
 
     expect(readFileSync(mcpPath, "utf8")).toBe(existing);
     expect(stdout).toContain(`MCP config already exists at ${mcpPath}; it was not modified.`);
-    expect(stdout).toContain(readFileSync(snippetPath, "utf8").trim());
+    expect(stdout).toContain(expectedLocalSnippet());
   });
 
-  it("rejects --no-mcp until no-MCP fallback assets exist", () => {
+  it("supports --no-mcp by installing only the rule and skill", () => {
     const cwd = makeTempDir();
 
-    const failure = runInstallerFailure(cwd, "--no-mcp");
+    const stdout = runInstaller(cwd, "--no-mcp");
 
-    expect(existsSync(join(cwd, ".cursor"))).toBe(false);
-    expect(failure.stdout).toBe("");
-    expect(failure.stderr).toContain("install-cursor --no-mcp is not available yet");
-    expect(failure.stderr).toContain("Milestone 4");
+    expect(existsSync(join(cwd, ".cursor", "rules", "ai-orchestrator.mdc"))).toBe(true);
+    expect(existsSync(join(cwd, ".cursor", "skills", "orchestrate", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(cwd, ".cursor", "mcp.json"))).toBe(false);
+    expect(stdout).toContain("Skipped MCP config because --no-mcp was supplied");
+  });
+
+  it("installs into the HOME Cursor directory with --global", () => {
+    const cwd = makeTempDir();
+
+    const stdout = runInstaller(cwd, "--global", "--no-mcp");
+
+    const homeCursor = join(cwd, "home", ".cursor");
+    expect(existsSync(join(homeCursor, "rules", "ai-orchestrator.mdc"))).toBe(true);
+    expect(existsSync(join(homeCursor, "skills", "orchestrate", "SKILL.md"))).toBe(true);
+    expect(stdout).toContain(`Installed Cursor rule: ${join(homeCursor, "rules", "ai-orchestrator.mdc")}`);
+  });
+
+  it("does not overwrite customized existing rule and skill files", () => {
+    const cwd = makeTempDir();
+    const rulePath = join(cwd, ".cursor", "rules", "ai-orchestrator.mdc");
+    const skillPath = join(cwd, ".cursor", "skills", "orchestrate", "SKILL.md");
+    mkdirSync(join(cwd, ".cursor", "rules"), { recursive: true });
+    mkdirSync(join(cwd, ".cursor", "skills", "orchestrate"), { recursive: true });
+    writeFileSync(rulePath, "custom rule\n");
+    writeFileSync(skillPath, "custom skill\n");
+
+    const stdout = runInstaller(cwd, "--no-mcp");
+
+    expect(readFileSync(rulePath, "utf8")).toBe("custom rule\n");
+    expect(readFileSync(skillPath, "utf8")).toBe("custom skill\n");
+    expect(stdout).toContain("Skipped existing customized Cursor rule");
+    expect(stdout).toContain("Skipped existing customized Cursor skill");
+  });
+
+  it("keeps the static npx snippet pinned to the package version", () => {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version: string };
+    const snippet = readFileSync(staticSnippetPath, "utf8");
+
+    expect(snippet).toContain(`ai-orchestrator@${packageJson.version}`);
   });
 });

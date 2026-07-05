@@ -8,7 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: ai-orchestrator install-cursor [--global]\n\nInstalls Cursor rule, skill, and MCP assets for the Plan → Code → Judge workflow.\n`);
+  stream.write(`Usage: ai-orchestrator install-cursor [--no-mcp] [--global]\n\nInstalls Cursor rule, skill, and optionally MCP assets for the Plan → Code → Judge workflow.\n`);
   process.exit(exitCode);
 }
 
@@ -28,10 +28,6 @@ if (unknown) {
   process.stderr.write(`Unknown option: ${unknown}\n`);
   usage(1);
 }
-if (noMcp) {
-  process.stderr.write("install-cursor --no-mcp is not available yet; no-MCP Cursor fallback assets are planned for Milestone 4.\n");
-  process.exit(1);
-}
 
 const cursorDir = globalInstall ? join(homedir(), ".cursor") : join(process.cwd(), ".cursor");
 const rulesDir = join(cursorDir, "rules");
@@ -41,21 +37,37 @@ mkdirSync(dirname(skillsDir), { recursive: true });
 
 const ruleTarget = join(rulesDir, "ai-orchestrator.mdc");
 const skillTarget = join(skillsDir, "SKILL.md");
-copyIfAbsentOrIdentical(join(root, "cursor", "rules", "ai-orchestrator.mdc"), ruleTarget);
+reportCopy("Cursor rule", copyIfAbsentOrIdentical(join(root, "cursor", "rules", "ai-orchestrator.mdc"), ruleTarget), ruleTarget);
 mkdirSync(skillsDir, { recursive: true });
-copyIfAbsentOrIdentical(join(root, "skills", "orchestrate", "SKILL.md"), skillTarget);
+reportCopy("Cursor skill", copyIfAbsentOrIdentical(join(root, "skills", "orchestrate", "SKILL.md"), skillTarget), skillTarget);
 
-process.stdout.write(`Installed Cursor rule: ${ruleTarget}\n`);
-process.stdout.write(`Installed Cursor skill: ${skillsDir}\n`);
-
-const snippetPath = join(root, "cursor", "mcp.json");
-const snippet = readFileSync(snippetPath, "utf8").trim();
-const mcpPath = join(cursorDir, "mcp.json");
-if (existsSync(mcpPath)) {
-  process.stdout.write(`\nMCP config already exists at ${mcpPath}; it was not modified. Merge this snippet manually:\n\n${snippet}\n`);
+if (noMcp) {
+  process.stdout.write("Skipped MCP config because --no-mcp was supplied. Cursor will use the manual no-tool workflow from the installed skill.\n");
 } else {
-  writeFileSync(mcpPath, `${snippet}\n`);
-  process.stdout.write(`Wrote MCP config: ${mcpPath}\n`);
+  const snippet = localMcpSnippet();
+  const mcpPath = join(cursorDir, "mcp.json");
+  const portabilityNote = "Note: this local-package snippet uses machine-specific absolute paths. Do not commit it unchanged for teammates; use cursor/mcp.json as the portable pinned-npx example after publishing.\n";
+  if (existsSync(mcpPath)) {
+    process.stdout.write(`\nMCP config already exists at ${mcpPath}; it was not modified. Merge this local-package snippet manually:\n\n${snippet}\n${portabilityNote}`);
+  } else {
+    writeFileSync(mcpPath, `${snippet}\n`);
+    process.stdout.write(`Wrote MCP config: ${mcpPath}\n${portabilityNote}`);
+  }
+}
+
+function localMcpSnippet() {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        "ai-orchestrator": {
+          command: process.execPath,
+          args: [join(root, "bin", "ai-orchestrator-mcp.js")],
+        },
+      },
+    },
+    null,
+    2,
+  );
 }
 
 function copyIfAbsentOrIdentical(source, target) {
@@ -63,9 +75,20 @@ function copyIfAbsentOrIdentical(source, target) {
   if (existsSync(target)) {
     const existing = readFileSync(target, "utf8");
     if (existing !== content) {
-      process.stdout.write(`Skipped existing customized file (not overwritten): ${target}\n`);
-      return;
+      return "skipped";
     }
+    return "unchanged";
   }
   writeFileSync(target, content);
+  return "wrote";
+}
+
+function reportCopy(label, status, target) {
+  if (status === "skipped") {
+    process.stdout.write(`Skipped existing customized ${label} (not overwritten): ${target}\n`);
+  } else if (status === "unchanged") {
+    process.stdout.write(`${label} already up to date: ${target}\n`);
+  } else {
+    process.stdout.write(`Installed ${label}: ${target}\n`);
+  }
 }

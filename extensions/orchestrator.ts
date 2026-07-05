@@ -319,7 +319,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       if (!ok) return;
       updateUi(ctx);
       pi.sendUserMessage(
-        plannerPrompt(`${state.task}\n\nUser requested plan revision:\n${feedback.trim()}`),
+        plannerPrompt(state.task, undefined, feedback.trim()),
         { deliverAs: "followUp" },
       );
       return;

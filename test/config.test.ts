@@ -77,7 +77,7 @@ describe("loadConfig", () => {
       mcp: {
         providers: {
           custom: {
-            baseUrl: "$CUSTOM_BASE_URL",
+            baseUrl: "https://custom.example/v1",
             api: "openai-completions",
             apiKey: "$CUSTOM_API_KEY",
           },
@@ -91,7 +91,19 @@ describe("loadConfig", () => {
     expect(config.mcp.providers.fable.apiKey).toBe("fable-secret");
     expect(config.mcp.providers.openai.apiKey).toBe("openai-secret");
     expect(config.mcp.providers.custom.apiKey).toBe("custom-secret");
-    expect(config.mcp.providers.custom.baseUrl).toBe("$CUSTOM_BASE_URL");
+    expect(config.mcp.providers.custom.baseUrl).toBe("https://custom.example/v1");
+  });
+
+  it("rejects near-miss apiKey environment reference syntax instead of sending it as a literal key", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: { providers: { custom: { baseUrl: "https://example.test", api: "openai-responses", apiKey: "${CUSTOM_API_KEY}" } } },
+    });
+
+    expect(() => loadConfig(project)).toThrow(/Invalid mcp provider apiKey environment reference/);
   });
 
   it("omits missing apiKey environment variables instead of silently using an empty string", () => {
@@ -105,6 +117,30 @@ describe("loadConfig", () => {
     });
 
     expect(loadConfig(project).mcp.providers.custom.apiKey).toBeUndefined();
+  });
+
+  it("rejects non-HTTPS MCP provider base URLs", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: { providers: { custom: { baseUrl: "http://example.test/v1", api: "openai-responses", apiKey: "literal-key" } } },
+    });
+
+    expect(() => loadConfig(project)).toThrow("mcp.providers.custom.baseUrl must use https:");
+  });
+
+  it("rejects invalid MCP provider base URLs", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: { providers: { custom: { baseUrl: "not a url", api: "openai-responses", apiKey: "literal-key" } } },
+    });
+
+    expect(() => loadConfig(project)).toThrow("mcp.providers.custom.baseUrl must be a valid HTTPS URL");
   });
 
   it("uses an intentionally invalid placeholder until the Fable MCP endpoint is configured", () => {

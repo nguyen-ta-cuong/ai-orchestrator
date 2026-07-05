@@ -43,7 +43,7 @@ Core design rules:
 - **State machine phases**: `idle → planning → awaiting_approval → coding → judging → (coding | replanning | done | failed)`. State is JSON-serializable (`OrchestratorState` in the ExecPlan).
 - **Config precedence**: built-in defaults ← `~/.ai-orchestrator/config.json` ← `<project>/.ai-orchestrator.json`. `$ENV_VAR` interpolation for `mcp.providers.*.apiKey` only — never shell execution.
 - **Pi surface** resolves role models against the user's local pi model registry (`ctx.modelRegistry.find(provider, id)`); it ignores the `mcp.providers` config block. API keys/endpoints are pi's problem.
-- **MCP surface** calls planner/judge models itself via a minimal `fetch`-based client (`mcp/llm.ts`, `anthropic-messages` + `openai-responses`/`openai-completions`, ~150 lines max, no per-provider SDKs). It never touches the caller's filesystem: the Cursor agent supplies `diff` and `testOutput`.
+- **MCP surface** calls planner/judge models itself via a compact `fetch`-based client (`mcp/llm.ts`, `anthropic-messages` + `openai-responses`/`openai-completions`, no per-provider SDKs). It never touches the caller's filesystem: the Cursor agent supplies `diff` and `testOutput`.
 - **Judge verdicts are structured, never parsed from prose**: a `judge_verdict` tool on pi (with `terminate: true`), a JSON tool response on MCP.
 
 ## Folder structure
@@ -91,17 +91,17 @@ Follow the ExecPlan milestones strictly; each is independently verifiable. Updat
 1. **M1 — Core** (`src/core/*`, `test/loop.test.ts`, `test/config.test.ts`). Scaffold package, tsconfig, deps. Get `npm test` and `npx tsc --noEmit` green. Everything else depends on this.
 2. **M2 — Pi extension** (`extensions/orchestrator.ts`, `skills/orchestrate/SKILL.md`). Before writing code, read the pi docs at
    `~/.nvm/versions/node/v24.16.0/lib/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md` (fully), plus `examples/extensions/plan-mode/` and `examples/extensions/structured-output.ts` there. Validate manually per the ExecPlan transcript in a scratch repo, with roles pointed at a **cheap model** via project config. Verify the real default model ids against `pi --list-models` and record them in the ExecPlan Decision Log.
-3. **M3 — MCP server** (`mcp/*`, `bin/*`, `cursor/*`, `test/mcp.test.ts`). Consult `node_modules/@modelcontextprotocol/sdk/README.md` for the current registration API. Tests must run keyless via the `AI_ORCH_FAKE_LLM=1` stub.
-4. **M4 — No-MCP Cursor fallback**: extend `SKILL.md`, conditionalize the rule, `install-cursor --no-mcp` path. Confirm pi loads the skill with zero validation warnings.
+3. **M3 — MCP server** (`mcp/*`, `bin/*`, `cursor/*`, `test/mcp.test.ts`). Consult `node_modules/@modelcontextprotocol/sdk/README.md` for the current registration API. Tests must run without real credentials or network via the `AI_ORCH_FAKE_LLM=1` stub; test harnesses may inject dummy API-key environment variables so fake mode still exercises provider config validation.
+4. **M4 — No-MCP Cursor fallback**: extend `SKILL.md`, conditionalize the rule, `install-cursor --no-mcp` path. Confirm pi loads the skill with zero validation warnings. The fallback is now implemented in the shared skill/rule; remaining M4 work is manual validation.
 5. **M5 — Docs + packaging**: README, `npm pack --dry-run` includes `extensions/ skills/ dist/ bin/ cursor/` and excludes `plans/ test/`.
 
 ## Coding conventions
 
 - TypeScript, ESM (`"type": "module"`), `strict: true`. Node ≥ 20.
-- Runtime dependency: `@modelcontextprotocol/sdk` **only**. Dev: `typescript`, `vitest`, `@types/node`. Peer (`"*"`, provided by pi at runtime, never bundled): `@earendil-works/pi-coding-agent`, `typebox`, `@earendil-works/pi-ai`.
+- Runtime dependencies: `@modelcontextprotocol/sdk` and `zod`. Dev: `typescript`, `vitest`, `@types/node`. Peer (`"*"`, provided by pi at runtime, never bundled): `@earendil-works/pi-coding-agent`, `typebox`, `@earendil-works/pi-ai`.
 - In the pi extension: use `StringEnum` from `@earendil-works/pi-ai` for enum tool params (never `Type.Union` of literals — breaks Google API); guard dialogs with `ctx.hasUI`; throw from tool `execute` to signal errors; keep persisted state JSON-serializable via `pi.appendEntry("ai-orchestrator", state)`.
 - The pi extension is loaded uncompiled by pi (jiti); `tsc` exists for type-checking and for building `dist/mcp/` for the bins.
-- Tests: vitest, no network, no API keys. New loop behavior requires a loop test first.
+- Tests: vitest, no network, no real API keys (dummy keys are allowed to exercise validation). New loop behavior requires a loop test first.
 
 ## Invariants (do not break)
 

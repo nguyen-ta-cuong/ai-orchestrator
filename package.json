@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Plan-code-judge AI orchestration for Pi and Cursor.",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "main": "dist/src/index.js",
   "scripts": {
     "build": "tsc",
