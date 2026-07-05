@@ -55,7 +55,8 @@ const mcpPath = join(cursorDir, "mcp.json");
 if (existsSync(mcpPath)) {
   process.stdout.write(`\nMCP config already exists at ${mcpPath}; it was not modified. Merge this snippet manually:\n\n${snippet}\n`);
 } else {
-  process.stdout.write(`\nCreate ${mcpPath} with this MCP snippet, or merge it into an existing Cursor MCP config:\n\n${snippet}\n`);
+  writeFileSync(mcpPath, `${snippet}\n`);
+  process.stdout.write(`Wrote MCP config: ${mcpPath}\n`);
 }
 
 function copyIfAbsentOrIdentical(source, target) {
