@@ -9,7 +9,7 @@ import {
   readState,
   releaseRun,
   writeState,
-} from "../src/core/artifacts.js";
+} from "../src/lifecycle/artifacts.js";
 import { createIdleLifecycleState } from "../src/core/lifecycle.js";
 
 const tempDirs: string[] = [];

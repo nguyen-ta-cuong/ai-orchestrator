@@ -1,4 +1,3 @@
-export * from "./core/artifacts.js";
 export * from "./core/config.js";
 export * from "./core/lifecycle.js";
 export * from "./core/lifecyclePrompts.js";

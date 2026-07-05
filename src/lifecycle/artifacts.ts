@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "./lifecycle.js";
+import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
 
 export interface RunPaths {
   root: string;
