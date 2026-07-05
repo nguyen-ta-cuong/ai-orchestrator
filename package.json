@@ -6,8 +6,22 @@
   "main": "dist/src/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "vitest run --exclude=dist/**"
+    "test": "vitest run --exclude=dist/**",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
   },
+  "bin": {
+    "ai-orchestrator-mcp": "bin/ai-orchestrator-mcp.js",
+    "ai-orchestrator": "bin/ai-orchestrator.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "cursor",
+    "skills",
+    "extensions",
+    "src"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nguyen-ta-cuong/ai-orchestrator.git"
@@ -43,5 +57,9 @@
     "@types/node": "^26.1.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25 || ^4.0"
   }
 }

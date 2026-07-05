@@ -94,6 +94,11 @@ export interface LoadConfigOptions {
    * the future MCP surface cannot block /orchestrate.
    */
   ignoreMcpProviders?: boolean;
+  /**
+   * Project config is repository-controlled input. Use this on the MCP surface so a
+   * cloned repository cannot redirect provider endpoints and exfiltrate user env vars.
+   */
+  ignoreProjectMcpProviders?: boolean;
 }
 
 export function loadConfig(cwd: string, options: LoadConfigOptions = {}): OrchestratorConfig {
@@ -103,8 +108,8 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Orches
   const userConfig = readJsonIfPresent(userPath);
   const projectConfig = readJsonIfPresent(projectPath);
   const merged = deepMerge(
-    deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options)),
-    sanitizeConfigPatch(projectConfig, options),
+    deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders)),
+    sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders),
   );
 
   return interpolateMcpApiKeys(validateConfig(merged));
@@ -222,8 +227,8 @@ function requireBoolean(value: unknown, path: string): void {
   }
 }
 
-function sanitizeConfigPatch(patch: ConfigPatch, options: LoadConfigOptions): ConfigPatch {
-  if (!options.ignoreMcpProviders || patch.mcp === undefined) {
+function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): ConfigPatch {
+  if (!ignoreMcpProviders || patch.mcp === undefined) {
     return patch;
   }
   const { mcp: _ignoredMcp, ...rest } = patch;
