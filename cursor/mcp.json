@@ -2,7 +2,7 @@
   "mcpServers": {
     "ai-orchestrator": {
       "command": "npx",
-      "args": ["-y", "--package", "ai-orchestrator", "ai-orchestrator-mcp"]
+      "args": ["-y", "--package", "ai-orchestrator@0.1.0", "ai-orchestrator-mcp"]
     }
   }
 }

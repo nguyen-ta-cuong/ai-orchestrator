@@ -10,12 +10,9 @@ export interface CompletionRequest {
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+let fakeLlmWarningPrinted = false;
 
 export async function completeWithRole({ config, role, prompt, signal }: CompletionRequest): Promise<string> {
-  if (process.env.AI_ORCH_FAKE_LLM === "1") {
-    return fakeCompletion(role);
-  }
-
   const roleConfig = config.roles[role];
   const provider = config.mcp.providers[roleConfig.provider];
   if (!provider) {
@@ -25,6 +22,14 @@ export async function completeWithRole({ config, role, prompt, signal }: Complet
     throw new Error(`Missing API key for MCP provider ${roleConfig.provider}; set mcp.providers.${roleConfig.provider}.apiKey`);
   }
   const apiKey = provider.apiKey;
+
+  if (process.env.AI_ORCH_FAKE_LLM === "1") {
+    if (!fakeLlmWarningPrinted) {
+      console.error("[ai-orchestrator-mcp] AI_ORCH_FAKE_LLM=1 is active; returning fake planner/judge responses.");
+      fakeLlmWarningPrinted = true;
+    }
+    return fakeCompletion(role);
+  }
 
   const text = await (async () => {
     switch (provider.api) {
@@ -71,7 +76,7 @@ async function anthropicMessages(baseUrl: string, apiKey: string, role: RoleConf
     max_tokens: 8192,
     messages: [{ role: "user", content: prompt }],
     ...anthropicThinking(role.thinking),
-  }, signal);
+  }, signal, [apiKey]);
   const response = json as { content?: Array<{ type?: string; text?: string }>; stop_reason?: string };
   if (response.stop_reason === "max_tokens") {
     throw new Error("Anthropic response was truncated at max_tokens; increase token budget or reduce prompt size");
@@ -88,22 +93,26 @@ async function openaiResponses(baseUrl: string, apiKey: string, role: RoleConfig
     input: prompt,
     max_output_tokens: 8192,
     ...openaiResponsesReasoning(role.thinking),
-  }, signal);
+  }, signal, [apiKey]);
   const response = json as {
     output_text?: string;
     status?: string;
     incomplete_details?: unknown;
+    error?: unknown;
     output?: Array<{ content?: Array<{ text?: string; type?: string }> }>;
   };
   if (response.status === "incomplete") {
-    throw new Error(`OpenAI response was incomplete: ${JSON.stringify(response.incomplete_details ?? {})}`);
+    throw new Error(`OpenAI response was incomplete: ${redactSecrets(JSON.stringify(response.incomplete_details ?? {}), [apiKey])}`);
+  }
+  if (response.status === "failed") {
+    throw new Error(`OpenAI response failed: ${redactSecrets(JSON.stringify(response.error ?? {}), [apiKey])}`);
   }
   if (typeof response.output_text === "string") {
     return response.output_text.trim();
   }
   return (response.output ?? [])
     .flatMap((item) => item.content ?? [])
-    .map((part) => part.text ?? "")
+    .map((part) => (part.type === "output_text" ? part.text ?? "" : ""))
     .join("\n")
     .trim();
 }
@@ -117,7 +126,7 @@ async function openaiCompletions(baseUrl: string, apiKey: string, role: RoleConf
     model: role.model,
     messages: [{ role: "user", content: prompt }],
     ...(reasoning.reasoning_effort ? { max_completion_tokens: 8192, ...reasoning } : { max_tokens: 4096, temperature: 0 }),
-  }, signal);
+  }, signal, [apiKey]);
   const choice = (json as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> }).choices?.[0];
   if (choice?.finish_reason === "length") {
     throw new Error("OpenAI chat completion was truncated at the token limit");
@@ -125,18 +134,34 @@ async function openaiCompletions(baseUrl: string, apiKey: string, role: RoleConf
   return choice?.message?.content?.trim() ?? "";
 }
 
-async function postJson(url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<unknown> {
+async function postJson(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  signal?: AbortSignal,
+  secrets: string[] = [],
+): Promise<unknown> {
   const timeout = withTimeout(signal, DEFAULT_LLM_TIMEOUT_MS);
   try {
     const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: timeout.signal });
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`LLM request failed (${response.status} ${response.statusText}): ${text.slice(0, 1000)}`);
+      throw new Error(
+        `LLM request failed (${response.status} ${response.statusText}): ${redactSecrets(text, secrets).slice(0, 1000)}`,
+      );
     }
-    return text ? JSON.parse(text) : {};
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`LLM response was not valid JSON: ${redactSecrets(text, secrets).slice(0, 1000)}`);
+    }
   } catch (error) {
-    if (timeout.signal.aborted) {
-      throw new Error(`LLM request aborted or timed out after ${DEFAULT_LLM_TIMEOUT_MS}ms`);
+    if (timeout.timedOut()) {
+      throw new Error(`LLM request timed out after ${DEFAULT_LLM_TIMEOUT_MS}ms`);
+    }
+    if (signal?.aborted) {
+      throw new Error("LLM request aborted by client");
     }
     throw error;
   } finally {
@@ -144,22 +169,40 @@ async function postJson(url: string, headers: Record<string, string>, body: unkn
   }
 }
 
-function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
+function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): {
+  signal: AbortSignal;
+  cleanup: () => void;
+  timedOut: () => boolean;
+} {
   const controller = new AbortController();
-  const abort = (): void => controller.abort();
-  const timer = setTimeout(abort, timeoutMs);
+  let didTimeOut = false;
+  const abortFromCaller = (): void => controller.abort();
+  const timer = setTimeout(() => {
+    didTimeOut = true;
+    controller.abort();
+  }, timeoutMs);
   if (signal?.aborted) {
     controller.abort();
   } else {
-    signal?.addEventListener("abort", abort, { once: true });
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
   }
   return {
     signal: controller.signal,
     cleanup: () => {
       clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
+      signal?.removeEventListener("abort", abortFromCaller);
     },
+    timedOut: () => didTimeOut,
   };
+}
+
+function redactSecrets(text: string, secrets: string[]): string {
+  let redacted = text;
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    redacted = redacted.split(secret).join("[redacted]");
+  }
+  return redacted;
 }
 
 function endpoint(baseUrl: string, suffix: string): string {
