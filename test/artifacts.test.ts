@@ -1,0 +1,125 @@
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  appendJournal,
+  createRun,
+  currentRun,
+  readState,
+  releaseRun,
+  writeState,
+} from "../src/core/artifacts.js";
+import { createIdleLifecycleState } from "../src/core/lifecycle.js";
+
+const tempDirs: string[] = [];
+const artifactsDir = ".ai-orchestrator/runs";
+
+function makeTempDir(): string {
+  const dir = join(tmpdir(), `ai-orchestrator-artifacts-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("lifecycle artifacts", () => {
+  it("creates a run directory, current pointer, and journal", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "ship a feature");
+
+    expect(run.runId).toMatch(/^\d{8}-\d{4}-[a-f0-9]{6}$/);
+    expect(existsSync(run.paths.root)).toBe(true);
+    expect(existsSync(run.paths.spec)).toBe(true);
+    expect(existsSync(run.paths.plan)).toBe(true);
+    expect(readFileSync(join(cwd, ".ai-orchestrator", "current"), "utf8").trim()).toBe(run.runId);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("Task: ship a feature");
+    expect(readState(run.paths)).toMatchObject({ runId: run.runId, phase: "defining", task: "ship a feature" });
+
+    expect(currentRun(cwd, artifactsDir)?.runId).toBe(run.runId);
+  });
+
+  it("writes and reads state atomically", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    const state = createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task" });
+
+    writeState(run.paths, state);
+
+    expect(readState(run.paths)).toEqual(state);
+    expect(readFileSync(run.paths.state, "utf8")).toContain('"phase": "defining"');
+  });
+
+  it("returns undefined for missing or corrupt state", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+
+    unlinkSync(run.paths.state);
+    expect(readState(run.paths)).toBeUndefined();
+    writeFileSync(run.paths.state, "not json");
+    expect(readState(run.paths)).toBeUndefined();
+    writeFileSync(run.paths.state, JSON.stringify({ phase: "defining" }));
+    expect(readState(run.paths)).toBeUndefined();
+    writeFileSync(run.paths.state, JSON.stringify(createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task", verdicts: [{ stage: "bad", verdict: "approve", reasons: "x" } as never] })));
+    expect(readState(run.paths)).toBeUndefined();
+  });
+
+  it("blocks creating a new run immediately while the current state is active", () => {
+    const cwd = makeTempDir();
+    createRun(cwd, artifactsDir, "first");
+
+    expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/already active/);
+  });
+
+  it("allows a new run when current state is terminal or corrupt", () => {
+    const cwd = makeTempDir();
+    const first = createRun(cwd, artifactsDir, "first");
+    writeState(first.paths, createIdleLifecycleState({ runId: first.runId, phase: "done", task: "first" }));
+
+    const second = createRun(cwd, artifactsDir, "second");
+    expect(second.runId).not.toBe(first.runId);
+
+    writeFileSync(second.paths.state, "not json");
+    const third = createRun(cwd, artifactsDir, "third");
+    expect(third.runId).not.toBe(second.runId);
+
+    writeFileSync(third.paths.state, JSON.stringify({ ...createIdleLifecycleState({ runId: third.runId, task: "third" }), phase: "unknown" }));
+    const fourth = createRun(cwd, artifactsDir, "fourth");
+    expect(fourth.runId).not.toBe(third.runId);
+  });
+
+  it("ignores invalid current run ids instead of joining untrusted path text", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".ai-orchestrator"), { recursive: true });
+    writeFileSync(join(cwd, ".ai-orchestrator", "current"), "../../outside\n");
+
+    expect(currentRun(cwd, artifactsDir)).toBeUndefined();
+  });
+
+  it("keeps the current pointer under the dedicated parent for non-default artifact directories", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, ".orch/runs", "task");
+
+    expect(readFileSync(join(cwd, ".orch", "current"), "utf8").trim()).toBe(run.runId);
+    expect(existsSync(join(cwd, "current"))).toBe(false);
+  });
+
+  it("appends journal entries and releases the current run pointer", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+
+    appendJournal(run.paths, "moved to planning");
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("moved to planning");
+
+    releaseRun(cwd, artifactsDir);
+    expect(currentRun(cwd, artifactsDir)).toBeUndefined();
+
+    const next = createRun(cwd, artifactsDir, "next");
+    expect(next.runId).not.toBe(run.runId);
+  });
+});

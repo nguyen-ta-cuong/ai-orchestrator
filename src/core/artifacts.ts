@@ -1,0 +1,158 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "./lifecycle.js";
+
+export interface RunPaths {
+  root: string;
+  spec: string;
+  plan: string;
+  state: string;
+  journal: string;
+}
+
+export function createRun(cwd: string, artifactsDir: string, task: string): { runId: string; paths: RunPaths } {
+  const active = currentRun(cwd, artifactsDir);
+  if (active) {
+    const activeState = readState(active.paths);
+    if (activeState && isActivePhase(activeState.phase)) {
+      throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
+    }
+  }
+
+  const runId = createRunId();
+  const paths = pathsForRun(cwd, artifactsDir, runId);
+  mkdirSync(paths.root, { recursive: true });
+  writeFileSync(paths.spec, "");
+  writeFileSync(paths.plan, "");
+  writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
+  writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task }));
+  mkdirSync(dirname(currentRunPath(cwd, artifactsDir)), { recursive: true });
+  writeFileSync(currentRunPath(cwd, artifactsDir), `${runId}\n`);
+  return { runId, paths };
+}
+
+export function currentRun(cwd: string, artifactsDir: string): { runId: string; paths: RunPaths } | undefined {
+  const currentPath = currentRunPath(cwd, artifactsDir);
+  if (!existsSync(currentPath)) return undefined;
+  const runId = readFileSync(currentPath, "utf8").trim();
+  if (!isRunId(runId)) return undefined;
+  return { runId, paths: pathsForRun(cwd, artifactsDir, runId) };
+}
+
+export function readState(paths: RunPaths): LifecycleState | undefined {
+  if (!existsSync(paths.state)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(paths.state, "utf8")) as unknown;
+    return isLifecycleState(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeState(paths: RunPaths, state: LifecycleState): void {
+  mkdirSync(paths.root, { recursive: true });
+  const tempPath = `${paths.state}.${process.pid}.${Date.now()}.tmp`;
+  let completed = false;
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`);
+    renameSync(tempPath, paths.state);
+    completed = true;
+  } finally {
+    if (!completed) {
+      rmSync(tempPath, { force: true });
+    }
+  }
+}
+
+export function appendJournal(paths: RunPaths, line: string): void {
+  mkdirSync(paths.root, { recursive: true });
+  const timestamp = new Date().toISOString();
+  writeFileSync(paths.journal, `- ${timestamp} ${line}\n`, { flag: "a" });
+}
+
+export function releaseRun(cwd: string, artifactsDir: string): void {
+  rmSync(currentRunPath(cwd, artifactsDir), { force: true });
+}
+
+export function pathsForRun(cwd: string, artifactsDir: string, runId: string): RunPaths {
+  const root = join(cwd, artifactsDir, runId);
+  return {
+    root,
+    spec: join(root, "spec.md"),
+    plan: join(root, "plan.md"),
+    state: join(root, "state.json"),
+    journal: join(root, "journal.md"),
+  };
+}
+
+function currentRunPath(cwd: string, artifactsDir: string): string {
+  return join(cwd, dirname(artifactsDir), "current");
+}
+
+function createRunId(): string {
+  const now = new Date();
+  const date = [
+    now.getFullYear().toString().padStart(4, "0"),
+    (now.getMonth() + 1).toString().padStart(2, "0"),
+    now.getDate().toString().padStart(2, "0"),
+  ].join("");
+  const time = [
+    now.getHours().toString().padStart(2, "0"),
+    now.getMinutes().toString().padStart(2, "0"),
+  ].join("");
+  return `${date}-${time}-${randomBytes(4).toString("hex").slice(0, 6)}`;
+}
+
+function isRunId(value: string): boolean {
+  return /^\d{8}-\d{4}-[a-f0-9]{6}$/.test(value);
+}
+
+const LIFECYCLE_PHASES = new Set<LifecyclePhase>([
+  "idle",
+  "defining",
+  "awaiting_spec_approval",
+  "planning",
+  "awaiting_plan_approval",
+  "building",
+  "verifying",
+  "reviewing",
+  "shipping",
+  "awaiting_ship_approval",
+  "finalizing",
+  "done",
+  "failed",
+]);
+
+function isActivePhase(phase: LifecycleState["phase"]): boolean {
+  return phase !== "idle" && phase !== "done" && phase !== "failed";
+}
+
+function isLifecycleState(value: unknown): value is LifecycleState {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<LifecycleState>;
+  return (
+    candidate.version === 1 &&
+    typeof candidate.runId === "string" &&
+    isRunId(candidate.runId) &&
+    typeof candidate.phase === "string" &&
+    LIFECYCLE_PHASES.has(candidate.phase as LifecyclePhase) &&
+    typeof candidate.task === "string" &&
+    typeof candidate.buildIterations === "number" &&
+    typeof candidate.consecutiveRejections === "number" &&
+    Array.isArray(candidate.verdicts) &&
+    candidate.verdicts.every(isLifecycleVerdict) &&
+    typeof candidate.yolo === "boolean"
+  );
+}
+
+function isLifecycleVerdict(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { stage?: unknown; verdict?: unknown; reasons?: unknown; requiredFixes?: unknown };
+  return (
+    (candidate.stage === "verify" || candidate.stage === "review" || candidate.stage === "ship") &&
+    (candidate.verdict === "approve" || candidate.verdict === "reject") &&
+    typeof candidate.reasons === "string" &&
+    (candidate.requiredFixes === undefined || typeof candidate.requiredFixes === "string")
+  );
+}
