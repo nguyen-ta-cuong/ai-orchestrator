@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,8 +16,8 @@ function makeTempDir(): string {
   return realDir;
 }
 
-function runInstaller(cwd: string, ...args: string[]): string {
-  return execFileSync(process.execPath, [binPath, "install-cursor", ...args], {
+function installerOptions(cwd: string): ExecFileSyncOptionsWithStringEncoding {
+  return {
     cwd,
     encoding: "utf8",
     env: {
@@ -25,7 +25,24 @@ function runInstaller(cwd: string, ...args: string[]): string {
       HOME: join(cwd, "home"),
       USERPROFILE: join(cwd, "home"),
     },
-  });
+  };
+}
+
+function runInstaller(cwd: string, ...args: string[]): string {
+  return execFileSync(process.execPath, [binPath, "install-cursor", ...args], installerOptions(cwd));
+}
+
+function runInstallerFailure(cwd: string, ...args: string[]): { stderr: string; stdout: string } {
+  try {
+    runInstaller(cwd, ...args);
+  } catch (error) {
+    const execError = error as { stderr?: Buffer; stdout?: Buffer };
+    return {
+      stderr: execError.stderr?.toString() ?? "",
+      stdout: execError.stdout?.toString() ?? "",
+    };
+  }
+  throw new Error("Expected installer to fail");
 }
 
 afterEach(() => {
@@ -61,14 +78,14 @@ describe("ai-orchestrator install-cursor", () => {
     expect(stdout).toContain(readFileSync(snippetPath, "utf8").trim());
   });
 
-  it("does not create MCP config when --no-mcp is supplied", () => {
+  it("rejects --no-mcp until no-MCP fallback assets exist", () => {
     const cwd = makeTempDir();
 
-    const stdout = runInstaller(cwd, "--no-mcp");
+    const failure = runInstallerFailure(cwd, "--no-mcp");
 
-    expect(existsSync(join(cwd, ".cursor", "mcp.json"))).toBe(false);
-    expect(existsSync(join(cwd, ".cursor", "rules", "ai-orchestrator.mdc"))).toBe(true);
-    expect(existsSync(join(cwd, ".cursor", "skills", "orchestrate", "SKILL.md"))).toBe(true);
-    expect(stdout).toContain("Skipped MCP configuration because --no-mcp was supplied.");
+    expect(existsSync(join(cwd, ".cursor"))).toBe(false);
+    expect(failure.stdout).toBe("");
+    expect(failure.stderr).toContain("install-cursor --no-mcp is not available yet");
+    expect(failure.stderr).toContain("Milestone 4");
   });
 });

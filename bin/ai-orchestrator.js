@@ -8,7 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: ai-orchestrator install-cursor [--no-mcp] [--global]\n\nInstalls Cursor rule and skill assets for the Plan → Code → Judge workflow.\n`);
+  stream.write(`Usage: ai-orchestrator install-cursor [--global]\n\nInstalls Cursor rule, skill, and MCP assets for the Plan → Code → Judge workflow.\n`);
   process.exit(exitCode);
 }
 
@@ -28,6 +28,10 @@ if (unknown) {
   process.stderr.write(`Unknown option: ${unknown}\n`);
   usage(1);
 }
+if (noMcp) {
+  process.stderr.write("install-cursor --no-mcp is not available yet; no-MCP Cursor fallback assets are planned for Milestone 4.\n");
+  process.exit(1);
+}
 
 const cursorDir = globalInstall ? join(homedir(), ".cursor") : join(process.cwd(), ".cursor");
 const rulesDir = join(cursorDir, "rules");
@@ -43,11 +47,6 @@ copyIfAbsentOrIdentical(join(root, "skills", "orchestrate", "SKILL.md"), skillTa
 
 process.stdout.write(`Installed Cursor rule: ${ruleTarget}\n`);
 process.stdout.write(`Installed Cursor skill: ${skillsDir}\n`);
-
-if (noMcp) {
-  process.stdout.write("Skipped MCP configuration because --no-mcp was supplied.\n");
-  process.exit(0);
-}
 
 const snippetPath = join(root, "cursor", "mcp.json");
 const snippet = readFileSync(snippetPath, "utf8").trim();
