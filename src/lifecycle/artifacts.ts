@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
 
@@ -12,24 +12,37 @@ export interface RunPaths {
 }
 
 export function createRun(cwd: string, artifactsDir: string, task: string): { runId: string; paths: RunPaths } {
-  const active = currentRun(cwd, artifactsDir);
-  if (active) {
-    const activeState = readState(active.paths);
-    if (activeState && isActivePhase(activeState.phase)) {
-      throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
+  return withCurrentRunLock(cwd, artifactsDir, () => {
+    const currentPath = currentRunPath(cwd, artifactsDir);
+    const active = currentRun(cwd, artifactsDir);
+    if (active) {
+      const activeState = readState(active.paths);
+      if (activeState && isActivePhase(activeState.phase)) {
+        throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
+      }
+      rmSync(currentPath, { force: true });
+    } else if (existsSync(currentPath)) {
+      rmSync(currentPath, { force: true });
     }
-  }
 
-  const runId = createRunId();
-  const paths = pathsForRun(cwd, artifactsDir, runId);
-  mkdirSync(paths.root, { recursive: true });
-  writeFileSync(paths.spec, "");
-  writeFileSync(paths.plan, "");
-  writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
-  writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task }));
-  mkdirSync(dirname(currentRunPath(cwd, artifactsDir)), { recursive: true });
-  writeFileSync(currentRunPath(cwd, artifactsDir), `${runId}\n`);
-  return { runId, paths };
+    const runId = createRunId();
+    const paths = pathsForRun(cwd, artifactsDir, runId);
+    let currentPointerWritten = false;
+    try {
+      mkdirSync(paths.root, { recursive: true });
+      writeFileSync(paths.spec, "");
+      writeFileSync(paths.plan, "");
+      writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
+      writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task }));
+      writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
+      currentPointerWritten = true;
+      return { runId, paths };
+    } finally {
+      if (!currentPointerWritten) {
+        rmSync(paths.root, { recursive: true, force: true });
+      }
+    }
+  });
 }
 
 export function currentRun(cwd: string, artifactsDir: string): { runId: string; paths: RunPaths } | undefined {
@@ -76,7 +89,7 @@ export function releaseRun(cwd: string, artifactsDir: string): void {
 }
 
 export function pathsForRun(cwd: string, artifactsDir: string, runId: string): RunPaths {
-  const root = join(cwd, artifactsDir, runId);
+  const root = join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), runId);
   return {
     root,
     spec: join(root, "spec.md"),
@@ -87,7 +100,64 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
 }
 
 function currentRunPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, dirname(artifactsDir), "current");
+  return join(cwd, ...currentParentSegments(artifactsDir), "current");
+}
+
+function currentRunLockPath(cwd: string, artifactsDir: string): string {
+  return join(cwd, ...currentParentSegments(artifactsDir), "current.lock");
+}
+
+function currentParentSegments(artifactsDir: string): string[] {
+  const segments = normalizeArtifactsDir(artifactsDir).split("/");
+  return segments.slice(0, -1);
+}
+
+function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () => T): T {
+  const lockPath = currentRunLockPath(cwd, artifactsDir);
+  mkdirSync(join(lockPath, ".."), { recursive: true });
+  let locked = false;
+  try {
+    mkdirSync(lockPath);
+    locked = true;
+    return operation();
+  } catch (error) {
+    if (isNodeErrorWithCode(error, "EEXIST")) {
+      throw new Error("An ai-orchestrator lifecycle run is already active or starting");
+    }
+    throw error;
+  } finally {
+    if (locked) {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
+  }
+}
+
+function normalizeArtifactsDir(artifactsDir: string): string {
+  if (artifactsDir.trim().length === 0 || isAbsolute(artifactsDir) || artifactsDir.startsWith("/") || artifactsDir.startsWith("\\") || /^[A-Za-z]:/.test(artifactsDir)) {
+    throw new Error("artifactsDir must be a relative path inside the project");
+  }
+
+  const stack: string[] = [];
+  for (const part of artifactsDir.split(/[\\/]+/)) {
+    if (part.length === 0 || part === ".") continue;
+    if (part === "..") {
+      if (stack.length === 0) {
+        throw new Error("artifactsDir must be a relative path inside the project");
+      }
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+
+  if (stack.length < 2) {
+    throw new Error("artifactsDir must contain a dedicated parent directory and child directory inside the project");
+  }
+  return stack.join("/");
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === code;
 }
 
 function createRunId(): string {

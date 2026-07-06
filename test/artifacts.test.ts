@@ -76,6 +76,14 @@ describe("lifecycle artifacts", () => {
     expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/already active/);
   });
 
+  it("blocks creating a run while another process holds the current-run lock", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".ai-orchestrator", "current.lock"), { recursive: true });
+
+    expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/active or starting/);
+    expect(existsSync(join(cwd, ".ai-orchestrator", "runs"))).toBe(false);
+  });
+
   it("allows a new run when current state is terminal or corrupt", () => {
     const cwd = makeTempDir();
     const first = createRun(cwd, artifactsDir, "first");
@@ -107,6 +115,16 @@ describe("lifecycle artifacts", () => {
 
     expect(readFileSync(join(cwd, ".orch", "current"), "utf8").trim()).toBe(run.runId);
     expect(existsSync(join(cwd, "current"))).toBe(false);
+  });
+
+  it("normalizes backslash separators before deriving run and current paths", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, ".orch\\runs", "task");
+
+    expect(run.paths.root).toBe(join(cwd, ".orch", "runs", run.runId));
+    expect(readFileSync(join(cwd, ".orch", "current"), "utf8").trim()).toBe(run.runId);
+    expect(existsSync(join(cwd, "current"))).toBe(false);
+    expect(existsSync(join(cwd, ".orch\\runs"))).toBe(false);
   });
 
   it("appends journal entries and releases the current run pointer", () => {
