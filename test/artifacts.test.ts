@@ -134,10 +134,22 @@ describe("lifecycle artifacts", () => {
     appendJournal(run.paths, "moved to planning");
     expect(readFileSync(run.paths.journal, "utf8")).toContain("moved to planning");
 
-    releaseRun(cwd, artifactsDir);
+    expect(releaseRun(cwd, artifactsDir, run.runId)).toBe(true);
     expect(currentRun(cwd, artifactsDir)).toBeUndefined();
 
     const next = createRun(cwd, artifactsDir, "next");
     expect(next.runId).not.toBe(run.runId);
+  });
+
+  it("does not release a newer run's pointer from an older run", () => {
+    const cwd = makeTempDir();
+    const oldRun = createRun(cwd, artifactsDir, "old");
+    writeState(oldRun.paths, createIdleLifecycleState({ runId: oldRun.runId, phase: "done", task: "old" }));
+    const newRun = createRun(cwd, artifactsDir, "new");
+
+    expect(releaseRun(cwd, artifactsDir, oldRun.runId)).toBe(false);
+    expect(currentRun(cwd, artifactsDir)?.runId).toBe(newRun.runId);
+    expect(releaseRun(cwd, artifactsDir, newRun.runId)).toBe(true);
+    expect(currentRun(cwd, artifactsDir)).toBeUndefined();
   });
 });

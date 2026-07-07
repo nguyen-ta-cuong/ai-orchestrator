@@ -84,8 +84,8 @@ export function appendJournal(paths: RunPaths, line: string): void {
   writeFileSync(paths.journal, `- ${timestamp} ${line}\n`, { flag: "a" });
 }
 
-export function releaseRun(cwd: string, artifactsDir: string): void {
-  rmSync(currentRunPath(cwd, artifactsDir), { force: true });
+export function releaseRun(cwd: string, artifactsDir: string, runId: string): boolean {
+  return withCurrentRunLock(cwd, artifactsDir, () => releaseCurrentPointerIfMatches(cwd, artifactsDir, runId));
 }
 
 export function pathsForRun(cwd: string, artifactsDir: string, runId: string): RunPaths {
@@ -105,6 +105,15 @@ function currentRunPath(cwd: string, artifactsDir: string): string {
 
 function currentRunLockPath(cwd: string, artifactsDir: string): string {
   return join(cwd, ...currentParentSegments(artifactsDir), "current.lock");
+}
+
+function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId: string): boolean {
+  const currentPath = currentRunPath(cwd, artifactsDir);
+  if (!existsSync(currentPath) || readFileSync(currentPath, "utf8").trim() !== runId) {
+    return false;
+  }
+  rmSync(currentPath, { force: true });
+  return true;
 }
 
 function currentParentSegments(artifactsDir: string): string[] {
