@@ -156,6 +156,14 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(join(cwd, ".ai-orchestrator", "current.lock"))).toBe(false);
   });
 
+  it("rejects artifact directories with control characters before writing git excludes", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".git", "info"), { recursive: true });
+
+    expect(() => createRun(cwd, ".orch/runs\n*.ts\n#", "task")).toThrow(/control characters/);
+    expect(existsSync(join(cwd, ".git", "info", "exclude"))).toBe(false);
+  });
+
   it("adds narrow lifecycle artifact patterns to local git excludes", () => {
     const cwd = makeTempDir();
     mkdirSync(join(cwd, ".git", "info"), { recursive: true });

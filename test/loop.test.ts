@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createIdleState, type LoopConfig, type OrchestratorState, nextPhase } from "../src/core/loop.js";
+import { createIdleState, decideRejectedBuildOutcome, type LoopConfig, type OrchestratorState, nextPhase } from "../src/core/loop.js";
 
 const config: LoopConfig = {
   maxCoderIterations: 3,
@@ -28,6 +28,14 @@ function approvePlan(state = planningState()): OrchestratorState {
 function completeCoding(state: OrchestratorState): OrchestratorState {
   return nextPhase(state, { type: "code_produced" }, config);
 }
+
+describe("decideRejectedBuildOutcome", () => {
+  it("centralizes retry, replan, and fail decisions", () => {
+    expect(decideRejectedBuildOutcome(1, 1, config)).toBe("retry");
+    expect(decideRejectedBuildOutcome(1, 2, config)).toBe("replan");
+    expect(decideRejectedBuildOutcome(3, 1, config)).toBe("fail");
+  });
+});
 
 describe("nextPhase", () => {
   it("starts a run from idle/done/failed and ignores start mid-run", () => {

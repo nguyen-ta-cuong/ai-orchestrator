@@ -207,6 +207,9 @@ function normalizeArtifactsDir(artifactsDir: string): string {
   if (artifactsDir.trim().length === 0 || isAbsolute(artifactsDir) || artifactsDir.startsWith("/") || artifactsDir.startsWith("\\") || /^[A-Za-z]:/.test(artifactsDir)) {
     throw new Error("artifactsDir must be a relative path inside the project");
   }
+  if (/[\u0000-\u001f\u007f]/.test(artifactsDir)) {
+    throw new Error("artifactsDir must not contain control characters");
+  }
 
   const stack: string[] = [];
   for (const part of artifactsDir.split(/[\\/]+/)) {

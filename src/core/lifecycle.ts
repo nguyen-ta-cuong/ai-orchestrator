@@ -1,4 +1,4 @@
-import type { LoopConfig } from "./loop.js";
+import { decideRejectedBuildOutcome, type LoopConfig } from "./loop.js";
 import type { ThinkingLevel } from "./config.js";
 
 export type LifecyclePhase =
@@ -183,12 +183,13 @@ export function nextStage(
 
       next.consecutiveRejections += 1;
 
-      if (next.buildIterations >= config.maxCoderIterations) {
+      const outcome = decideRejectedBuildOutcome(next.buildIterations, next.consecutiveRejections, config);
+      if (outcome === "fail") {
         next.phase = "failed";
         return next;
       }
 
-      if (next.consecutiveRejections >= config.plannerEscalationAfterRejections) {
+      if (outcome === "replan") {
         next.phase = "planning";
         next.consecutiveRejections = 0;
         return next;
