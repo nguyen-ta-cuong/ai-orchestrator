@@ -12,6 +12,7 @@ export interface RunPaths {
 }
 
 export function createRun(cwd: string, artifactsDir: string, task: string): { runId: string; paths: RunPaths } {
+  ensureArtifactsExcludedFromGit(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => {
     const currentPath = currentRunPath(cwd, artifactsDir);
     const active = currentRun(cwd, artifactsDir);
@@ -121,6 +122,22 @@ function currentParentSegments(artifactsDir: string): string[] {
   return segments.slice(0, -1);
 }
 
+function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void {
+  const gitDir = join(cwd, ".git");
+  if (!existsSync(gitDir)) return;
+
+  const pattern = `/${currentParentSegments(artifactsDir).join("/")}/`;
+  const infoDir = join(gitDir, "info");
+  const excludePath = join(infoDir, "exclude");
+  mkdirSync(infoDir, { recursive: true });
+
+  const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+  if (existing.split(/\r?\n/).some((line) => line.trim() === pattern)) return;
+
+  const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+  writeFileSync(excludePath, `${separator}# ai-orchestrator lifecycle artifacts\n${pattern}\n`, { flag: "a" });
+}
+
 function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () => T): T {
   const lockPath = currentRunLockPath(cwd, artifactsDir);
   mkdirSync(join(lockPath, ".."), { recursive: true });
@@ -161,6 +178,11 @@ function normalizeArtifactsDir(artifactsDir: string): string {
 
   if (stack.length < 2) {
     throw new Error("artifactsDir must contain a dedicated parent directory and child directory inside the project");
+  }
+
+  const basename = stack[stack.length - 1];
+  if (basename === "current" || basename === "current.lock") {
+    throw new Error("artifactsDir basename is reserved for lifecycle run coordination");
   }
   return stack.join("/");
 }

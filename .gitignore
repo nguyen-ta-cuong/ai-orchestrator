@@ -1,6 +1,9 @@
 # ExecPlans are local working documents — never commit
 plans/
 
+# Runtime lifecycle artifacts
+.ai-orchestrator/
+
 node_modules/
 dist/
 *.tsbuildinfo

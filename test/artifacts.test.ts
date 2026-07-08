@@ -127,6 +127,29 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(join(cwd, ".orch\\runs"))).toBe(false);
   });
 
+  it("rejects artifact directories that collide with current coordination names", () => {
+    const cwd = makeTempDir();
+
+    expect(() => createRun(cwd, ".ai-orchestrator/current", "task")).toThrow(/reserved/);
+    expect(() => createRun(cwd, ".ai-orchestrator/current.lock", "task")).toThrow(/reserved/);
+    expect(existsSync(join(cwd, ".ai-orchestrator", "current"))).toBe(false);
+    expect(existsSync(join(cwd, ".ai-orchestrator", "current.lock"))).toBe(false);
+  });
+
+  it("adds the lifecycle artifact parent to local git excludes", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".git", "info"), { recursive: true });
+    writeFileSync(join(cwd, ".git", "info", "exclude"), "# existing\n");
+
+    const first = createRun(cwd, ".orch/runs", "task");
+    writeState(first.paths, createIdleLifecycleState({ runId: first.runId, phase: "done", task: "task" }));
+    createRun(cwd, ".orch/runs", "task 2");
+
+    const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
+    expect(exclude).toContain("/.orch/");
+    expect(exclude.match(/^\/\.orch\/$/gm)).toHaveLength(1);
+  });
+
   it("appends journal entries and releases the current run pointer", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, artifactsDir, "task");
