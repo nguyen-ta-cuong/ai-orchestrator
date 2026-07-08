@@ -101,7 +101,6 @@ export function nextStage(
       phase: "defining",
       task: event.task,
       yolo: event.yolo,
-      originalModel: state.originalModel ? { ...state.originalModel } : undefined,
     });
   }
 

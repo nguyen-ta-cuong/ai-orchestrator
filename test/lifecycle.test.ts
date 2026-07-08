@@ -35,6 +35,20 @@ function builtOnce(state = approvedPlan()): LifecycleState {
 }
 
 describe("nextStage", () => {
+  it("starts from terminal state without inheriting previous run restore state", () => {
+    const previousDone = createIdleLifecycleState({
+      runId: "run-1",
+      phase: "done",
+      task: "old task",
+      originalModel: { provider: "anthropic", id: "old-model", thinking: "high" },
+    });
+
+    const next = nextStage(previousDone, { type: "start", task: "new task", yolo: false }, config);
+
+    expect(next).toMatchObject({ phase: "defining", runId: "run-1", task: "new task" });
+    expect(next.originalModel).toBeUndefined();
+  });
+
   it("runs the gated happy path from define to done", () => {
     const defining = startState();
     expect(defining).toMatchObject({ phase: "defining", runId: "run-1", task: "add a lifecycle feature" });
