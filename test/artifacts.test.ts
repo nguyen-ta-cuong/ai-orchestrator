@@ -37,7 +37,7 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(run.paths.root)).toBe(true);
     expect(existsSync(run.paths.spec)).toBe(true);
     expect(existsSync(run.paths.plan)).toBe(true);
-    expect(readFileSync(join(cwd, ".ai-orchestrator", "current"), "utf8").trim()).toBe(run.runId);
+    expect(readFileSync(join(cwd, ".ai-orchestrator", "runs", "current"), "utf8").trim()).toBe(run.runId);
     expect(readFileSync(run.paths.journal, "utf8")).toContain("Task: ship a feature");
     expect(readState(run.paths)).toMatchObject({ runId: run.runId, phase: "defining", task: "ship a feature" });
 
@@ -85,10 +85,10 @@ describe("lifecycle artifacts", () => {
 
   it("blocks creating a run while another process holds the current-run lock", () => {
     const cwd = makeTempDir();
-    mkdirSync(join(cwd, ".ai-orchestrator", "current.lock"), { recursive: true });
+    mkdirSync(join(cwd, ".ai-orchestrator", "runs", "current.lock"), { recursive: true });
 
     expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/active or starting/);
-    expect(existsSync(join(cwd, ".ai-orchestrator", "runs"))).toBe(false);
+    expect(existsSync(join(cwd, ".ai-orchestrator", "runs", "current"))).toBe(false);
   });
 
   it("allows a new run when current state is terminal or corrupt", () => {
@@ -110,18 +110,30 @@ describe("lifecycle artifacts", () => {
 
   it("ignores invalid current run ids instead of joining untrusted path text", () => {
     const cwd = makeTempDir();
-    mkdirSync(join(cwd, ".ai-orchestrator"), { recursive: true });
-    writeFileSync(join(cwd, ".ai-orchestrator", "current"), "../../outside\n");
+    mkdirSync(join(cwd, ".ai-orchestrator", "runs"), { recursive: true });
+    writeFileSync(join(cwd, ".ai-orchestrator", "runs", "current"), "../../outside\n");
 
     expect(currentRun(cwd, artifactsDir)).toBeUndefined();
   });
 
-  it("keeps the current pointer under the dedicated parent for non-default artifact directories", () => {
+  it("keeps the current pointer inside the artifact directory for non-default artifact directories", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, ".orch/runs", "task");
 
-    expect(readFileSync(join(cwd, ".orch", "current"), "utf8").trim()).toBe(run.runId);
+    expect(readFileSync(join(cwd, ".orch", "runs", "current"), "utf8").trim()).toBe(run.runId);
+    expect(existsSync(join(cwd, ".orch", "current"))).toBe(false);
     expect(existsSync(join(cwd, "current"))).toBe(false);
+  });
+
+  it("does not delete sibling current files under artifact parents", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, "src"), { recursive: true });
+    writeFileSync(join(cwd, "src", "current"), "user-owned file\n");
+
+    const run = createRun(cwd, "src/orch-runs", "task");
+
+    expect(readFileSync(join(cwd, "src", "current"), "utf8")).toBe("user-owned file\n");
+    expect(readFileSync(join(cwd, "src", "orch-runs", "current"), "utf8").trim()).toBe(run.runId);
   });
 
   it("normalizes backslash separators before deriving run and current paths", () => {
@@ -129,7 +141,8 @@ describe("lifecycle artifacts", () => {
     const run = createRun(cwd, ".orch\\runs", "task");
 
     expect(run.paths.root).toBe(join(cwd, ".orch", "runs", run.runId));
-    expect(readFileSync(join(cwd, ".orch", "current"), "utf8").trim()).toBe(run.runId);
+    expect(readFileSync(join(cwd, ".orch", "runs", "current"), "utf8").trim()).toBe(run.runId);
+    expect(existsSync(join(cwd, ".orch", "current"))).toBe(false);
     expect(existsSync(join(cwd, "current"))).toBe(false);
     expect(existsSync(join(cwd, ".orch\\runs"))).toBe(false);
   });
@@ -154,8 +167,8 @@ describe("lifecycle artifacts", () => {
 
     const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
     expect(exclude).toContain("/src/orch-runs/");
-    expect(exclude).toContain("/src/current");
-    expect(exclude).toContain("/src/current.lock/");
+    expect(exclude).not.toContain("/src/current");
+    expect(exclude).not.toContain("/src/current.lock/");
     expect(exclude).not.toMatch(/^\/src\/$/m);
     expect(exclude.match(/^\/src\/orch-runs\/$/gm)).toHaveLength(1);
   });
@@ -168,7 +181,7 @@ describe("lifecycle artifacts", () => {
 
     const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
     expect(exclude).toContain("/src/\\*\\[tmp\\]\\?/runs/");
-    expect(exclude).toContain("/src/\\*\\[tmp\\]\\?/current");
+    expect(exclude).not.toContain("/src/\\*\\[tmp\\]\\?/current");
     expect(exclude).not.toContain("/src/*[tmp]?/runs/");
   });
 
@@ -181,8 +194,8 @@ describe("lifecycle artifacts", () => {
 
     const exclude = readFileSync(join(cwd, ".real-git", "info", "exclude"), "utf8");
     expect(exclude).toContain("/.orch/runs/");
-    expect(exclude).toContain("/.orch/current");
-    expect(exclude).toContain("/.orch/current.lock/");
+    expect(exclude).not.toContain("/.orch/current");
+    expect(exclude).not.toContain("/.orch/current.lock/");
   });
 
   it("appends journal entries and releases the current run pointer", () => {

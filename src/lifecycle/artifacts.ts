@@ -102,11 +102,11 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
 }
 
 function currentRunPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, ...currentParentSegments(artifactsDir), "current");
+  return join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), "current");
 }
 
 function currentRunLockPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, ...currentParentSegments(artifactsDir), "current.lock");
+  return join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), "current.lock");
 }
 
 function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId: string): boolean {
@@ -116,11 +116,6 @@ function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId
   }
   rmSync(currentPath, { force: true });
   return true;
-}
-
-function currentParentSegments(artifactsDir: string): string[] {
-  const segments = normalizeArtifactsDir(artifactsDir).split("/");
-  return segments.slice(0, -1);
 }
 
 function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void {
@@ -139,10 +134,7 @@ function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void
 }
 
 function gitExcludePatterns(artifactsDir: string): string[] {
-  const segments = normalizeArtifactsDir(artifactsDir).split("/");
-  const normalized = gitIgnorePath(segments);
-  const parent = gitIgnorePath(segments.slice(0, -1));
-  return [`/${normalized}/`, `/${parent}/current`, `/${parent}/current.lock/`];
+  return [`/${gitIgnorePath(normalizeArtifactsDir(artifactsDir).split("/"))}/`];
 }
 
 function gitIgnorePath(segments: string[]): string {
