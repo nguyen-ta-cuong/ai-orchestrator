@@ -136,18 +136,34 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(join(cwd, ".ai-orchestrator", "current.lock"))).toBe(false);
   });
 
-  it("adds the lifecycle artifact parent to local git excludes", () => {
+  it("adds narrow lifecycle artifact patterns to local git excludes", () => {
     const cwd = makeTempDir();
     mkdirSync(join(cwd, ".git", "info"), { recursive: true });
     writeFileSync(join(cwd, ".git", "info", "exclude"), "# existing\n");
 
-    const first = createRun(cwd, ".orch/runs", "task");
+    const first = createRun(cwd, "src/orch-runs", "task");
     writeState(first.paths, createIdleLifecycleState({ runId: first.runId, phase: "done", task: "task" }));
-    createRun(cwd, ".orch/runs", "task 2");
+    createRun(cwd, "src/orch-runs", "task 2");
 
     const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
-    expect(exclude).toContain("/.orch/");
-    expect(exclude.match(/^\/\.orch\/$/gm)).toHaveLength(1);
+    expect(exclude).toContain("/src/orch-runs/");
+    expect(exclude).toContain("/src/current");
+    expect(exclude).toContain("/src/current.lock/");
+    expect(exclude).not.toMatch(/^\/src\/$/m);
+    expect(exclude.match(/^\/src\/orch-runs\/$/gm)).toHaveLength(1);
+  });
+
+  it("resolves gitdir files before adding local git excludes", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".real-git"), { recursive: true });
+    writeFileSync(join(cwd, ".git"), "gitdir: .real-git\n");
+
+    createRun(cwd, ".orch/runs", "task");
+
+    const exclude = readFileSync(join(cwd, ".real-git", "info", "exclude"), "utf8");
+    expect(exclude).toContain("/.orch/runs/");
+    expect(exclude).toContain("/.orch/current");
+    expect(exclude).toContain("/.orch/current.lock/");
   });
 
   it("appends journal entries and releases the current run pointer", () => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
@@ -123,19 +123,45 @@ function currentParentSegments(artifactsDir: string): string[] {
 }
 
 function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void {
-  const gitDir = join(cwd, ".git");
-  if (!existsSync(gitDir)) return;
+  const gitDir = resolveGitDir(cwd);
+  if (!gitDir) return;
 
-  const pattern = `/${currentParentSegments(artifactsDir).join("/")}/`;
   const infoDir = join(gitDir, "info");
   const excludePath = join(infoDir, "exclude");
   mkdirSync(infoDir, { recursive: true });
 
   const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
-  if (existing.split(/\r?\n/).some((line) => line.trim() === pattern)) return;
+  const existingPatterns = new Set(existing.split(/\r?\n/).map((line) => line.trim()));
+  const additions = gitExcludePatterns(artifactsDir).filter((pattern) => !existingPatterns.has(pattern));
+  if (additions.length === 0) return;
 
   const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-  writeFileSync(excludePath, `${separator}# ai-orchestrator lifecycle artifacts\n${pattern}\n`, { flag: "a" });
+  writeFileSync(excludePath, `${separator}# ai-orchestrator lifecycle artifacts\n${additions.join("\n")}\n`, { flag: "a" });
+}
+
+function gitExcludePatterns(artifactsDir: string): string[] {
+  const normalized = normalizeArtifactsDir(artifactsDir);
+  const parent = normalized.split("/").slice(0, -1).join("/");
+  return [`/${normalized}/`, `/${parent}/current`, `/${parent}/current.lock/`];
+}
+
+function resolveGitDir(cwd: string): string | undefined {
+  const dotGitPath = join(cwd, ".git");
+  if (!existsSync(dotGitPath)) return undefined;
+
+  try {
+    const dotGitStat = statSync(dotGitPath);
+    if (dotGitStat.isDirectory()) return dotGitPath;
+    if (!dotGitStat.isFile()) return undefined;
+
+    const match = /^gitdir:\s*(.+)$/i.exec(readFileSync(dotGitPath, "utf8").trim());
+    if (!match) return undefined;
+
+    const gitDir = isAbsolute(match[1]) ? match[1] : join(cwd, match[1]);
+    return statSync(gitDir).isDirectory() ? gitDir : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () => T): T {
