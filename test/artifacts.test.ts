@@ -55,6 +55,13 @@ describe("lifecycle artifacts", () => {
     expect(readFileSync(run.paths.state, "utf8")).toContain('"phase": "defining"');
   });
 
+  it("persists yolo on the initial lifecycle run state", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task", true);
+
+    expect(readState(run.paths)).toMatchObject({ yolo: true, phase: "defining" });
+  });
+
   it("returns undefined for missing or corrupt state", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, artifactsDir, "task");
@@ -151,6 +158,18 @@ describe("lifecycle artifacts", () => {
     expect(exclude).toContain("/src/current.lock/");
     expect(exclude).not.toMatch(/^\/src\/$/m);
     expect(exclude.match(/^\/src\/orch-runs\/$/gm)).toHaveLength(1);
+  });
+
+  it("escapes gitignore metacharacters in lifecycle artifact patterns", () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".git", "info"), { recursive: true });
+
+    createRun(cwd, "src/*[tmp]?/runs", "task");
+
+    const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
+    expect(exclude).toContain("/src/\\*\\[tmp\\]\\?/runs/");
+    expect(exclude).toContain("/src/\\*\\[tmp\\]\\?/current");
+    expect(exclude).not.toContain("/src/*[tmp]?/runs/");
   });
 
   it("resolves gitdir files before adding local git excludes", () => {

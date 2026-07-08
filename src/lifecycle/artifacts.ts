@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
@@ -11,7 +12,7 @@ export interface RunPaths {
   journal: string;
 }
 
-export function createRun(cwd: string, artifactsDir: string, task: string): { runId: string; paths: RunPaths } {
+export function createRun(cwd: string, artifactsDir: string, task: string, yolo = false): { runId: string; paths: RunPaths } {
   ensureArtifactsExcludedFromGit(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => {
     const currentPath = currentRunPath(cwd, artifactsDir);
@@ -34,7 +35,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string): { ru
       writeFileSync(paths.spec, "");
       writeFileSync(paths.plan, "");
       writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
-      writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task }));
+      writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
       currentPointerWritten = true;
       return { runId, paths };
@@ -123,12 +124,10 @@ function currentParentSegments(artifactsDir: string): string[] {
 }
 
 function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void {
-  const gitDir = resolveGitDir(cwd);
-  if (!gitDir) return;
+  const excludePath = resolveGitExcludePath(cwd);
+  if (!excludePath) return;
 
-  const infoDir = join(gitDir, "info");
-  const excludePath = join(infoDir, "exclude");
-  mkdirSync(infoDir, { recursive: true });
+  mkdirSync(join(excludePath, ".."), { recursive: true });
 
   const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
   const existingPatterns = new Set(existing.split(/\r?\n/).map((line) => line.trim()));
@@ -140,9 +139,37 @@ function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void
 }
 
 function gitExcludePatterns(artifactsDir: string): string[] {
-  const normalized = normalizeArtifactsDir(artifactsDir);
-  const parent = normalized.split("/").slice(0, -1).join("/");
+  const segments = normalizeArtifactsDir(artifactsDir).split("/");
+  const normalized = gitIgnorePath(segments);
+  const parent = gitIgnorePath(segments.slice(0, -1));
   return [`/${normalized}/`, `/${parent}/current`, `/${parent}/current.lock/`];
+}
+
+function gitIgnorePath(segments: string[]): string {
+  return segments.map(escapeGitIgnoreSegment).join("/");
+}
+
+function escapeGitIgnoreSegment(segment: string): string {
+  return segment.replace(/([\\*?\[\]#! ])/g, "\\$1");
+}
+
+function resolveGitExcludePath(cwd: string): string | undefined {
+  const dotGitPath = join(cwd, ".git");
+  if (!existsSync(dotGitPath)) return undefined;
+
+  try {
+    const gitPath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (gitPath.length > 0) return isAbsolute(gitPath) ? gitPath : join(cwd, gitPath);
+  } catch {
+    // Fall back to direct .git resolution for tests and minimal Git installations.
+  }
+
+  const gitDir = resolveGitDir(cwd);
+  return gitDir ? join(gitDir, "info", "exclude") : undefined;
 }
 
 function resolveGitDir(cwd: string): string | undefined {
