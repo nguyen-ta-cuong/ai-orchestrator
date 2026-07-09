@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -179,6 +180,19 @@ describe("lifecycle artifacts", () => {
     expect(exclude).not.toContain("/src/current.lock/");
     expect(exclude).not.toMatch(/^\/src\/$/m);
     expect(exclude.match(/^\/src\/orch-runs\/$/gm)).toHaveLength(1);
+  });
+
+  it("adds repo-root-relative git excludes when cwd is a repository subdirectory", () => {
+    const repo = makeTempDir();
+    execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+    const packageDir = join(repo, "packages", "pkg");
+    mkdirSync(packageDir, { recursive: true });
+
+    createRun(packageDir, ".ai-orchestrator/runs", "task");
+
+    const exclude = readFileSync(join(repo, ".git", "info", "exclude"), "utf8");
+    expect(exclude).toContain("/packages/pkg/.ai-orchestrator/runs/");
+    expect(exclude).not.toMatch(/^\/\.ai-orchestrator\/runs\/$/m);
   });
 
   it("escapes gitignore metacharacters in lifecycle artifact patterns", () => {

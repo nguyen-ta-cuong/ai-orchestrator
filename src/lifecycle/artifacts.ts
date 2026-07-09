@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
 
@@ -119,22 +119,30 @@ function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId
 }
 
 function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void {
-  const excludePath = resolveGitExcludePath(cwd);
-  if (!excludePath) return;
+  const gitContext = resolveGitContext(cwd);
+  if (!gitContext) return;
 
-  mkdirSync(join(excludePath, ".."), { recursive: true });
+  mkdirSync(join(gitContext.excludePath, ".."), { recursive: true });
 
-  const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+  const existing = existsSync(gitContext.excludePath) ? readFileSync(gitContext.excludePath, "utf8") : "";
   const existingPatterns = new Set(existing.split(/\r?\n/).map((line) => line.trim()));
-  const additions = gitExcludePatterns(artifactsDir).filter((pattern) => !existingPatterns.has(pattern));
+  const additions = gitExcludePatterns(cwd, gitContext.worktreeRoot, artifactsDir).filter((pattern) => !existingPatterns.has(pattern));
   if (additions.length === 0) return;
 
   const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-  writeFileSync(excludePath, `${separator}# ai-orchestrator lifecycle artifacts\n${additions.join("\n")}\n`, { flag: "a" });
+  writeFileSync(gitContext.excludePath, `${separator}# ai-orchestrator lifecycle artifacts\n${additions.join("\n")}\n`, { flag: "a" });
 }
 
-function gitExcludePatterns(artifactsDir: string): string[] {
-  return [`/${gitIgnorePath(normalizeArtifactsDir(artifactsDir).split("/"))}/`];
+function gitExcludePatterns(cwd: string, worktreeRoot: string, artifactsDir: string): string[] {
+  const normalized = normalizeArtifactsDir(artifactsDir);
+  const realCwd = realpathSync(cwd);
+  const realWorktreeRoot = realpathSync(worktreeRoot);
+  const artifactRoot = join(realCwd, ...normalized.split("/"));
+  const relativeArtifactRoot = relative(realWorktreeRoot, artifactRoot);
+  if (relativeArtifactRoot.length === 0 || relativeArtifactRoot.startsWith("..") || isAbsolute(relativeArtifactRoot)) {
+    return [`/${gitIgnorePath(normalized.split("/"))}/`];
+  }
+  return [`/${gitIgnorePath(relativeArtifactRoot.split(/[\\/]+/))}/`];
 }
 
 function gitIgnorePath(segments: string[]): string {
@@ -145,23 +153,30 @@ function escapeGitIgnoreSegment(segment: string): string {
   return segment.replace(/([\\*?\[\]#! ])/g, "\\$1");
 }
 
-function resolveGitExcludePath(cwd: string): string | undefined {
-  const dotGitPath = join(cwd, ".git");
-  if (!existsSync(dotGitPath)) return undefined;
-
+function resolveGitContext(cwd: string): { excludePath: string; worktreeRoot: string } | undefined {
   try {
     const gitPath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    if (gitPath.length > 0) return isAbsolute(gitPath) ? gitPath : join(cwd, gitPath);
+    const worktreeRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (gitPath.length > 0 && worktreeRoot.length > 0) {
+      return {
+        excludePath: isAbsolute(gitPath) ? gitPath : join(cwd, gitPath),
+        worktreeRoot,
+      };
+    }
   } catch {
     // Fall back to direct .git resolution for tests and minimal Git installations.
   }
 
   const gitDir = resolveGitDir(cwd);
-  return gitDir ? join(gitDir, "info", "exclude") : undefined;
+  return gitDir ? { excludePath: join(gitDir, "info", "exclude"), worktreeRoot: cwd } : undefined;
 }
 
 function resolveGitDir(cwd: string): string | undefined {
