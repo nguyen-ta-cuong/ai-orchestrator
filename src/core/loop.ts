@@ -56,6 +56,19 @@ export const DEFAULT_LOOP_CONFIG: LoopConfig = {
   requirePlanApproval: true,
 };
 
+export type RejectedBuildOutcome = "fail" | "replan" | "retry";
+
+export function decideRejectedBuildOutcome(
+  coderIterations: number,
+  consecutiveRejections: number,
+  config: LoopConfig,
+): RejectedBuildOutcome {
+  validateLoopConfig(config);
+  if (coderIterations >= config.maxCoderIterations) return "fail";
+  if (consecutiveRejections >= config.plannerEscalationAfterRejections) return "replan";
+  return "retry";
+}
+
 export function createIdleState(overrides: Partial<OrchestratorState> = {}): OrchestratorState {
   const state: OrchestratorState = {
     phase: "idle",
@@ -148,12 +161,13 @@ export function nextPhase(
 
       next.consecutiveRejections += 1;
 
-      if (next.coderIterations >= config.maxCoderIterations) {
+      const outcome = decideRejectedBuildOutcome(next.coderIterations, next.consecutiveRejections, config);
+      if (outcome === "fail") {
         next.phase = "failed";
         return next;
       }
 
-      if (next.consecutiveRejections >= config.plannerEscalationAfterRejections) {
+      if (outcome === "replan") {
         next.phase = "replanning";
         next.consecutiveRejections = 0;
         return next;

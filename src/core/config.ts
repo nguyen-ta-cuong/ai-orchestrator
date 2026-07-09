@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -16,12 +16,12 @@ export interface ProviderConfig {
   apiKey?: string;
 }
 
+export type RoleName = "planner" | "coder" | "judge" | "spec" | "verifier" | "reviewer" | "shipper";
+export type ShipCommitMode = "ask" | "never" | "auto";
+export type ShipOpenPrMode = "ask" | "never";
+
 export interface OrchestratorConfig {
-  roles: {
-    planner: RoleConfig;
-    coder: RoleConfig;
-    judge: RoleConfig;
-  };
+  roles: Record<RoleName, RoleConfig>;
   loop: {
     maxCoderIterations: number;
     plannerEscalationAfterRejections: number;
@@ -31,6 +31,16 @@ export interface OrchestratorConfig {
   };
   judge: {
     runTests: boolean;
+  };
+  lifecycle: {
+    artifactsDir: string;
+  };
+  build: {
+    commitPerTask: boolean;
+  };
+  ship: {
+    commit: ShipCommitMode;
+    openPr: ShipOpenPrMode;
   };
   mcp: {
     providers: Record<string, ProviderConfig>;
@@ -42,6 +52,9 @@ type ConfigPatch = Partial<{
   loop: Partial<OrchestratorConfig["loop"]>;
   approval: Partial<OrchestratorConfig["approval"]>;
   judge: Partial<OrchestratorConfig["judge"]>;
+  lifecycle: Partial<OrchestratorConfig["lifecycle"]>;
+  build: Partial<OrchestratorConfig["build"]>;
+  ship: Partial<OrchestratorConfig["ship"]>;
   mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>> }>;
 }>;
 
@@ -54,6 +67,10 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     planner: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
     coder: { provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
     judge: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    spec: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    verifier: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    reviewer: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    shipper: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
   },
   loop: {
     maxCoderIterations: 3,
@@ -64,6 +81,16 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   judge: {
     runTests: true,
+  },
+  lifecycle: {
+    artifactsDir: ".ai-orchestrator/runs",
+  },
+  build: {
+    commitPerTask: false,
+  },
+  ship: {
+    commit: "ask",
+    openPr: "ask",
   },
   mcp: {
     providers: {
@@ -176,10 +203,13 @@ function validateConfig(value: unknown): OrchestratorConfig {
   const loop = requirePlainObject(config.loop, "loop");
   const approval = requirePlainObject(config.approval, "approval");
   const judge = requirePlainObject(config.judge, "judge");
+  const lifecycle = requirePlainObject(config.lifecycle, "lifecycle");
+  const build = requirePlainObject(config.build, "build");
+  const ship = requirePlainObject(config.ship, "ship");
   const mcp = requirePlainObject(config.mcp, "mcp");
   const providers = requirePlainObject(mcp.providers, "mcp.providers");
 
-  for (const roleName of ["planner", "coder", "judge"] as const) {
+  for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "shipper"] as const) {
     const role = requirePlainObject(roles[roleName], `roles.${roleName}`);
     requireNonEmptyString(role.provider, `roles.${roleName}.provider`);
     requireNonEmptyString(role.model, `roles.${roleName}.model`);
@@ -192,6 +222,10 @@ function validateConfig(value: unknown): OrchestratorConfig {
   requirePositiveInteger(loop.plannerEscalationAfterRejections, "loop.plannerEscalationAfterRejections");
   requireBoolean(approval.requirePlanApproval, "approval.requirePlanApproval");
   requireBoolean(judge.runTests, "judge.runTests");
+  requireSafeRelativePath(lifecycle.artifactsDir, "lifecycle.artifactsDir");
+  requireBoolean(build.commitPerTask, "build.commitPerTask");
+  requireStringEnum(ship.commit, "ship.commit", ["ask", "never", "auto"] as const);
+  requireStringEnum(ship.openPr, "ship.openPr", ["ask", "never"] as const);
 
   for (const [providerName, providerValue] of Object.entries(providers)) {
     const provider = requirePlainObject(providerValue, `mcp.providers.${providerName}`);
@@ -240,6 +274,37 @@ function requirePositiveInteger(value: unknown, path: string): void {
 function requireBoolean(value: unknown, path: string): void {
   if (typeof value !== "boolean") {
     throw new Error(`${path} must be a boolean`);
+  }
+}
+
+function requireStringEnum<T extends string>(value: unknown, path: string, allowed: readonly T[]): void {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new Error(`${path} must be one of ${allowed.join(", ")}`);
+  }
+}
+
+function requireSafeRelativePath(value: unknown, path: string): void {
+  requireNonEmptyString(value, path);
+  const text = value as string;
+  if (isAbsolute(text) || text.startsWith("/") || text.startsWith("\\") || /^[A-Za-z]:/.test(text)) {
+    throw new Error(`${path} must be a relative path inside the project`);
+  }
+
+  const parts = text.split(/[\\/]+/).filter((part) => part.length > 0 && part !== ".");
+  const stack: string[] = [];
+  for (const part of parts) {
+    if (part === "..") {
+      if (stack.length === 0) {
+        throw new Error(`${path} must be a relative path inside the project`);
+      }
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+
+  if (stack.length < 2) {
+    throw new Error(`${path} must contain a dedicated parent directory and child directory inside the project`);
   }
 }
 

@@ -240,6 +240,78 @@ describe("loadConfig", () => {
     expect(() => loadConfig(project)).toThrow("roles.planner.thinking must be one of");
   });
 
+  it("adds lifecycle roles and options with safe defaults", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    const config = loadConfig(project);
+
+    expect(config.roles.spec).toEqual(DEFAULT_CONFIG.roles.spec);
+    expect(config.roles.verifier.model).toBe("claude-fable-5");
+    expect(config.roles.reviewer.thinking).toBe("xhigh");
+    expect(config.roles.shipper.provider).toBe("anthropic");
+    expect(config.lifecycle.artifactsDir).toBe(".ai-orchestrator/runs");
+    expect(config.build.commitPerTask).toBe(false);
+    expect(config.ship).toEqual({ commit: "ask", openPr: "ask" });
+  });
+
+  it("allows project config to override lifecycle roles and options", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      roles: {
+        spec: { provider: "cheap", model: "fast-planner", thinking: "high" },
+        verifier: { model: "fast-verifier" },
+      },
+      lifecycle: { artifactsDir: ".orch/runs" },
+      build: { commitPerTask: true },
+      ship: { commit: "auto", openPr: "never" },
+    });
+
+    const config = loadConfig(project);
+    expect(config.roles.spec).toEqual({ provider: "cheap", model: "fast-planner", thinking: "high" });
+    expect(config.roles.verifier.model).toBe("fast-verifier");
+    expect(config.roles.verifier.provider).toBe(DEFAULT_CONFIG.roles.verifier.provider);
+    expect(config.lifecycle.artifactsDir).toBe(".orch/runs");
+    expect(config.build.commitPerTask).toBe(true);
+    expect(config.ship).toEqual({ commit: "auto", openPr: "never" });
+  });
+
+  it("rejects unsafe lifecycle paths and invalid ship modes", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    for (const artifactsDir of ["../outside", "..\\outside", "a/../../outside", "/tmp/outside", "C:outside"] as const) {
+      writeJson(join(project, ".ai-orchestrator.json"), {
+        lifecycle: { artifactsDir },
+      });
+      expect(() => loadConfig(project), artifactsDir).toThrow("lifecycle.artifactsDir must be a relative path inside the project");
+    }
+
+    for (const artifactsDir of ["runs", ".", "a/../runs"] as const) {
+      writeJson(join(project, ".ai-orchestrator.json"), {
+        lifecycle: { artifactsDir },
+      });
+      expect(() => loadConfig(project), artifactsDir).toThrow(
+        "lifecycle.artifactsDir must contain a dedicated parent directory and child directory inside the project",
+      );
+    }
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      ship: { commit: "sometimes" },
+    });
+    expect(() => loadConfig(project)).toThrow("ship.commit must be one of ask, never, auto");
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      ship: { openPr: "auto" },
+    });
+    expect(() => loadConfig(project)).toThrow("ship.openPr must be one of ask, never");
+  });
+
   it("maps shared config to loop config", () => {
     const loopConfig = loopConfigFrom({
       ...DEFAULT_CONFIG,
