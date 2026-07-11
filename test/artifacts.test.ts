@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   appendJournal,
+  appendRoutingTrace,
   createRun,
   currentRun,
   readState,
@@ -39,11 +40,30 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(run.paths.spec)).toBe(true);
     expect(existsSync(run.paths.plan)).toBe(true);
     expect(existsSync(run.paths.debug)).toBe(true);
+    expect(readFileSync(run.paths.routing, "utf8")).toBe("");
     expect(readFileSync(join(cwd, ".ai-orchestrator", "runs", "current"), "utf8").trim()).toBe(run.runId);
     expect(readFileSync(run.paths.journal, "utf8")).toContain("Task: ship a feature");
     expect(readState(run.paths)).toMatchObject({ runId: run.runId, phase: "defining", task: "ship a feature" });
 
     expect(currentRun(cwd, artifactsDir)?.runId).toBe(run.runId);
+  });
+
+  it("appends bounded routing decision records", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    appendRoutingTrace(run.paths, {
+      decisionId: "decision-1",
+      runId: run.runId,
+      stage: "build",
+      recordedAt: new Date(0).toISOString(),
+      plan: { engine: "capability", candidates: [] },
+      attempts: [{ provider: "p", model: "m", outcome: "selected" }],
+    });
+    expect(JSON.parse(readFileSync(run.paths.routing, "utf8"))).toMatchObject({ decisionId: "decision-1", stage: "build" });
+    expect(() => appendRoutingTrace(run.paths, {
+      decisionId: "oversized", runId: run.runId, stage: "build", recordedAt: "now",
+      plan: { text: "x".repeat(300_000) }, attempts: [],
+    })).toThrow(/exceeds 256 KiB/);
   });
 
   it("writes and reads state atomically", () => {

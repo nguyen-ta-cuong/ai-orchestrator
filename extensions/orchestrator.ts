@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { DEFAULT_CONFIG, loadConfig, loopConfigFrom, type OrchestratorConfig, type RoleConfig } from "../src/core/config.js";
+import { DEFAULT_CONFIG, loadConfigWithProvenance, loopConfigFrom, type ConfigProvenance, type OrchestratorConfig, type RoleConfig } from "../src/core/config.js";
+import { createPiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
+import type { ModelSelectionIdentity, RoutingStage } from "../src/core/modelRouting.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
@@ -26,10 +28,23 @@ interface RuntimeState extends OrchestratorState {
   plannerReminderSent?: boolean;
   latestJudgeFeedback?: string;
   toolsBeforeJudge?: string[];
+  modelSelections?: Array<{
+    stage: "plan" | "build" | "fast-judge";
+    provider: string;
+    model: string;
+    family?: string;
+    thinking: OrchestratorConfig["roles"]["coder"]["thinking"];
+    reason: string;
+    engine: OrchestratorConfig["routing"]["engine"];
+    policyVersion: string;
+    taskFeaturesHash: string;
+    fallbackCount: number;
+  }>;
 }
 
 interface RuntimeConfig {
   config: OrchestratorConfig;
+  provenance: ConfigProvenance;
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
@@ -207,8 +222,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
 
     let config: OrchestratorConfig;
+    let provenance: ConfigProvenance;
     try {
-      config = loadPiConfig(ctx.cwd);
+      const resolved = loadPiResolvedConfig(ctx.cwd);
+      config = resolved.config;
+      provenance = resolved.provenance;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       notifyUser(ctx, `Invalid ai-orchestrator config: ${message}`, "error");
@@ -221,9 +239,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    runtime = { config };
+    runtime = { config, provenance };
 
-    const missingRole = findMissingRole(ctx, config);
+    const missingRole = config.routing.engine === "capability" ? undefined : findMissingRole(ctx, config);
     if (missingRole) {
       notifyUser(ctx, missingRole, "error");
       runtime = undefined;
@@ -358,7 +376,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const ok = await switchToRole("judge", ctx);
     if (!ok) return;
 
-    runtime = runtime ?? { config: loadPiConfig(ctx.cwd) };
+    runtime = runtime ?? loadPiResolvedConfig(ctx.cwd);
     state = { ...state, toolsBeforeJudge: pi.getActiveTools() };
     persist();
     pi.setActiveTools(JUDGE_TOOLS);
@@ -495,22 +513,60 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function switchToRole(role: keyof OrchestratorConfig["roles"], ctx: ExtensionContext): Promise<boolean> {
-    const config = runtime?.config ?? loadPiConfig(ctx.cwd);
-    const roleConfig = config.roles[role];
-    const model = ctx.modelRegistry.find(roleConfig.provider, roleConfig.model);
-    if (!model) {
-      await abortForModelError(ctx, `${role} model not found: ${roleConfig.provider}/${roleConfig.model}`);
-      return false;
+    const resolved = runtime ?? loadPiResolvedConfig(ctx.cwd);
+    runtime = resolved;
+    const stage = fastRoutingStage(role);
+    const priorSelections: ModelSelectionIdentity[] = (state.modelSelections ?? []).map((selection) => ({
+      stage: selection.stage,
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.family ? { family: selection.family } : {}),
+    }));
+    const plan = createPiRoutingPlan({
+      config: resolved.config,
+      provenance: resolved.provenance,
+      stage,
+      role,
+      available: ctx.modelRegistry.getAvailable(),
+      evidence: { task: state.task, plan: state.plan, verdictCategory: state.latestJudgeFeedback },
+      priorSelections,
+    });
+    const failed: string[] = [];
+    for (const candidate of plan.candidates) {
+      const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
+      if (!model) {
+        failed.push(`${candidate.provider}/${candidate.model} (not found)`);
+        continue;
+      }
+      const runId = state.runId;
+      const phase = state.phase;
+      if (!(await pi.setModel(model))) {
+        failed.push(`${candidate.provider}/${candidate.model} (unavailable)`);
+        continue;
+      }
+      if (state.runId !== runId || state.phase !== phase) return false;
+      pi.setThinkingLevel(candidate.thinking);
+      state = {
+        ...state,
+        modelSelections: [...(state.modelSelections ?? []), {
+          stage,
+          provider: candidate.provider,
+          model: candidate.model,
+          ...(candidate.family ? { family: candidate.family } : {}),
+          thinking: candidate.thinking,
+          reason: candidate.reason,
+          engine: plan.engine,
+          policyVersion: plan.policyVersion,
+          taskFeaturesHash: plan.taskFeaturesHash,
+          fallbackCount: failed.length,
+        }],
+      };
+      persist();
+      return true;
     }
-
-    const ok = await pi.setModel(model);
-    if (!ok) {
-      await abortForModelError(ctx, `${role} model has no configured API key: ${roleConfig.provider}/${roleConfig.model}`);
-      return false;
-    }
-
-    pi.setThinkingLevel(roleConfig.thinking);
-    return true;
+    const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
+    await abortForModelError(ctx, `${role} has no eligible model (${[...failed, ...exclusions].join(", ") || "no candidates"})`);
+    return false;
   }
 
   async function abortForModelError(ctx: ExtensionContext, reason: string): Promise<void> {
@@ -580,9 +636,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    const role = phaseRole(state.phase);
-    const roleConfig = role && runtime?.config.roles[role];
-    const modelLabel = roleConfig ? ` ${roleConfig.provider}/${roleConfig.model}` : "";
+    const selection = state.modelSelections?.at(-1);
+    const modelLabel = selection ? ` ${selection.provider}/${selection.model}` : "";
     ctx.ui.setStatus(STATUS_KEY, `orchestrator ${state.phase}${modelLabel}`);
 
     const latestReport = state.judgeReports.at(-1);
@@ -591,6 +646,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       `Task: ${truncate(state.task, 80)}`,
       `Coder iterations: ${state.coderIterations}`,
       `Consecutive rejections: ${state.consecutiveRejections}`,
+      selection ? `Routing: ${selection.engine}; fallback ${selection.fallbackCount}` : undefined,
       latestReport ? `Last judge: ${latestReport.verdict} — ${truncate(latestReport.reasons, 80)}` : undefined,
     ].filter((line): line is string => Boolean(line));
     ctx.ui.setWidget(WIDGET_KEY, lines);
@@ -616,11 +672,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 }
 
 function createRuntimeState(overrides: Partial<RuntimeState> = {}): RuntimeState {
-  return { ...(createIdleState(overrides) as RuntimeState), ...overrides };
+  return { ...(createIdleState(overrides) as RuntimeState), modelSelections: [], ...overrides };
 }
 
-function loadPiConfig(cwd: string): OrchestratorConfig {
-  return loadConfig(cwd, { ignoreMcpProviders: true });
+function loadPiResolvedConfig(cwd: string) {
+  return loadConfigWithProvenance(cwd, { ignoreMcpProviders: true });
+}
+
+function fastRoutingStage(role: keyof OrchestratorConfig["roles"]): Extract<RoutingStage, "plan" | "build" | "fast-judge"> {
+  if (role === "planner") return "plan";
+  if (role === "coder") return "build";
+  if (role === "judge") return "fast-judge";
+  throw new Error(`Role ${role} is not part of the fast workflow`);
 }
 
 function createRunId(): string {
@@ -743,14 +806,6 @@ function finalSummary(state: RuntimeState): string {
     .join("\n\n");
 }
 
-function phaseRole(phase: OrchestratorState["phase"]): keyof OrchestratorConfig["roles"] | undefined {
-  if (phase === "planning" || phase === "replanning" || phase === "awaiting_approval") return "planner";
-  if (phase === "coding") return "coder";
-  if (phase === "judging") return "judge";
-  return undefined;
-}
-
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
 }
-

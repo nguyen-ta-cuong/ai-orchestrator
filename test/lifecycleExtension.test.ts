@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -32,7 +32,7 @@ function makeRun(phase: LifecyclePhase) {
   return { cwd, paths: created.paths };
 }
 
-function extensionHarness(cwd: string) {
+function extensionHarness(cwd: string, models: Array<Record<string, unknown>> = [{ provider: "anthropic", id: "claude-fable-5" }]) {
   const commands = new Map<string, CommandHandler>();
   const events = new Map<string, EventHandler>();
   let activeTools = ["read", "bash", "agent_team"];
@@ -62,7 +62,7 @@ function extensionHarness(cwd: string) {
     signal: new AbortController().signal,
     model: { provider: "test", id: "current-model" },
     modelRegistry: {
-      getAvailable: () => [{ provider: "anthropic", id: "claude-fable-5" }],
+      getAvailable: () => models,
       find: (provider: string, id: string) => ({ provider, id }),
     },
     sessionManager: { getBranch: () => [] },
@@ -85,6 +85,82 @@ afterEach(() => {
 });
 
 describe("lifecycle Pi extension safety", () => {
+  it("uses capability routing for BUILD and an independent VERIFY model", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability",
+        unknownCost: "allow",
+        profiles: {
+          "invented/coder": { family: "maker", confidence: 9000, version: "test", scores: { coding: 9500, verification: 6000 } },
+          "invented/checker": { family: "checker", confidence: 9000, version: "test", scores: { coding: 6000, verification: 9500 } },
+        },
+      },
+    }));
+    const models = ["coder", "checker"].map((id) => ({
+      provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
+    }));
+    const buildHarness = extensionHarness(run.cwd, models);
+    await buildHarness.commands.get("lifecycle")!("resume", buildHarness.ctx);
+    expect(readState(run.paths)?.modelSelections.at(-1)).toMatchObject({
+      stage: "build", model: "coder", family: "maker", routing: { engine: "capability" },
+    });
+
+    const resumeHarness = extensionHarness(run.cwd, models);
+    await resumeHarness.commands.get("lifecycle")!("resume", resumeHarness.ctx);
+    expect(readState(run.paths)?.modelSelections).toHaveLength(1);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("reused saved decision");
+
+    const state = readState(run.paths)!;
+    state.phase = "verifying";
+    writeState(run.paths, state);
+    const verifyHarness = extensionHarness(run.cwd, models);
+    await verifyHarness.commands.get("lifecycle")!("resume", verifyHarness.ctx);
+    expect(readState(run.paths)?.modelSelections.at(-1)).toMatchObject({
+      stage: "verify", model: "checker", family: "checker", routing: { separation: "different-family" },
+    });
+    expect(readFileSync(run.paths.routing, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("does not access runtime tool state while the extension factory is loading", () => {
+    const getActiveTools = vi.fn(() => {
+      throw new Error("Extension runtime not initialized");
+    });
+    const pi = {
+      registerFlag: vi.fn(),
+      registerTool: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      getActiveTools,
+    };
+
+    expect(() => lifecycleExtension(pi as unknown as ExtensionAPI)).not.toThrow();
+    expect(getActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("records a typed fallback when the highest-ranked model cannot be activated", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability", unknownCost: "allow",
+        profiles: {
+          "invented/first": { confidence: 9000, version: "test", scores: { coding: 9500 } },
+          "invented/second": { confidence: 9000, version: "test", scores: { coding: 8500 } },
+        },
+      },
+    }));
+    const models = ["first", "second"].map((id) => ({
+      provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
+    }));
+    const harness = extensionHarness(run.cwd, models);
+    vi.mocked(harness.pi.setModel).mockImplementation(async (model: unknown) => (model as { id: string }).id !== "first");
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+    expect(readState(run.paths)?.modelSelections.at(-1)).toMatchObject({
+      model: "second",
+      routing: { fallbackCount: 1, attemptedModels: ["invented/first", "invented/second"], failureCategories: ["unavailable"] },
+    });
+  });
+
   it("does not expose agent_team during SHIP", async () => {
     const run = makeRun("shipping");
     const harness = extensionHarness(run.cwd);

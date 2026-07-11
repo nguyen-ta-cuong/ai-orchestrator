@@ -239,13 +239,15 @@ The lifecycle defaults to `.ai-orchestrator/runs`, asks before committing or ope
 }
 ```
 
-Each routing stage must have at least one candidate. Routing lists replace the default list for that stage; they are not merged by array position. Set `routing.lifecycle.enabled` to `false` to use only the corresponding fixed lifecycle role (`spec`, `planner`, `verifier`, `reviewer`, `debugger`, or `shipper`).
+Each legacy routing stage must have at least one candidate. These lists drive `legacy` and `capability-shadow`; arrays replace the default list for that stage rather than merging by position. Set `routing.lifecycle.enabled` to `false` to use only the corresponding fixed lifecycle role (`spec`, `planner`, `verifier`, `reviewer`, `debugger`, or `shipper`).
 
 `ship.commit` can be `ask`, `never`, or `auto`; `ship.openPr` can be `ask` or `never`. Even `auto` never pushes, and interactive approval is still required before opening a PR.
 
-### Capability-routing preview
+### Capability routing
 
-Capability routing is currently a shadow-only policy: it ranks locally callable Pi models and explains exclusions, but the paid lifecycle and fast loop still use the legacy role and lifecycle routes above. The fresh default is `routing.engine: "capability-shadow"`; `legacy` disables the intended shadow posture, while `capability` is reserved for the later workflow-integration milestone and is not operative yet.
+Capability routing is shared by the durable lifecycle and the fast Plan → Code → Judge loop. Set `routing.engine` to `"capability"` to make it active for every role, including BUILD. The conservative fresh default remains `"capability-shadow"`, which keeps legacy selection active while exposing the read-only ranking preview. Set `"legacy"` for the one-setting rollback.
+
+In capability mode, a `roles.*` provider or model written in user or project config is an exact pin. An untouched built-in role (including `openai-codex/gpt-5.5` for BUILD) is only a tie-breaking preference. Checkers cannot select the exact latest BUILD identity; strict family separation can additionally be required per stage. Each lifecycle run stores a compact selection summary in `state.json`, an explanation in `journal.md`, and the full append-only decision and fallback trace in `routing.jsonl`.
 
 Run the read-only preview with any lifecycle stage or `fast-judge`:
 
@@ -260,7 +262,7 @@ Profiles contain subjective, user-overridable policy claims. All capability scor
 ```json
 {
   "routing": {
-    "engine": "capability-shadow",
+    "engine": "capability",
     "mode": "balanced",
     "allowInferredProfiles": false,
     "unknownCost": "penalize",
@@ -303,7 +305,7 @@ Profiles contain subjective, user-overridable policy claims. All capability scor
 }
 ```
 
-Modes are `quality`, `balanced`, `economy`, `pinned`, and `custom`. Hard constraints always run before scoring. Unknown profiles are excluded unless `allowInferredProfiles` is enabled; inferred profiles start with zero confidence and do not satisfy normal stage floors. Unknown cost follows `unknownCost: "exclude" | "penalize" | "allow"` and is never treated as free. User-level deny lists, cost/attempt ceilings, and separation requirements cannot be weakened by project configuration; a project may only add denials or tighten those limits.
+Modes are `quality`, `balanced`, `economy`, `pinned`, and `custom`. Hard constraints always run before scoring. Unknown profiles are excluded unless `allowInferredProfiles` is enabled; inferred profiles start with zero confidence and do not satisfy normal stage floors. Unknown cost follows `unknownCost: "exclude" | "penalize" | "allow"` and is never treated as free. User-level deny lists, cost/attempt ceilings, and separation requirements cannot be weakened by project configuration; a project may only add denials or tighten those limits. To reproduce the old behavior exactly, use `"engine": "legacy"`; to keep capability ranking observational, use `"capability-shadow"`.
 
 ### MCP provider configuration
 
@@ -335,14 +337,14 @@ Put provider credentials in `~/.ai-orchestrator/config.json`, not the repository
 | Setting | Default |
 | --- | --- |
 | Planner / judge | `anthropic/claude-fable-5` at `xhigh` |
-| Coder / lifecycle BUILD | `openai-codex/gpt-5.5` at `xhigh` |
+| Coder / lifecycle BUILD preference | `openai-codex/gpt-5.5` at `xhigh` |
 | Fast-loop coder passes | 3 |
 | Rejections before re-plan | 2 consecutive |
 | Plan approval | Required |
 | Lifecycle commit | Ask |
 | Lifecycle PR | Ask; never push |
 
-The lifecycle dynamically prefers Fable for DEFINE, PLAN, and SHIP, and GPT-5.6 Sol for VERIFY, REVIEW, and DEBUG, then falls back through configured candidates that are already authenticated locally. These preference orders are fully configurable.
+Legacy/shadow lifecycle selection prefers Fable for DEFINE, PLAN, and SHIP, and GPT-5.6 Sol for VERIFY, REVIEW, and DEBUG. Capability mode instead ranks the callable Pi registry against per-stage profiles, task evidence, policy limits, and maker/checker separation, then records typed fallback reasons.
 
 ## Development and validation
 

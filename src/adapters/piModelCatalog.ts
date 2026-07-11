@@ -12,7 +12,6 @@ export interface PiModelLike {
   maxTokens?: unknown;
   cost?: unknown;
   thinkingLevelMap?: unknown;
-  [key: string]: unknown;
 }
 
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];

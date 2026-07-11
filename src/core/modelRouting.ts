@@ -385,7 +385,9 @@ function exclusionFor(
   if (policy.deny.models.includes(identityText)) return excluded("denied-model", `${identityText} is denied by policy`);
   const family = profile?.family ?? model.family;
   if (family && policy.deny.families.includes(family)) return excluded("denied-family", `family ${family} is denied by policy`);
-  if (policy.mode === "pinned" && !stage.pins.includes(identityText)) return excluded("pinned-only", `${identityText} is not pinned for ${request.stage}`);
+  if ((policy.mode === "pinned" || stage.pins.length > 0) && !stage.pins.includes(identityText)) {
+    return excluded("pinned-only", `${identityText} is not pinned for ${request.stage}`);
+  }
   if (!profile) return excluded("profile-unknown", `${identityText} has no explicit profile and inferred profiles are disabled`);
   if (profile.confidence < stage.minimumProfileConfidence) {
     return excluded("profile-confidence-low", `${identityText} profile confidence ${profile.confidence} is below ${stage.minimumProfileConfidence}`);
