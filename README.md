@@ -91,6 +91,7 @@ These commands let you control or continue a lifecycle run:
 /lifecycle [--yolo] <task>   Create and automatically drive a full run
 /lifecycle resume            Continue the active run from its saved phase
 /lifecycle-stop              Stop, restore model/tools, and preserve artifacts
+/lifecycle-models [stage]    Preview legacy and capability routing without invoking a model
 /spec [--yolo] <idea>        Run DEFINE only
 /plan                        Run the currently pending PLAN stage
 /build                       Run the currently pending BUILD stage
@@ -241,6 +242,68 @@ The lifecycle defaults to `.ai-orchestrator/runs`, asks before committing or ope
 Each routing stage must have at least one candidate. Routing lists replace the default list for that stage; they are not merged by array position. Set `routing.lifecycle.enabled` to `false` to use only the corresponding fixed lifecycle role (`spec`, `planner`, `verifier`, `reviewer`, `debugger`, or `shipper`).
 
 `ship.commit` can be `ask`, `never`, or `auto`; `ship.openPr` can be `ask` or `never`. Even `auto` never pushes, and interactive approval is still required before opening a PR.
+
+### Capability-routing preview
+
+Capability routing is currently a shadow-only policy: it ranks locally callable Pi models and explains exclusions, but the paid lifecycle and fast loop still use the legacy role and lifecycle routes above. The fresh default is `routing.engine: "capability-shadow"`; `legacy` disables the intended shadow posture, while `capability` is reserved for the later workflow-integration milestone and is not operative yet.
+
+Run the read-only preview with any lifecycle stage or `fast-judge`:
+
+```text
+/lifecycle-models review
+```
+
+The report shows the locally available legacy choice, ordered capability candidates, selected thinking level, score components, and typed exclusions. It ends with `Shadow only; no model invoked or selected.` The command waits for the current agent to become idle, reads `ctx.modelRegistry.getAvailable()`, and does not switch models, call an LLM, start a run, or write lifecycle artifacts.
+
+Profiles contain subjective, user-overridable policy claims. All capability scores and confidence values are integer basis points from `0` through `10000`; for example, `8000` represents 80%. Objective facts such as callability, text/image input, reasoning support, context, output limit, and cost come from Pi metadata instead.
+
+```json
+{
+  "routing": {
+    "engine": "capability-shadow",
+    "mode": "balanced",
+    "allowInferredProfiles": false,
+    "unknownCost": "penalize",
+    "deny": {
+      "providers": [],
+      "models": ["untrusted/opaque-model"],
+      "families": []
+    },
+    "limits": {
+      "maxEstimatedUsdPerRun": 8,
+      "maxAttemptsPerStage": 3
+    },
+    "separation": {
+      "checkerMustDifferFromBuilder": true,
+      "preferDifferentProviderFamily": true,
+      "requireDifferentProviderFamilyFor": ["review", "ship"]
+    },
+    "stages": {
+      "review": {
+        "prefer": ["my-provider/my-reviewer"],
+        "minimumScores": { "review": 8000, "architecture": 7000 }
+      }
+    },
+    "profiles": {
+      "my-provider/my-reviewer": {
+        "family": "independent-review-family",
+        "confidence": 9000,
+        "provenance": "project",
+        "version": "team-eval-v1",
+        "scores": {
+          "architecture": 8000,
+          "verification": 8500,
+          "review": 9000,
+          "structuredOutput": 9000,
+          "longContext": 8000
+        }
+      }
+    }
+  }
+}
+```
+
+Modes are `quality`, `balanced`, `economy`, `pinned`, and `custom`. Hard constraints always run before scoring. Unknown profiles are excluded unless `allowInferredProfiles` is enabled; inferred profiles start with zero confidence and do not satisfy normal stage floors. Unknown cost follows `unknownCost: "exclude" | "penalize" | "allow"` and is never treated as free. User-level deny lists, cost/attempt ceilings, and separation requirements cannot be weakened by project configuration; a project may only add denials or tighten those limits.
 
 ### MCP provider configuration
 

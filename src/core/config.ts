@@ -1,6 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import {
+  DEFAULT_ROUTING_POLICY,
+  type ModelCapabilityProfile,
+  type RoutingPolicy,
+  type RoutingStage,
+  type StageRoutingPolicy,
+} from "./modelRouting.js";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -27,6 +34,11 @@ export interface LifecycleRoutingConfig {
   stages: Record<LifecycleRoutedStage, ModelCandidate[]>;
 }
 
+export interface CapabilityRoutingConfig extends RoutingPolicy {
+  engine: "legacy" | "capability-shadow" | "capability";
+  profiles: Record<string, ModelCapabilityProfile>;
+}
+
 export interface OrchestratorConfig {
   roles: Record<RoleName, RoleConfig>;
   loop: {
@@ -47,7 +59,7 @@ export interface OrchestratorConfig {
   };
   routing: {
     lifecycle: LifecycleRoutingConfig;
-  };
+  } & CapabilityRoutingConfig;
   ship: {
     commit: ShipCommitMode;
     openPr: ShipOpenPrMode;
@@ -64,7 +76,13 @@ type ConfigPatch = Partial<{
   judge: Partial<OrchestratorConfig["judge"]>;
   lifecycle: Partial<OrchestratorConfig["lifecycle"]>;
   build: Partial<OrchestratorConfig["build"]>;
-  routing: Partial<{ lifecycle: Partial<{ enabled: boolean; stages: Partial<Record<LifecycleRoutedStage, ModelCandidate[]>> }> }>;
+  routing: Partial<CapabilityRoutingConfig> & {
+    lifecycle?: Partial<{ enabled: boolean; stages: Partial<Record<LifecycleRoutedStage, ModelCandidate[]>> }>;
+    deny?: Partial<RoutingPolicy["deny"]>;
+    separation?: Partial<RoutingPolicy["separation"]>;
+    limits?: Partial<RoutingPolicy["limits"]>;
+    stages?: Partial<Record<RoutingStage, Partial<StageRoutingPolicy>>>;
+  };
   ship: Partial<OrchestratorConfig["ship"]>;
   mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>> }>;
 }>;
@@ -72,6 +90,11 @@ type ConfigPatch = Partial<{
 export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
 
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const ROUTING_STAGES: readonly RoutingStage[] = ["define", "plan", "build", "verify", "debug", "review", "ship", "fast-judge"];
+const CAPABILITY_NAMES = [
+  "requirements", "architecture", "coding", "debugging", "verification", "review", "release",
+  "structuredOutput", "longContext", "speed", "economy",
+] as const;
 const FABLE: ModelCandidate = { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" };
 const GPT_56_SOL: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "xhigh" };
 const GPT_56_TERRA: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-terra", thinking: "xhigh" };
@@ -109,6 +132,9 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     commitPerTask: false,
   },
   routing: {
+    ...cloneConfig(DEFAULT_ROUTING_POLICY),
+    engine: "capability-shadow",
+    profiles: {},
     lifecycle: {
       enabled: true,
       stages: {
@@ -167,10 +193,10 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Orches
 
   const userConfig = readJsonIfPresent(userPath);
   const projectConfig = readJsonIfPresent(projectPath);
-  const merged = deepMerge(
-    deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders)),
-    sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders),
-  );
+  const userMerged = deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders));
+  validateConfig(cloneConfig(userMerged));
+  const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
+  const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing));
 
   return interpolateMcpApiKeys(validateConfig(merged));
 }
@@ -257,6 +283,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
     }
     stageCandidates.forEach((candidate, index) => validateRoleConfig(candidate, `routing.lifecycle.stages.${stage}[${index}]`));
   }
+  validateCapabilityRouting(routing);
 
   requirePositiveInteger(loop.maxCoderIterations, "loop.maxCoderIterations");
   requirePositiveInteger(loop.plannerEscalationAfterRejections, "loop.plannerEscalationAfterRejections");
@@ -277,6 +304,72 @@ function validateConfig(value: unknown): OrchestratorConfig {
   }
 
   return config as unknown as OrchestratorConfig;
+}
+
+function validateCapabilityRouting(routing: Record<string, unknown>): void {
+  requireStringEnum(routing.engine, "routing.engine", ["legacy", "capability-shadow", "capability"] as const);
+  requireStringEnum(routing.mode, "routing.mode", ["quality", "balanced", "economy", "pinned", "custom"] as const);
+  requireNonEmptyString(routing.version, "routing.version");
+  requireBoolean(routing.allowInferredProfiles, "routing.allowInferredProfiles");
+  requireStringEnum(routing.unknownCost, "routing.unknownCost", ["exclude", "penalize", "allow"] as const);
+  requireNonNegativeInteger(routing.unknownCostPenaltyBasisPoints, "routing.unknownCostPenaltyBasisPoints");
+  requireNonNegativeInteger(routing.confidenceBonusBasisPoints, "routing.confidenceBonusBasisPoints");
+  requireNonNegativeNumber(routing.costPenaltyBasisPointsPerUsd, "routing.costPenaltyBasisPointsPerUsd");
+
+  const deny = requirePlainObject(routing.deny, "routing.deny");
+  requireStringArray(deny.providers, "routing.deny.providers");
+  requireStringArray(deny.models, "routing.deny.models");
+  requireStringArray(deny.families, "routing.deny.families");
+
+  const separation = requirePlainObject(routing.separation, "routing.separation");
+  requireBoolean(separation.checkerMustDifferFromBuilder, "routing.separation.checkerMustDifferFromBuilder");
+  requireBoolean(separation.preferDifferentProviderFamily, "routing.separation.preferDifferentProviderFamily");
+  requireEnumArray(separation.requireDifferentProviderFamilyFor, "routing.separation.requireDifferentProviderFamilyFor", ROUTING_STAGES);
+
+  const limits = requirePlainObject(routing.limits, "routing.limits");
+  requireNonNegativeNumber(limits.maxEstimatedUsdPerRun, "routing.limits.maxEstimatedUsdPerRun");
+  requirePositiveInteger(limits.maxAttemptsPerStage, "routing.limits.maxAttemptsPerStage");
+
+  const stages = requirePlainObject(routing.stages, "routing.stages");
+  for (const stageName of ROUTING_STAGES) validateCapabilityStage(stages[stageName], `routing.stages.${stageName}`);
+
+  const profiles = requirePlainObject(routing.profiles, "routing.profiles");
+  for (const [identity, value] of Object.entries(profiles)) {
+    if (!identity.includes("/") || identity.startsWith("/") || identity.endsWith("/") || identity.trim() !== identity) {
+      throw new Error("routing.profiles keys must be non-empty provider/model identities");
+    }
+    const profile = requirePlainObject(value, `routing.profiles.${identity}`);
+    if (profile.family !== undefined) requireNonEmptyString(profile.family, `routing.profiles.${identity}.family`);
+    requireBasisPoints(profile.confidence, `routing.profiles.${identity}.confidence`);
+    if (profile.provenance !== undefined) {
+      requireStringEnum(profile.provenance, `routing.profiles.${identity}.provenance`, ["user", "project", "builtin", "observed", "inferred"] as const);
+    }
+    if (profile.version !== undefined) requireNonEmptyString(profile.version, `routing.profiles.${identity}.version`);
+    validateCapabilityValues(profile.scores, `routing.profiles.${identity}.scores`, true);
+  }
+}
+
+function validateCapabilityStage(value: unknown, path: string): void {
+  const stage = requirePlainObject(value, path);
+  requireStringArray(stage.prefer, `${path}.prefer`);
+  requireStringArray(stage.pins, `${path}.pins`);
+  requireEnumArray(stage.requiredInput, `${path}.requiredInput`, ["text", "image"] as const);
+  requireNonNegativeInteger(stage.minimumContextWindow, `${path}.minimumContextWindow`);
+  requireNonNegativeInteger(stage.minimumOutputTokens, `${path}.minimumOutputTokens`);
+  requireBoolean(stage.requiresReasoning, `${path}.requiresReasoning`);
+  requireBasisPoints(stage.minimumProfileConfidence, `${path}.minimumProfileConfidence`);
+  validateCapabilityValues(stage.minimumScores, `${path}.minimumScores`, true);
+  validateCapabilityValues(stage.weights, `${path}.weights`, false);
+  requireStringEnum(stage.thinking, `${path}.thinking`, THINKING_LEVELS);
+}
+
+function validateCapabilityValues(value: unknown, path: string, basisPoints: boolean): void {
+  const values = requirePlainObject(value, path);
+  for (const [name, score] of Object.entries(values)) {
+    if (!(CAPABILITY_NAMES as readonly string[]).includes(name)) throw new Error(`${path}.${name} is not a recognized capability`);
+    if (basisPoints) requireBasisPoints(score, `${path}.${name}`);
+    else requireNonNegativeInteger(score, `${path}.${name}`);
+  }
 }
 
 function requirePlainObject(value: unknown, path: string): Record<string, unknown> {
@@ -320,6 +413,20 @@ function requirePositiveInteger(value: unknown, path: string): void {
   }
 }
 
+function requireNonNegativeInteger(value: unknown, path: string): void {
+  if (!Number.isInteger(value) || (value as number) < 0) throw new Error(`${path} must be a non-negative integer`);
+}
+
+function requireNonNegativeNumber(value: unknown, path: string): void {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`${path} must be a non-negative number`);
+}
+
+function requireBasisPoints(value: unknown, path: string): void {
+  if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 10_000) {
+    throw new Error(`${path} must be an integer between 0 and 10000`);
+  }
+}
+
 function requireBoolean(value: unknown, path: string): void {
   if (typeof value !== "boolean") {
     throw new Error(`${path} must be a boolean`);
@@ -330,6 +437,16 @@ function requireStringEnum<T extends string>(value: unknown, path: string, allow
   if (typeof value !== "string" || !allowed.includes(value as T)) {
     throw new Error(`${path} must be one of ${allowed.join(", ")}`);
   }
+}
+
+function requireStringArray(value: unknown, path: string): void {
+  if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
+  value.forEach((item, index) => requireNonEmptyString(item, `${path}[${index}]`));
+}
+
+function requireEnumArray<T extends string>(value: unknown, path: string, allowed: readonly T[]): void {
+  if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
+  value.forEach((item, index) => requireStringEnum(item, `${path}[${index}]`, allowed));
 }
 
 function requireSafeRelativePath(value: unknown, path: string): void {
@@ -363,6 +480,74 @@ function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): 
   }
   const { mcp: _ignoredMcp, ...rest } = patch;
   return rest;
+}
+
+function constrainProjectRoutingPatch(patch: ConfigPatch, userRouting: CapabilityRoutingConfig): ConfigPatch {
+  if (!patch.routing) return patch;
+  const routing = cloneConfig(patch.routing) as unknown as Record<string, unknown>;
+  protectDenyRules(routing, userRouting);
+  protectLimits(routing, userRouting);
+  protectSeparation(routing, userRouting);
+  return { ...patch, routing: routing as unknown as ConfigPatch["routing"] };
+}
+
+function protectDenyRules(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.deny === undefined) {
+    routing.deny = cloneConfig(userRouting.deny);
+    return;
+  }
+  if (!isPlainObject(routing.deny)) return;
+  routing.deny.providers = protectedUnion(userRouting.deny.providers, routing.deny.providers);
+  routing.deny.models = protectedUnion(userRouting.deny.models, routing.deny.models);
+  routing.deny.families = protectedUnion(userRouting.deny.families, routing.deny.families);
+}
+
+function protectLimits(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.limits === undefined) {
+    routing.limits = cloneConfig(userRouting.limits);
+    return;
+  }
+  if (!isPlainObject(routing.limits)) return;
+  routing.limits.maxEstimatedUsdPerRun = protectedMinimum(
+    userRouting.limits.maxEstimatedUsdPerRun,
+    routing.limits.maxEstimatedUsdPerRun,
+  );
+  routing.limits.maxAttemptsPerStage = protectedMinimum(
+    userRouting.limits.maxAttemptsPerStage,
+    routing.limits.maxAttemptsPerStage,
+  );
+}
+
+function protectSeparation(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.separation === undefined) {
+    routing.separation = cloneConfig(userRouting.separation);
+    return;
+  }
+  if (!isPlainObject(routing.separation)) return;
+  routing.separation.checkerMustDifferFromBuilder = protectedBoolean(
+    userRouting.separation.checkerMustDifferFromBuilder,
+    routing.separation.checkerMustDifferFromBuilder,
+  );
+  routing.separation.preferDifferentProviderFamily = protectedBoolean(
+    userRouting.separation.preferDifferentProviderFamily,
+    routing.separation.preferDifferentProviderFamily,
+  );
+  routing.separation.requireDifferentProviderFamilyFor = protectedUnion(
+    userRouting.separation.requireDifferentProviderFamilyFor,
+    routing.separation.requireDifferentProviderFamilyFor,
+  );
+}
+
+function protectedUnion(base: readonly string[], patch: unknown): unknown {
+  return patch === undefined ? [...base] : Array.isArray(patch) ? [...new Set([...base, ...patch])] : patch;
+}
+
+function protectedMinimum(base: number, patch: unknown): unknown {
+  return patch === undefined ? base : typeof patch === "number" ? Math.min(base, patch) : patch;
+}
+
+function protectedBoolean(base: boolean, patch: unknown): unknown {
+  return patch === undefined ? base : typeof patch === "boolean" ? base || patch : patch;
 }
 
 function deepMerge<T>(base: T, patch: unknown): T {
