@@ -29,7 +29,7 @@ SHIP NO-GO continues to use the existing rejection policy directly. DEBUG is spe
 - [x] (2026-07-11) Re-read Pi `docs/extensions.md`, `docs/models.md`, `docs/packages.md`, the complete `examples/extensions/plan-mode/`, and `examples/extensions/structured-output.ts`.
 - [x] (2026-07-11) Milestone 1: extended lifecycle state, artifacts, prompts, configuration, and tests for DEBUG and local stage routing.
 - [x] (2026-07-11) Milestone 2: implemented `extensions/lifecycle.ts` with pipeline/stage commands, structured verdict and diagnosis tools, read-only command policy, disk persistence/resume, routing UI, finalization checkpoints, and safe restoration.
-- [x] (2026-07-11) Milestone 3 automated scope: added `skills/lifecycle/SKILL.md`; `npm test` passes 12 files/111 tests; `npx tsc --noEmit`, build, pack dry-run, and direct Pi package load pass with no extension/skill warnings.
+- [x] (2026-07-11) Milestone 3 automated scope: added `skills/lifecycle/SKILL.md`; after PR review fixes, `npm test` passes 12 files/112 tests; `npx tsc --noEmit`, build, pack dry-run, and direct Pi package load pass with no extension/skill warnings.
 - [ ] Milestone 3 manual model-turn scope: run the full scratch-repository lifecycle, forced DEBUG rejection, and kill/restart transcript. This intentionally remains pending because it invokes paid models and requires an interactive Pi session.
 
 ## Surprises & Discoveries
@@ -54,6 +54,9 @@ SHIP NO-GO continues to use the existing rejection policy directly. DEBUG is spe
 
 - Observation: Safe finalization requires provenance and durable checkpoints, not only `git diff --name-only`.
   Evidence: review found that pre-staged unrelated files could be committed and untracked implementation files omitted. New runs persist baseline dirty/staged paths, refuse commits with pre-staged work, include newly created files via porcelain status, scope `git add`, and persist commit SHA/PR URL before final completion.
+
+- Observation: A stop command must not wait for the operation it is intended to stop, and a durable artifact needs a matching durable completion marker.
+  Evidence: PR review found `/lifecycle-stop` called `waitForIdle()` before `ctx.abort()`, and DEBUG resume truncated a diagnosis written just before a crash because completion lived only in memory. The stop path now aborts immediately; `debugDiagnosisVerdictIndex` is persisted with `debug.md`, allowing resume to advance the exact rejected verdict without rerunning DEBUG.
 
 ## Decision Log
 
@@ -306,7 +309,7 @@ Automated implementation evidence:
 
     npm test
     Test Files  12 passed (12)
-    Tests       111 passed (111)
+    Tests       112 passed (112)
 
     npx tsc --noEmit
     # passed with no output

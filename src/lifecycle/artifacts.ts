@@ -317,6 +317,8 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
     (candidate.debugPath === undefined || typeof candidate.debugPath === "string") &&
+    (candidate.debugDiagnosisVerdictIndex === undefined ||
+      (Number.isInteger(candidate.debugDiagnosisVerdictIndex) && candidate.debugDiagnosisVerdictIndex >= 0)) &&
     (candidate.baselinePaths === undefined ||
       (Array.isArray(candidate.baselinePaths) && candidate.baselinePaths.every((path) => typeof path === "string"))) &&
     (candidate.baselineStagedPaths === undefined ||

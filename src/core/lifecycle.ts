@@ -50,6 +50,7 @@ export interface LifecycleState {
   specPath?: string;
   planPath?: string;
   debugPath?: string;
+  debugDiagnosisVerdictIndex?: number;
   buildIterations: number;
   consecutiveRejections: number;
   verdicts: LifecycleStageVerdict[];

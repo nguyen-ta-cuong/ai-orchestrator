@@ -109,7 +109,6 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   pi.registerCommand("lifecycle-stop", {
     description: "Stop the active lifecycle, restore the model, and preserve artifacts",
     handler: async (_args, ctx) => {
-      await ctx.waitForIdle();
       await stopRun(ctx, "Lifecycle stopped by user.");
     },
   });
@@ -282,6 +281,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         requireToolPhase("debugging", "debug_diagnosis");
         const diagnosis = params as PendingDiagnosis;
         runtime!.pendingDiagnosis = diagnosis;
+        runtime!.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
+        writeState(runtime!.paths, runtime!.state);
         writeFileSync(runtime!.paths.debug, formatDiagnosis(diagnosis));
         appendJournal(runtime!.paths, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
         persistMirror(runtime!.state);
@@ -500,10 +501,21 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         updateUi(ctx);
         sendPrompt(reviewPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan")));
         break;
-      case "debugging":
+      case "debugging": {
+        const rejectionIndex = latestRejectionIndex();
+        if (runtime.state.debugDiagnosisVerdictIndex === rejectionIndex && isNonEmpty(runtime.paths.debug)) {
+          await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "Recovered durable DEBUG diagnosis", ctx);
+          if (!runtime) return;
+          const recoveredPhase = runtime.state.phase as LifecyclePhase;
+          if (recoveredPhase === "failed") await finishRun(ctx);
+          else await continueOrPause(ctx, nextStandaloneForPhase(recoveredPhase));
+          break;
+        }
+        runtime.state.debugDiagnosisVerdictIndex = undefined;
+        writeState(runtime.paths, runtime.state);
+        writeFileSync(runtime.paths.debug, "");
         await enterRoutedStage("debug", "debugger", ctx);
         activateReadOnlyTools("debug_diagnosis");
-        writeFileSync(runtime.paths.debug, "");
         updateUi(ctx);
         sendPrompt(debugPrompt(
           readRequired(runtime.paths.spec, "spec"),
@@ -512,6 +524,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           rel(runtime.paths.debug),
         ));
         break;
+      }
       case "shipping":
         await enterRoutedStage("ship", "shipper", ctx);
         activateReadOnlyTools("ship_decision", true);
@@ -712,6 +725,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         validationCommands: [],
       };
       runtime.pendingDiagnosis = synthesized;
+      runtime.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
+      writeState(runtime.paths, runtime.state);
       writeFileSync(runtime.paths.debug, formatDiagnosis(synthesized));
       appendJournal(runtime.paths, "Synthesized DEBUG diagnosis after missing structured output");
     }
@@ -982,10 +997,17 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     return active?.runId === runId && disk?.runId === runId && (!phase || disk.phase === phase);
   }
 
+  function latestRejectionIndex(): number {
+    const verdicts = runtime?.state.verdicts ?? [];
+    for (let index = verdicts.length - 1; index >= 0; index -= 1) {
+      if (verdicts[index].verdict === "reject") return index;
+    }
+    throw new Error("DEBUG requires a preceding rejection");
+  }
+
   function latestRejection(): LifecycleStageVerdict {
-    const rejection = [...(runtime?.state.verdicts ?? [])].reverse().find((verdict) => verdict.verdict === "reject");
-    if (!rejection) throw new Error("DEBUG requires a preceding rejection");
-    return rejection;
+    const index = latestRejectionIndex();
+    return runtime!.state.verdicts[index];
   }
 
   function buildFeedback(): string | undefined {

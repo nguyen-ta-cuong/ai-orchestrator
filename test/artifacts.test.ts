@@ -57,6 +57,21 @@ describe("lifecycle artifacts", () => {
     expect(readFileSync(run.paths.state, "utf8")).toContain('"phase": "defining"');
   });
 
+  it("persists the DEBUG diagnosis checkpoint for crash-safe resume", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    const state = createIdleLifecycleState({
+      runId: run.runId,
+      phase: "debugging",
+      task: "task",
+      verdicts: [{ stage: "verify", verdict: "reject", reasons: "failed" }],
+      debugDiagnosisVerdictIndex: 0,
+    });
+
+    writeState(run.paths, state);
+    expect(readState(run.paths)).toMatchObject({ phase: "debugging", debugDiagnosisVerdictIndex: 0 });
+  });
+
   it("persists yolo on the initial lifecycle run state", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, artifactsDir, "task", true);
@@ -86,6 +101,11 @@ describe("lifecycle artifacts", () => {
     writeFileSync(run.paths.state, JSON.stringify({
       ...createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task" }),
       originalModel: { provider: "anthropic", id: "model", thinking: "impossible" },
+    }));
+    expect(readState(run.paths)).toBeUndefined();
+    writeFileSync(run.paths.state, JSON.stringify({
+      ...createIdleLifecycleState({ runId: run.runId, phase: "debugging", task: "task" }),
+      debugDiagnosisVerdictIndex: -1,
     }));
     expect(readState(run.paths)).toBeUndefined();
   });
