@@ -6,12 +6,13 @@ declare module "typebox" {
   export const Type: {
     Object(properties: Record<string, unknown>, options?: Record<string, unknown>): unknown;
     String(options?: Record<string, unknown>): unknown;
+    Array(schema: unknown, options?: Record<string, unknown>): unknown;
     Optional(schema: unknown): unknown;
   };
 }
 
 declare module "@earendil-works/pi-coding-agent" {
-  export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
   export interface ModelInfo {
     provider: string;
@@ -20,6 +21,7 @@ declare module "@earendil-works/pi-coding-agent" {
 
   export interface ModelRegistry {
     find(provider: string, model: string): ModelInfo | undefined;
+    getAvailable(): ModelInfo[];
   }
 
   export interface SessionManager {
@@ -29,6 +31,7 @@ declare module "@earendil-works/pi-coding-agent" {
   export interface ExtensionUI {
     select<T extends string>(prompt: string, options: readonly T[]): Promise<T>;
     editor(prompt: string, initialValue: string): Promise<string | undefined>;
+    confirm(title: string, message: string): Promise<boolean>;
     notify(message: string, level?: "info" | "warning" | "error"): void;
     setStatus(key: string, value: string | undefined): void;
     setWidget(key: string, value: string[] | undefined): void;
@@ -40,7 +43,7 @@ declare module "@earendil-works/pi-coding-agent" {
     model?: ModelInfo;
     modelRegistry: ModelRegistry;
     sessionManager: SessionManager;
-    signal: AbortSignal;
+    signal?: AbortSignal;
     ui: ExtensionUI;
     isIdle(): boolean;
     abort(): void;
@@ -56,11 +59,14 @@ declare module "@earendil-works/pi-coding-agent" {
 
   export interface ToolCallEvent {
     toolName: string;
+    input: Record<string, unknown>;
   }
 
   export interface ExecResult {
     stdout: string;
     stderr: string;
+    code: number;
+    killed?: boolean;
   }
 
   export interface ToolExecuteResult {
@@ -78,7 +84,7 @@ declare module "@earendil-works/pi-coding-agent" {
       promptSnippet?: string;
       promptGuidelines?: string[];
       parameters?: unknown;
-      execute(toolCallId: string, params: { verdict: "approve" | "reject"; reasons: string; requiredFixes?: string }): Promise<ToolExecuteResult>;
+      execute(toolCallId: string, params: any): Promise<ToolExecuteResult>;
     }): void;
     registerCommand(name: string, config: {
       description?: string;
@@ -87,6 +93,7 @@ declare module "@earendil-works/pi-coding-agent" {
     on(event: "session_start", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "session_shutdown", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "agent_end", handler: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "agent_settled", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<{ block: boolean; reason: string } | void> | { block: boolean; reason: string } | void): void;
     getThinkingLevel(): ThinkingLevel;
     setThinkingLevel(level: ThinkingLevel): void;

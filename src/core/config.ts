@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface RoleConfig {
   provider: string;
@@ -16,9 +16,16 @@ export interface ProviderConfig {
   apiKey?: string;
 }
 
-export type RoleName = "planner" | "coder" | "judge" | "spec" | "verifier" | "reviewer" | "shipper";
+export type RoleName = "planner" | "coder" | "judge" | "spec" | "verifier" | "reviewer" | "debugger" | "shipper";
+export type LifecycleRoutedStage = "define" | "plan" | "verify" | "review" | "debug" | "ship";
+export type ModelCandidate = RoleConfig;
 export type ShipCommitMode = "ask" | "never" | "auto";
 export type ShipOpenPrMode = "ask" | "never";
+
+export interface LifecycleRoutingConfig {
+  enabled: boolean;
+  stages: Record<LifecycleRoutedStage, ModelCandidate[]>;
+}
 
 export interface OrchestratorConfig {
   roles: Record<RoleName, RoleConfig>;
@@ -38,6 +45,9 @@ export interface OrchestratorConfig {
   build: {
     commitPerTask: boolean;
   };
+  routing: {
+    lifecycle: LifecycleRoutingConfig;
+  };
   ship: {
     commit: ShipCommitMode;
     openPr: ShipOpenPrMode;
@@ -54,13 +64,22 @@ type ConfigPatch = Partial<{
   judge: Partial<OrchestratorConfig["judge"]>;
   lifecycle: Partial<OrchestratorConfig["lifecycle"]>;
   build: Partial<OrchestratorConfig["build"]>;
+  routing: Partial<{ lifecycle: Partial<{ enabled: boolean; stages: Partial<Record<LifecycleRoutedStage, ModelCandidate[]>> }> }>;
   ship: Partial<OrchestratorConfig["ship"]>;
   mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>> }>;
 }>;
 
 export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
 
-const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const FABLE: ModelCandidate = { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" };
+const GPT_56_SOL: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "xhigh" };
+const GPT_56_TERRA: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-terra", thinking: "xhigh" };
+const GPT_56_LUNA: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-luna", thinking: "xhigh" };
+
+function candidates(...values: ModelCandidate[]): ModelCandidate[] {
+  return values.map((value) => ({ ...value }));
+}
 
 export const DEFAULT_CONFIG: OrchestratorConfig = {
   roles: {
@@ -70,6 +89,7 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     spec: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
     verifier: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
     reviewer: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
+    debugger: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
     shipper: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
   },
   loop: {
@@ -87,6 +107,19 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   build: {
     commitPerTask: false,
+  },
+  routing: {
+    lifecycle: {
+      enabled: true,
+      stages: {
+        define: candidates(FABLE, GPT_56_SOL, GPT_56_TERRA, GPT_56_LUNA),
+        plan: candidates(FABLE, GPT_56_SOL, GPT_56_TERRA, GPT_56_LUNA),
+        verify: candidates(GPT_56_SOL, FABLE, GPT_56_TERRA, GPT_56_LUNA),
+        review: candidates(GPT_56_SOL, FABLE, GPT_56_TERRA, GPT_56_LUNA),
+        debug: candidates(GPT_56_SOL, FABLE, GPT_56_TERRA, GPT_56_LUNA),
+        ship: candidates(FABLE, GPT_56_SOL, GPT_56_TERRA, GPT_56_LUNA),
+      },
+    },
   },
   ship: {
     commit: "ask",
@@ -205,17 +238,24 @@ function validateConfig(value: unknown): OrchestratorConfig {
   const judge = requirePlainObject(config.judge, "judge");
   const lifecycle = requirePlainObject(config.lifecycle, "lifecycle");
   const build = requirePlainObject(config.build, "build");
+  const routing = requirePlainObject(config.routing, "routing");
+  const lifecycleRouting = requirePlainObject(routing.lifecycle, "routing.lifecycle");
+  const routingStages = requirePlainObject(lifecycleRouting.stages, "routing.lifecycle.stages");
   const ship = requirePlainObject(config.ship, "ship");
   const mcp = requirePlainObject(config.mcp, "mcp");
   const providers = requirePlainObject(mcp.providers, "mcp.providers");
 
-  for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "shipper"] as const) {
-    const role = requirePlainObject(roles[roleName], `roles.${roleName}`);
-    requireNonEmptyString(role.provider, `roles.${roleName}.provider`);
-    requireNonEmptyString(role.model, `roles.${roleName}.model`);
-    if (!THINKING_LEVELS.includes(role.thinking as ThinkingLevel)) {
-      throw new Error(`roles.${roleName}.thinking must be one of ${THINKING_LEVELS.join(", ")}`);
+  for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "debugger", "shipper"] as const) {
+    validateRoleConfig(roles[roleName], `roles.${roleName}`);
+  }
+
+  requireBoolean(lifecycleRouting.enabled, "routing.lifecycle.enabled");
+  for (const stage of ["define", "plan", "verify", "review", "debug", "ship"] as const) {
+    const stageCandidates = routingStages[stage];
+    if (!Array.isArray(stageCandidates) || stageCandidates.length === 0) {
+      throw new Error(`routing.lifecycle.stages.${stage} must be a non-empty array`);
     }
+    stageCandidates.forEach((candidate, index) => validateRoleConfig(candidate, `routing.lifecycle.stages.${stage}[${index}]`));
   }
 
   requirePositiveInteger(loop.maxCoderIterations, "loop.maxCoderIterations");
@@ -244,6 +284,15 @@ function requirePlainObject(value: unknown, path: string): Record<string, unknow
     throw new Error(`${path} must be an object`);
   }
   return value;
+}
+
+function validateRoleConfig(value: unknown, path: string): void {
+  const role = requirePlainObject(value, path);
+  requireNonEmptyString(role.provider, `${path}.provider`);
+  requireNonEmptyString(role.model, `${path}.model`);
+  if (!THINKING_LEVELS.includes(role.thinking as ThinkingLevel)) {
+    throw new Error(`${path}.thinking must be one of ${THINKING_LEVELS.join(", ")}`);
+  }
 }
 
 function requireNonEmptyString(value: unknown, path: string): void {

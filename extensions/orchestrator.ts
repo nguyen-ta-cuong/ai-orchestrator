@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG, loadConfig, loopConfigFrom, type OrchestratorConfig, ty
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
+import { currentRun, readState } from "../src/lifecycle/artifacts.js";
 
 const STATE_TYPE = "ai-orchestrator";
 const STATUS_KEY = "ai-orchestrator";
@@ -213,6 +214,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       notifyUser(ctx, `Invalid ai-orchestrator config: ${message}`, "error");
       return;
     }
+    const lifecycle = currentRun(ctx.cwd, config.lifecycle.artifactsDir);
+    const lifecycleState = lifecycle && readState(lifecycle.paths);
+    if (lifecycleState && isActiveLifecyclePhase(lifecycleState.phase)) {
+      notifyUser(ctx, `Lifecycle run ${lifecycleState.runId} is active at ${lifecycleState.phase}. Use /lifecycle-stop before /orchestrate.`, "error");
+      return;
+    }
+
     runtime = { config };
 
     const missingRole = findMissingRole(ctx, config);
@@ -672,6 +680,10 @@ function extractLastAssistantText(messages: unknown[]): string {
 function lastAssistantStopReason(messages: unknown[]): string | undefined {
   const stopReason = findLastAssistant(messages)?.stopReason;
   return typeof stopReason === "string" ? stopReason : undefined;
+}
+
+function isActiveLifecyclePhase(phase: string): boolean {
+  return phase !== "idle" && phase !== "done" && phase !== "failed";
 }
 
 function isActiveRunPhase(phase: OrchestratorState["phase"]): boolean {

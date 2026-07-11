@@ -10,6 +10,8 @@ export interface CompletionRequest {
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+const ANTHROPIC_DEFAULT_MAX_TOKENS = 8192;
+const ANTHROPIC_MAX_THINKING_MAX_TOKENS = 16384;
 let fakeLlmWarningPrinted = false;
 
 export async function completeWithRole({ config, role, prompt, signal }: CompletionRequest): Promise<string> {
@@ -73,7 +75,7 @@ async function anthropicMessages(baseUrl: string, apiKey: string, role: RoleConf
     "anthropic-version": "2023-06-01",
   }, {
     model: role.model,
-    max_tokens: 8192,
+    max_tokens: anthropicMaxTokens(role.thinking),
     messages: [{ role: "user", content: prompt }],
     ...anthropicThinking(role.thinking),
   }, signal, [apiKey]);
@@ -240,6 +242,11 @@ function anthropicThinking(thinking: ThinkingLevel): Record<string, unknown> {
     medium: 1024,
     high: 2048,
     xhigh: 4096,
+    max: 8192,
   };
   return { thinking: { type: "enabled", budget_tokens: budgetByLevel[thinking] } };
+}
+
+function anthropicMaxTokens(thinking: ThinkingLevel): number {
+  return thinking === "max" ? ANTHROPIC_MAX_THINKING_MAX_TOKENS : ANTHROPIC_DEFAULT_MAX_TOKENS;
 }

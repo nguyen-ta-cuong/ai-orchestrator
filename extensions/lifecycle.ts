@@ -1,0 +1,1277 @@
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { relative, resolve } from "node:path";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import {
+  DEFAULT_CONFIG,
+  loadConfig,
+  loopConfigFrom,
+  type LifecycleRoutedStage,
+  type OrchestratorConfig,
+  type RoleConfig,
+  type RoleName,
+  type ThinkingLevel,
+} from "../src/core/config.js";
+import {
+  debugPrompt,
+  buildPrompt,
+  reviewPrompt,
+  shipPrompt,
+  specPrompt,
+  taskPlanPrompt,
+  verifyPrompt,
+} from "../src/core/lifecyclePrompts.js";
+import { lifecycleModelChoices } from "../src/core/lifecycleRouting.js";
+import {
+  nextStage,
+  type LifecycleEvent,
+  type LifecyclePhase,
+  type LifecycleStageVerdict,
+  type LifecycleState,
+} from "../src/core/lifecycle.js";
+import { detectTestCommand } from "../src/core/tests.js";
+import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
+import {
+  appendJournal,
+  createRun,
+  currentRun,
+  readState,
+  releaseRun,
+  writeState,
+  type RunPaths,
+} from "../src/lifecycle/artifacts.js";
+
+const ENTRY_TYPE = "ai-orchestrator-lifecycle";
+const STATUS_KEY = ENTRY_TYPE;
+const WIDGET_KEY = ENTRY_TYPE;
+const VERDICT_TOOLS = new Set(["verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
+const MUTATION_TOOLS = new Set(["edit", "write"]);
+const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
+
+type StandaloneStage = "spec" | "plan" | "build" | "test" | "debug" | "review" | "ship";
+interface PendingDiagnosis {
+  rootCause: string;
+  evidence: string;
+  confidence: "low" | "medium" | "high";
+  recommendedFix: string;
+  filesLikelyAffected: string[];
+  validationCommands: string[];
+}
+
+type PendingVerdict =
+  | { kind: "verify" | "review"; verdict: "approve" | "reject"; reasons: string; requiredFixes?: string }
+  | { kind: "ship"; verdict: "approve" | "reject"; reasons: string; requiredFixes?: string };
+
+interface Runtime {
+  config: OrchestratorConfig;
+  cwd: string;
+  paths: RunPaths;
+  state: LifecycleState;
+  automatic: boolean;
+  standalone?: StandaloneStage;
+  toolsBeforeRun: string[];
+  invocationOriginal?: LifecycleState["originalModel"];
+  pendingVerdict?: PendingVerdict;
+  pendingDiagnosis?: PendingDiagnosis;
+  remindedPhase?: LifecyclePhase;
+  specRevisionFeedback?: string;
+  planRevisionFeedback?: string;
+  attemptedModels: string[];
+}
+
+export default function lifecycleExtension(pi: ExtensionAPI): void {
+  let runtime: Runtime | undefined;
+  let pendingSettlement: { runId: string; messages: unknown[] } | undefined;
+  let stopping = false;
+
+  pi.registerFlag("lifecycle-yolo", {
+    description: "Skip lifecycle spec, plan, and ship approval gates",
+    type: "boolean",
+    default: false,
+  });
+
+  registerVerdictTools();
+  deactivateVerdictTools();
+
+  pi.registerCommand("lifecycle", {
+    description: "Run or resume the durable DEFINE → SHIP lifecycle",
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle();
+      if (args.trim() === "resume") {
+        await resumeRun(ctx);
+      } else {
+        await startPipeline(args, ctx);
+      }
+    },
+  });
+
+  pi.registerCommand("lifecycle-stop", {
+    description: "Stop the active lifecycle, restore the model, and preserve artifacts",
+    handler: async (_args, ctx) => {
+      await stopRun(ctx, "Lifecycle stopped by user.");
+    },
+  });
+
+  registerStageCommand("spec", "Run DEFINE only", async (args, ctx) => startSpec(args, ctx));
+  registerStageCommand("plan", "Run PLAN for the current lifecycle", async (_args, ctx) => startStandalone("plan", "planning", ctx));
+  registerStageCommand("build", "Run BUILD for the current lifecycle", async (_args, ctx) => startStandalone("build", "building", ctx));
+  registerStageCommand("test", "Run VERIFY for the current lifecycle", async (_args, ctx) => startStandalone("test", "verifying", ctx));
+  registerStageCommand("debug", "Run read-only DEBUG for the current lifecycle", async (_args, ctx) => startStandalone("debug", "debugging", ctx));
+  registerStageCommand("review", "Run REVIEW for the current lifecycle", async (_args, ctx) => startStandalone("review", "reviewing", ctx));
+  registerStageCommand("ship", "Run SHIP for the current lifecycle", async (_args, ctx) => startStandalone("ship", "shipping", ctx));
+
+  pi.on("tool_call", async (event) => {
+    const activeRuntime = runtime;
+    const state = activeRuntime?.state;
+    if (!activeRuntime || !state) return;
+    if (event.toolName === "bash" && state.phase !== "building") {
+      const command = typeof event.input.command === "string" ? event.input.command : "";
+      const testCommand = activeRuntime.config.judge.runTests ? detectTestCommand(activeRuntime.cwd) : undefined;
+      if (!isReadOnlyLifecycleCommand(command, testCommand)) {
+        return { block: true, reason: `${stageLabel(state.phase)} allows only reviewed read-only inspection commands and the exact detected test command.` };
+      }
+      return;
+    }
+    if (!MUTATION_TOOLS.has(event.toolName)) return;
+
+    if (state.phase === "building") return;
+    if (state.phase === "defining" || state.phase === "planning") {
+      const input = event.input as { path?: unknown };
+      const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
+      const allowedPath = resolve(state.phase === "defining" ? activeRuntime.paths.spec : activeRuntime.paths.plan);
+      if (requestedPath === allowedPath) return;
+      return { block: true, reason: `${stageLabel(state.phase)} may write only ${allowedPath}.` };
+    }
+
+    return { block: true, reason: `${stageLabel(state.phase)} is read-only; edit/write are blocked.` };
+  });
+
+  pi.on("agent_end", async (event) => {
+    if (runtime) pendingSettlement = { runId: runtime.state.runId, messages: event.messages };
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!runtime || !pendingSettlement || pendingSettlement.runId !== runtime.state.runId) return;
+    const { runId, messages } = pendingSettlement;
+    pendingSettlement = undefined;
+    try {
+      const stopReason = lastAssistantStopReason(messages);
+      if (stopReason === "aborted" || stopReason === "error") {
+        await interruptRun(ctx, stopReason === "aborted"
+          ? "Lifecycle turn was aborted. Run /lifecycle resume to continue."
+          : "Lifecycle turn ended with a model/provider error. Run /lifecycle resume to retry.");
+        return;
+      }
+
+      if (!ownsRun(runId, runtime.state.phase)) return;
+      switch (runtime.state.phase) {
+        case "defining":
+          await artifactStageEnded(ctx, "spec");
+          break;
+        case "planning":
+          await artifactStageEnded(ctx, "plan");
+          break;
+        case "building":
+          await transition({ type: "build_produced" }, "BUILD completed; entering VERIFY", ctx);
+          await continueOrPause(ctx, "test");
+          break;
+        case "verifying":
+          await checkerStageEnded(ctx, "verify");
+          break;
+        case "reviewing":
+          await checkerStageEnded(ctx, "review");
+          break;
+        case "debugging":
+          await debugStageEnded(ctx);
+          break;
+        case "shipping":
+          await checkerStageEnded(ctx, "ship");
+          break;
+        default:
+          break;
+      }
+    } catch (error) {
+      await interruptRun(ctx, `Lifecycle stopped after an internal error: ${errorMessage(error)}. Run /lifecycle resume after correcting it.`);
+    }
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    deactivateVerdictTools();
+    const loaded = loadCurrent(ctx.cwd);
+    if (!loaded || !isActivePhase(loaded.state.phase)) {
+      clearUi(ctx);
+      return;
+    }
+
+    if (loaded.state.modelRestored === false) {
+      await restoreOriginalModel(ctx, loaded.state);
+      writeState(loaded.paths, loaded.state);
+    }
+    clearUi(ctx);
+    runtime = undefined;
+    notify(ctx, `Lifecycle run ${loaded.state.runId} is at ${loaded.state.phase}. Use /lifecycle resume or /lifecycle-stop.`, "warning");
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (runtime) {
+      restoreTools();
+      await restoreRuntimeModel(ctx);
+      persistMirror(runtime.state);
+    }
+    runtime = undefined;
+    deactivateVerdictTools();
+    clearUi(ctx);
+  });
+
+  function registerVerdictTools(): void {
+    pi.registerTool({
+      name: "verify_verdict",
+      label: "Verify Verdict",
+      description: "Return the structured verdict for lifecycle VERIFY.",
+      promptSnippet: "Return the lifecycle VERIFY approve/reject verdict",
+      promptGuidelines: ["Use verify_verdict exactly once as the final action during lifecycle VERIFY."],
+      parameters: Type.Object({
+        verdict: StringEnum(["approve", "reject"] as const),
+        reasons: Type.String(),
+        requiredFixes: Type.Optional(Type.String()),
+      }),
+      async execute(_id, params) {
+        requireToolPhase("verifying", "verify_verdict");
+        runtime!.pendingVerdict = { kind: "verify", ...params };
+        persistMirror(runtime!.state);
+        return { content: [{ type: "text", text: `Recorded VERIFY verdict: ${params.verdict}` }], details: params, terminate: true };
+      },
+    });
+
+    pi.registerTool({
+      name: "review_verdict",
+      label: "Review Verdict",
+      description: "Return the structured verdict for lifecycle REVIEW.",
+      promptSnippet: "Return the lifecycle REVIEW approve/reject verdict",
+      promptGuidelines: ["Use review_verdict exactly once as the final action during lifecycle REVIEW."],
+      parameters: Type.Object({
+        verdict: StringEnum(["approve", "reject"] as const),
+        reasons: Type.String(),
+        requiredFixes: Type.Optional(Type.String()),
+      }),
+      async execute(_id, params) {
+        requireToolPhase("reviewing", "review_verdict");
+        runtime!.pendingVerdict = { kind: "review", ...params };
+        persistMirror(runtime!.state);
+        return { content: [{ type: "text", text: `Recorded REVIEW verdict: ${params.verdict}` }], details: params, terminate: true };
+      },
+    });
+
+    pi.registerTool({
+      name: "debug_diagnosis",
+      label: "Debug Diagnosis",
+      description: "Return a structured root-cause diagnosis for lifecycle DEBUG.",
+      promptSnippet: "Return the lifecycle DEBUG root-cause diagnosis",
+      promptGuidelines: ["Use debug_diagnosis exactly once as the final action during lifecycle DEBUG."],
+      parameters: Type.Object({
+        rootCause: Type.String(),
+        evidence: Type.String(),
+        confidence: StringEnum(["low", "medium", "high"] as const),
+        recommendedFix: Type.String(),
+        filesLikelyAffected: Type.Array(Type.String()),
+        validationCommands: Type.Array(Type.String()),
+      }),
+      async execute(_id, params) {
+        requireToolPhase("debugging", "debug_diagnosis");
+        const diagnosis = params as PendingDiagnosis;
+        runtime!.pendingDiagnosis = diagnosis;
+        runtime!.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
+        writeState(runtime!.paths, runtime!.state);
+        writeFileSync(runtime!.paths.debug, formatDiagnosis(diagnosis));
+        appendJournal(runtime!.paths, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
+        persistMirror(runtime!.state);
+        return { content: [{ type: "text", text: "Recorded DEBUG diagnosis." }], details: diagnosis, terminate: true };
+      },
+    });
+
+    pi.registerTool({
+      name: "ship_decision",
+      label: "Ship Decision",
+      description: "Return the lifecycle SHIP go/no-go report.",
+      promptSnippet: "Return the lifecycle SHIP GO or NO-GO decision",
+      promptGuidelines: ["Use ship_decision exactly once as the final action during lifecycle SHIP."],
+      parameters: Type.Object({
+        decision: StringEnum(["go", "no_go"] as const),
+        report: Type.String(),
+        blockers: Type.Optional(Type.String()),
+      }),
+      async execute(_id, params) {
+        requireToolPhase("shipping", "ship_decision");
+        runtime!.pendingVerdict = {
+          kind: "ship",
+          verdict: params.decision === "go" ? "approve" : "reject",
+          reasons: params.report,
+          requiredFixes: params.blockers,
+        };
+        persistMirror(runtime!.state);
+        return { content: [{ type: "text", text: `Recorded SHIP decision: ${params.decision}` }], details: params, terminate: true };
+      },
+    });
+  }
+
+  function registerStageCommand(
+    name: StandaloneStage,
+    description: string,
+    handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>,
+  ): void {
+    pi.registerCommand(name, {
+      description,
+      handler: async (args, ctx) => {
+        await ctx.waitForIdle();
+        await handler(args, ctx);
+      },
+    });
+  }
+
+  async function startPipeline(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (hasActiveFastPath(ctx)) {
+      notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before starting lifecycle.", "error");
+      return;
+    }
+    const parsed = parseTaskArgs(args);
+    if (!parsed.task) {
+      notify(ctx, "Usage: /lifecycle [--yolo] <task> or /lifecycle resume", "error");
+      return;
+    }
+    if (loadCurrent(ctx.cwd)?.state && isActivePhase(loadCurrent(ctx.cwd)!.state.phase)) {
+      notify(ctx, "A lifecycle run is already active. Use /lifecycle resume or /lifecycle-stop.", "error");
+      return;
+    }
+
+    const config = loadPiConfig(ctx.cwd);
+    const yolo = parsed.yolo || pi.getFlag("lifecycle-yolo") === true;
+    const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
+    const state = readState(created.paths);
+    if (!state) throw new Error("new lifecycle state could not be read");
+    const baseline = await workingTreeStatus(ctx);
+    state.baselinePaths = baseline?.paths;
+    state.baselineStagedPaths = baseline?.stagedPaths;
+    state.originalModel = currentModelState(ctx);
+    writeState(created.paths, state);
+    runtime = makeRuntime(config, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
+    appendJournal(created.paths, "Lifecycle pipeline started");
+    persistMirror(state);
+    await runCurrentPhase(ctx);
+  }
+
+  async function startSpec(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (hasActiveFastPath(ctx)) {
+      notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before starting lifecycle.", "error");
+      return;
+    }
+    const parsed = parseTaskArgs(args);
+    if (!parsed.task) {
+      notify(ctx, "Usage: /spec [--yolo] <idea>", "error");
+      return;
+    }
+    const active = loadCurrent(ctx.cwd);
+    if (active && isActivePhase(active.state.phase)) {
+      notify(ctx, `Run ${active.state.runId} is already at ${active.state.phase}.`, "error");
+      return;
+    }
+
+    const config = loadPiConfig(ctx.cwd);
+    const yolo = parsed.yolo || pi.getFlag("lifecycle-yolo") === true;
+    const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
+    const state = readState(created.paths);
+    if (!state) throw new Error("new lifecycle state could not be read");
+    const baseline = await workingTreeStatus(ctx);
+    state.baselinePaths = baseline?.paths;
+    state.baselineStagedPaths = baseline?.stagedPaths;
+    state.originalModel = currentModelState(ctx);
+    writeState(created.paths, state);
+    runtime = makeRuntime(config, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
+    appendJournal(created.paths, "Standalone DEFINE started");
+    persistMirror(state);
+    await runCurrentPhase(ctx);
+  }
+
+  async function resumeRun(ctx: ExtensionCommandContext): Promise<void> {
+    if (hasActiveFastPath(ctx)) {
+      notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before resuming lifecycle.", "error");
+      return;
+    }
+    const loaded = loadCurrent(ctx.cwd);
+    if (!loaded) {
+      notify(ctx, "No lifecycle run is available to resume.", "error");
+      return;
+    }
+    if (!isActivePhase(loaded.state.phase)) {
+      notify(ctx, `Lifecycle run ${loaded.state.runId} is ${loaded.state.phase}; it cannot be resumed.`, "info");
+      return;
+    }
+    const config = loadPiConfig(ctx.cwd);
+    if (!loaded.state.originalModel) {
+      loaded.state.originalModel = currentModelState(ctx);
+      writeState(loaded.paths, loaded.state);
+    }
+    runtime = makeRuntime(config, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
+    appendJournal(loaded.paths, `Resumed at ${loaded.state.phase}`);
+    persistMirror(loaded.state);
+    await runCurrentPhase(ctx);
+  }
+
+  async function startStandalone(stage: StandaloneStage, expected: LifecyclePhase, ctx: ExtensionCommandContext): Promise<void> {
+    if (hasActiveFastPath(ctx)) {
+      notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before running a lifecycle stage.", "error");
+      return;
+    }
+    const loaded = loadCurrent(ctx.cwd);
+    if (!loaded) {
+      notify(ctx, `No lifecycle run exists. Start with /spec <idea> or /lifecycle <task>.`, "error");
+      return;
+    }
+    if (loaded.state.phase !== expected) {
+      notify(ctx, `Run ${loaded.state.runId} is at ${loaded.state.phase}; next command is ${nextCommand(loaded.state.phase)}.`, "error");
+      return;
+    }
+    const config = loadPiConfig(ctx.cwd);
+    if (!loaded.state.originalModel) loaded.state.originalModel = currentModelState(ctx);
+    writeState(loaded.paths, loaded.state);
+    runtime = makeRuntime(config, ctx.cwd, loaded.paths, loaded.state, false, stage, currentModelState(ctx));
+    appendJournal(loaded.paths, `Standalone ${stage.toUpperCase()} started`);
+    persistMirror(loaded.state);
+    await runCurrentPhase(ctx);
+  }
+
+  function makeRuntime(
+    config: OrchestratorConfig,
+    cwd: string,
+    paths: RunPaths,
+    state: LifecycleState,
+    automatic: boolean,
+    standalone: StandaloneStage | undefined,
+    invocationOriginal: LifecycleState["originalModel"],
+  ): Runtime {
+    return {
+      config,
+      cwd,
+      paths,
+      state,
+      automatic,
+      standalone,
+      toolsBeforeRun: pi.getActiveTools().filter((name) => !VERDICT_TOOLS.has(name)),
+      invocationOriginal,
+      attemptedModels: [],
+    };
+  }
+
+  async function runCurrentPhase(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    runtime.pendingVerdict = undefined;
+    runtime.pendingDiagnosis = undefined;
+    runtime.remindedPhase = undefined;
+    switch (runtime.state.phase) {
+      case "defining":
+        await enterRoutedStage("define", "spec", ctx);
+        activateArtifactTools();
+        updateUi(ctx);
+        sendPrompt(specPrompt(runtime.state.task, rel(runtime.paths.spec), undefined, runtime.specRevisionFeedback));
+        break;
+      case "awaiting_spec_approval":
+        await requestArtifactApproval(ctx, "spec");
+        break;
+      case "planning":
+        await enterRoutedStage("plan", "planner", ctx);
+        activateArtifactTools();
+        updateUi(ctx);
+        sendPrompt(taskPlanPrompt(readRequired(runtime.paths.spec, "spec"), rel(runtime.paths.plan), runtime.planRevisionFeedback ?? replanFeedback()));
+        break;
+      case "awaiting_plan_approval":
+        await requestArtifactApproval(ctx, "plan");
+        break;
+      case "building":
+        await enterBuild(ctx);
+        break;
+      case "verifying":
+        await enterRoutedStage("verify", "verifier", ctx);
+        activateReadOnlyTools("verify_verdict");
+        updateUi(ctx);
+        sendPrompt(verifyPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
+        break;
+      case "reviewing":
+        await enterRoutedStage("review", "reviewer", ctx);
+        activateReadOnlyTools("review_verdict");
+        updateUi(ctx);
+        sendPrompt(reviewPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan")));
+        break;
+      case "debugging": {
+        const rejectionIndex = latestRejectionIndex();
+        if (runtime.state.debugDiagnosisVerdictIndex === rejectionIndex && isNonEmpty(runtime.paths.debug)) {
+          await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "Recovered durable DEBUG diagnosis", ctx);
+          if (!runtime) return;
+          const recoveredPhase = runtime.state.phase as LifecyclePhase;
+          if (recoveredPhase === "failed") await finishRun(ctx);
+          else await continueOrPause(ctx, nextStandaloneForPhase(recoveredPhase));
+          break;
+        }
+        runtime.state.debugDiagnosisVerdictIndex = undefined;
+        writeState(runtime.paths, runtime.state);
+        writeFileSync(runtime.paths.debug, "");
+        await enterRoutedStage("debug", "debugger", ctx);
+        activateReadOnlyTools("debug_diagnosis");
+        updateUi(ctx);
+        sendPrompt(debugPrompt(
+          readRequired(runtime.paths.spec, "spec"),
+          readRequired(runtime.paths.plan, "plan"),
+          latestRejection(),
+          rel(runtime.paths.debug),
+        ));
+        break;
+      }
+      case "shipping":
+        await enterRoutedStage("ship", "shipper", ctx);
+        activateReadOnlyTools("ship_decision");
+        updateUi(ctx);
+        sendPrompt(shipPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.state.verdicts));
+        break;
+      case "awaiting_ship_approval":
+        await requestShipApproval(ctx);
+        break;
+      case "finalizing":
+        await finalizeRun(ctx);
+        break;
+      case "done":
+      case "failed":
+        await finishRun(ctx);
+        break;
+      case "idle":
+        notify(ctx, "Lifecycle is idle.", "info");
+        break;
+      default:
+        assertNever(runtime.state.phase);
+    }
+  }
+
+  async function enterBuild(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    restoreBuildTools();
+    await switchFixedRole("coder", "build", ctx);
+    updateUi(ctx);
+    sendPrompt(buildPrompt(readRequired(runtime.paths.plan, "plan"), buildFeedback(), runtime.config.build.commitPerTask));
+  }
+
+  async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const available = ctx.modelRegistry.getAvailable().map((model) => ({ provider: String(model.provider), model: String(model.id) }));
+    const choices = lifecycleModelChoices(stage, runtime.config, available, runtime.config.roles[role]);
+    runtime.attemptedModels = [];
+    for (const choice of choices) {
+      const label = `${choice.candidate.provider}/${choice.candidate.model}`;
+      runtime.attemptedModels.push(label);
+      const model = ctx.modelRegistry.find(choice.candidate.provider, choice.candidate.model);
+      if (!model || !(await pi.setModel(model))) continue;
+      pi.setThinkingLevel(choice.candidate.thinking);
+      const fallback = runtime.attemptedModels.length > 1
+        ? `; fell back after ${runtime.attemptedModels.slice(0, -1).join(", ")}`
+        : "";
+      recordModelSelection(stage, choice.candidate, `${choice.reason}${fallback}`);
+      return;
+    }
+    await modelFailure(ctx, stage, runtime.attemptedModels);
+    throw new Error(`no locally configured model for ${stage}`);
+  }
+
+  async function switchFixedRole(role: RoleName, stage: "build", ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const choice = runtime.config.roles[role];
+    const model = ctx.modelRegistry.find(choice.provider, choice.model);
+    if (!model || !(await pi.setModel(model))) {
+      await modelFailure(ctx, stage, [`${choice.provider}/${choice.model}`]);
+      throw new Error(`configured ${role} model is unavailable`);
+    }
+    pi.setThinkingLevel(choice.thinking);
+    recordModelSelection(stage, choice, "BUILD uses the configured implementer role; dynamic routing is intentionally disabled");
+  }
+
+  function recordModelSelection(
+    stage: LifecycleRoutedStage | "build",
+    candidate: RoleConfig,
+    reason: string,
+  ): void {
+    if (!runtime) return;
+    runtime.state.modelRestored = false;
+    runtime.state.modelSelections.push({
+      stage,
+      provider: candidate.provider,
+      model: candidate.model,
+      thinking: candidate.thinking,
+      reason,
+      selectedAt: new Date().toISOString(),
+    });
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Model ${stage}: ${candidate.provider}/${candidate.model} (${candidate.thinking}) — ${reason}`);
+    persistMirror(runtime.state);
+  }
+
+  async function artifactStageEnded(ctx: ExtensionContext, artifact: "spec" | "plan"): Promise<void> {
+    if (!runtime) return;
+    const path = artifact === "spec" ? runtime.paths.spec : runtime.paths.plan;
+    if (!isNonEmpty(path)) {
+      if (runtime.remindedPhase !== runtime.state.phase) {
+        runtime.remindedPhase = runtime.state.phase;
+        sendPrompt(`Write the required ${artifact} artifact to exactly ${rel(path)} before finishing. Do not perform another stage.`);
+        return;
+      }
+      await interruptRun(ctx, `${artifact.toUpperCase()} stopped because ${rel(path)} remained empty after a reminder.`);
+      return;
+    }
+
+    await transition(
+      artifact === "spec"
+        ? { type: "spec_produced", specPath: rel(path) }
+        : { type: "plan_produced", planPath: rel(path) },
+      `${artifact.toUpperCase()} artifact produced`,
+      ctx,
+    );
+    if (runtime?.state.phase === "awaiting_spec_approval" || runtime?.state.phase === "awaiting_plan_approval") {
+      await requestArtifactApproval(ctx, artifact);
+    } else {
+      await continueOrPause(ctx, artifact === "spec" ? "plan" : "build");
+    }
+  }
+
+  async function requestArtifactApproval(ctx: ExtensionContext, artifact: "spec" | "plan"): Promise<void> {
+    if (!runtime) return;
+    const expected = artifact === "spec" ? "awaiting_spec_approval" : "awaiting_plan_approval";
+    const runId = runtime.state.runId;
+    if (!ctx.hasUI) {
+      await interruptRun(ctx, `${artifact} approval requires interactive mode. Resume with --yolo only by starting a new yolo run.`);
+      return;
+    }
+    const choice = await ctx.ui.select(`${artifact.toUpperCase()} ready`, ["Approve", "Revise", "Cancel"]);
+    if (!ownsRun(runId, expected)) return;
+    if (choice === "Approve") {
+      await transition({ type: artifact === "spec" ? "spec_approved" : "plan_approved" }, `${artifact.toUpperCase()} approved`, ctx);
+      await continueOrPause(ctx, artifact === "spec" ? "plan" : "build");
+      return;
+    }
+    if (choice === "Revise") {
+      const feedback = await ctx.ui.editor(`How should ${artifact} change?`, "");
+      if (!ownsRun(runId, expected)) return;
+      if (!feedback?.trim()) {
+        await interruptRun(ctx, `${artifact.toUpperCase()} revision cancelled.`);
+        return;
+      }
+      if (artifact === "spec") runtime.specRevisionFeedback = feedback.trim();
+      else runtime.planRevisionFeedback = feedback.trim();
+      await transition({ type: artifact === "spec" ? "spec_rejected_by_user" : "plan_rejected_by_user" }, `${artifact.toUpperCase()} revision requested`, ctx);
+      await runCurrentPhase(ctx);
+      return;
+    }
+    await stopRun(ctx, `${artifact.toUpperCase()} approval cancelled.`);
+  }
+
+  async function checkerStageEnded(ctx: ExtensionContext, stage: "verify" | "review" | "ship"): Promise<void> {
+    if (!runtime) return;
+    if (!runtime.pendingVerdict || runtime.pendingVerdict.kind !== stage) {
+      if (runtime.remindedPhase !== runtime.state.phase) {
+        runtime.remindedPhase = runtime.state.phase;
+        const tool = stage === "verify" ? "verify_verdict" : stage === "review" ? "review_verdict" : "ship_decision";
+        sendPrompt(`Finish ${stage.toUpperCase()} by calling ${tool} exactly once. Do not edit files.`);
+        return;
+      }
+      runtime.pendingVerdict = {
+        kind: stage,
+        verdict: "reject",
+        reasons: `${stage.toUpperCase()} did not return a structured verdict; treat the work as unverified.`,
+        requiredFixes: "Repeat the checker stage and provide structured evidence.",
+      };
+    }
+    const verdict = runtime.pendingVerdict;
+    if (!verdict) throw new Error(`${stage} verdict was not available after recovery`);
+    runtime.pendingVerdict = undefined;
+    await transition({
+      type: "verdict",
+      stage,
+      verdict: verdict.verdict,
+      reasons: verdict.reasons,
+      requiredFixes: verdict.requiredFixes,
+    }, `${stage.toUpperCase()} ${verdict.verdict}: ${truncate(verdict.reasons, 160)}`, ctx);
+
+    if (!runtime) return;
+    if (runtime.state.phase === "awaiting_ship_approval") {
+      await requestShipApproval(ctx);
+    } else if (runtime.state.phase === "finalizing") {
+      await finalizeRun(ctx);
+    } else if (runtime.state.phase === "done" || runtime.state.phase === "failed") {
+      await finishRun(ctx);
+    } else {
+      await continueOrPause(ctx, nextStandaloneForPhase(runtime.state.phase));
+    }
+  }
+
+  async function debugStageEnded(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    if (!runtime.pendingDiagnosis || !isNonEmpty(runtime.paths.debug)) {
+      if (runtime.remindedPhase !== "debugging") {
+        runtime.remindedPhase = "debugging";
+        sendPrompt("Finish DEBUG by calling debug_diagnosis exactly once. Do not edit source files.");
+        return;
+      }
+      const rejection = latestRejection();
+      const synthesized: PendingDiagnosis = {
+        rootCause: "The debugger did not return a structured diagnosis.",
+        evidence: rejection.reasons,
+        confidence: "low",
+        recommendedFix: rejection.requiredFixes ?? "Reproduce the rejection and address its concrete findings.",
+        filesLikelyAffected: [],
+        validationCommands: [],
+      };
+      runtime.pendingDiagnosis = synthesized;
+      runtime.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
+      writeState(runtime.paths, runtime.state);
+      writeFileSync(runtime.paths.debug, formatDiagnosis(synthesized));
+      appendJournal(runtime.paths, "Synthesized DEBUG diagnosis after missing structured output");
+    }
+    runtime.pendingDiagnosis = undefined;
+    await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "DEBUG diagnosis produced", ctx);
+    if (!runtime) return;
+    if (runtime.state.phase === "failed") await finishRun(ctx);
+    else await continueOrPause(ctx, nextStandaloneForPhase(runtime.state.phase));
+  }
+
+  async function requestShipApproval(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    if (runtime.state.yolo) {
+      await transition({ type: "ship_confirmed" }, "SHIP automatically confirmed under --yolo (publication policy still applies)", ctx);
+      await finalizeRun(ctx);
+      return;
+    }
+    const runId = runtime.state.runId;
+    if (!ctx.hasUI) {
+      await interruptRun(ctx, "SHIP confirmation requires interactive mode; the working tree was left unchanged.");
+      return;
+    }
+    const confirmed = await ctx.ui.confirm("SHIP report is GO", "Proceed to configured commit/PR finalization?");
+    if (!ownsRun(runId, "awaiting_ship_approval")) return;
+    await transition({ type: confirmed ? "ship_confirmed" : "ship_declined" }, confirmed ? "SHIP confirmed" : "SHIP declined", ctx);
+    if (!runtime) return;
+    if (runtime.state.phase === "finalizing") await finalizeRun(ctx);
+    else await finishRun(ctx);
+  }
+
+  async function finalizeRun(ctx: ExtensionContext): Promise<void> {
+    if (!runtime || runtime.state.phase !== "finalizing") return;
+    const commitOutcome = await maybeCommit(ctx);
+    if (commitOutcome === "failed") {
+      await interruptRun(ctx, "Finalization paused after a Git failure. Correct the problem and run /lifecycle resume.");
+      return;
+    }
+    if (commitOutcome === "committed") {
+      const prOutcome = await maybeOpenPr(ctx);
+      if (prOutcome === "failed") {
+        await interruptRun(ctx, "Finalization paused after a pull-request failure. Correct the problem and run /lifecycle resume.");
+        return;
+      }
+    }
+    await transition({ type: "finalize_complete" }, "Finalization complete", ctx);
+    await finishRun(ctx);
+  }
+
+  async function maybeCommit(ctx: ExtensionContext): Promise<"committed" | "skipped" | "failed"> {
+    if (!runtime) return "failed";
+    const runId = runtime.state.runId;
+    if (runtime.state.finalization?.commitSha) return "committed";
+    if (runtime.config.ship.commit === "never") return "skipped";
+    let shouldCommit = runtime.config.ship.commit === "auto";
+    if (runtime.config.ship.commit === "ask") {
+      shouldCommit = ctx.hasUI && await ctx.ui.confirm("Commit changes", "Commit the lifecycle changes now?");
+      if (!ownsRun(runId, "finalizing")) return "failed";
+    }
+    if (!shouldCommit) return "skipped";
+    if (!runtime.state.baselinePaths || !runtime.state.baselineStagedPaths) {
+      notify(ctx, "Cannot safely attribute files for this older run; commit skipped.", "error");
+      return "failed";
+    }
+    if (runtime.state.baselineStagedPaths.length > 0) {
+      notify(ctx, `Refusing to commit because files were already staged before the lifecycle: ${runtime.state.baselineStagedPaths.join(", ")}`, "error");
+      return "failed";
+    }
+
+    let files: string[];
+    try {
+      files = await changedFiles(ctx);
+    } catch (error) {
+      notify(ctx, `Could not collect lifecycle changes: ${errorMessage(error)}`, "error");
+      return "failed";
+    }
+    if (files.length === 0) {
+      notify(ctx, "No lifecycle-attributable source files were available to commit.", "info");
+      return "skipped";
+    }
+    for (const file of files) {
+      const result = await pi.exec("git", ["add", "--", file], { timeout: 10_000, signal: ctx.signal });
+      if (result.code !== 0) {
+        notify(ctx, `git add failed for ${file}: ${result.stderr || result.stdout}`, "error");
+        return "failed";
+      }
+    }
+    const message = `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
+    const commit = await pi.exec("git", ["commit", "-m", message], { timeout: 30_000, signal: ctx.signal });
+    if (commit.code !== 0) {
+      notify(ctx, `git commit failed: ${commit.stderr || commit.stdout}`, "error");
+      return "failed";
+    }
+    const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    if (head.code !== 0 || !head.stdout.trim()) {
+      notify(ctx, `Commit created but its SHA could not be recorded: ${head.stderr || head.stdout}`, "error");
+      return "failed";
+    }
+    runtime.state.finalization = { ...runtime.state.finalization, commitSha: head.stdout.trim() };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Committed ${head.stdout.trim()}: ${message}`);
+    persistMirror(runtime.state);
+    return "committed";
+  }
+
+  async function maybeOpenPr(ctx: ExtensionContext): Promise<"opened" | "skipped" | "failed"> {
+    if (!runtime) return "failed";
+    const runId = runtime.state.runId;
+    if (runtime.state.finalization?.prUrl) return "opened";
+    if (runtime.config.ship.openPr === "never") return "skipped";
+    const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!confirmed) return "skipped";
+    const result = await pi.exec("gh", ["pr", "create", "--fill"], { timeout: 60_000, signal: ctx.signal });
+    if (result.code !== 0) {
+      notify(ctx, `gh pr create failed: ${result.stderr || result.stdout}`, "error");
+      return "failed";
+    }
+    const prUrl = result.stdout.trim();
+    runtime.state.finalization = { ...runtime.state.finalization, prUrl };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Opened pull request: ${prUrl}`);
+    persistMirror(runtime.state);
+    return "opened";
+  }
+
+  async function workingTreeStatus(ctx: ExtensionContext): Promise<{ paths: string[]; stagedPaths: string[] } | undefined> {
+    const result = await pi.exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+      timeout: 10_000,
+      signal: ctx.signal,
+    });
+    if (result.code !== 0) return undefined;
+    return parsePorcelainStatus(result.stdout);
+  }
+
+  async function changedFiles(ctx: ExtensionContext): Promise<string[]> {
+    if (!runtime?.state.baselinePaths) throw new Error("baseline file set is unavailable");
+    const status = await workingTreeStatus(ctx);
+    if (!status) throw new Error("git status failed");
+    const baseline = new Set(runtime.state.baselinePaths);
+    const artifactPrefix = `${relative(runtime.cwd, resolve(runtime.cwd, runtime.config.lifecycle.artifactsDir)).replaceAll("\\", "/")}/`;
+    return status.paths
+      .filter((file) => !baseline.has(file))
+      .filter((file) => !file.replaceAll("\\", "/").startsWith(artifactPrefix));
+  }
+
+  async function continueOrPause(ctx: ExtensionContext, next: StandaloneStage): Promise<void> {
+    if (!runtime) return;
+    if (runtime.automatic) {
+      await runCurrentPhase(ctx);
+      return;
+    }
+    await pauseStandalone(ctx, `Stage complete. Next: /${next}`);
+  }
+
+  async function pauseStandalone(ctx: ExtensionContext, message: string): Promise<void> {
+    if (!runtime) return;
+    const state = runtime.state;
+    restoreTools();
+    await restoreRuntimeModel(ctx);
+    clearUi(ctx);
+    notify(ctx, message, "info");
+    persistMirror(state);
+    runtime = undefined;
+    deactivateVerdictTools();
+  }
+
+  async function finishRun(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const finished = runtime.state;
+    const summary = finalSummary(finished, runtime.paths);
+    restoreTools();
+    await restoreRuntimeModel(ctx);
+    releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
+    clearUi(ctx);
+    pi.sendMessage({ customType: ENTRY_TYPE, content: summary, display: true, details: finished }, { triggerTurn: false });
+    persistMirror(finished);
+    runtime = undefined;
+    deactivateVerdictTools();
+  }
+
+  async function stopRun(ctx: ExtensionContext, message: string): Promise<void> {
+    if (stopping) return;
+    stopping = true;
+    try {
+      if (!runtime) {
+        const loaded = loadCurrent(ctx.cwd);
+        if (!loaded || !isActivePhase(loaded.state.phase)) {
+          notify(ctx, "No active lifecycle run.", "info");
+          return;
+        }
+        runtime = makeRuntime(loadPiConfig(ctx.cwd), ctx.cwd, loaded.paths, loaded.state, false, undefined, currentModelState(ctx));
+      }
+      const stopped = runtime.state;
+      if (!ctx.isIdle()) ctx.abort();
+      await transition({ type: "cancelled" }, "Lifecycle cancelled", ctx);
+      restoreTools();
+      await restoreRuntimeModel(ctx);
+      releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
+      clearUi(ctx);
+      pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: stopped }, { triggerTurn: false });
+      runtime = undefined;
+      deactivateVerdictTools();
+    } finally {
+      stopping = false;
+    }
+  }
+
+  async function interruptRun(ctx: ExtensionContext, message: string): Promise<void> {
+    if (!runtime) return;
+    const state = runtime.state;
+    if (!ctx.isIdle()) ctx.abort();
+    restoreTools();
+    await restoreRuntimeModel(ctx);
+    clearUi(ctx);
+    appendJournal(runtime.paths, message);
+    persistMirror(state);
+    pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: state }, { triggerTurn: false });
+    runtime = undefined;
+    deactivateVerdictTools();
+  }
+
+  async function transition(event: LifecycleEvent, journal: string, ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const before = runtime.state.phase;
+    const next = nextStage(runtime.state, event, loopConfigFrom(runtime.config));
+    if (next.phase === before && JSON.stringify(next) === JSON.stringify(runtime.state)) return;
+    runtime.state = next;
+    writeState(runtime.paths, next);
+    appendJournal(runtime.paths, `${before} -> ${next.phase}: ${journal}`);
+    persistMirror(next);
+    updateUi(ctx);
+  }
+
+  function activateArtifactTools(): void {
+    if (!runtime) return;
+    const optionalQuestions = runtime.toolsBeforeRun.filter((name) => name === "ask_user_question" || name === "questionnaire");
+    pi.setActiveTools(unique([...READ_TOOLS, "edit", "write", ...optionalQuestions]));
+  }
+
+  function activateReadOnlyTools(verdictTool?: string): void {
+    if (!runtime) return;
+    pi.setActiveTools(unique([...READ_TOOLS, ...(verdictTool ? [verdictTool] : [])]));
+  }
+
+  function restoreBuildTools(): void {
+    if (!runtime) return;
+    pi.setActiveTools(runtime.toolsBeforeRun);
+  }
+
+  function restoreTools(): void {
+    if (runtime) pi.setActiveTools(runtime.toolsBeforeRun);
+    else deactivateVerdictTools();
+  }
+
+  function deactivateVerdictTools(): void {
+    const active = pi.getActiveTools();
+    const next = active.filter((name) => !VERDICT_TOOLS.has(name));
+    if (next.length !== active.length) pi.setActiveTools(next);
+  }
+
+  function requireToolPhase(phase: LifecyclePhase, tool: string): void {
+    if (!runtime || runtime.state.phase !== phase || !ownsRun(runtime.state.runId, phase)) {
+      throw new Error(`${tool} is only valid for the active lifecycle ${phase} phase`);
+    }
+  }
+
+  function ownsRun(runId: string, phase?: LifecyclePhase): boolean {
+    if (!runtime || runtime.state.runId !== runId || (phase && runtime.state.phase !== phase)) return false;
+    const active = currentRun(runtime.cwd, runtime.config.lifecycle.artifactsDir);
+    const disk = active && readState(active.paths);
+    return active?.runId === runId && disk?.runId === runId && (!phase || disk.phase === phase);
+  }
+
+  function latestRejectionIndex(): number {
+    const verdicts = runtime?.state.verdicts ?? [];
+    for (let index = verdicts.length - 1; index >= 0; index -= 1) {
+      if (verdicts[index].verdict === "reject") return index;
+    }
+    throw new Error("DEBUG requires a preceding rejection");
+  }
+
+  function latestRejection(): LifecycleStageVerdict {
+    const index = latestRejectionIndex();
+    return runtime!.state.verdicts[index];
+  }
+
+  function buildFeedback(): string | undefined {
+    if (!runtime) return undefined;
+    const rejection = [...runtime.state.verdicts].reverse().find((verdict) => verdict.verdict === "reject");
+    if (!rejection) return undefined;
+    const diagnosis = isNonEmpty(runtime.paths.debug) ? readFileSync(runtime.paths.debug, "utf8").trim() : undefined;
+    return [
+      `${rejection.stage.toUpperCase()} rejection: ${rejection.reasons}`,
+      rejection.requiredFixes ? `Required fixes: ${rejection.requiredFixes}` : undefined,
+      diagnosis ? `Independent DEBUG diagnosis:\n${diagnosis}` : undefined,
+    ].filter(Boolean).join("\n\n");
+  }
+
+  function replanFeedback(): string | undefined {
+    if (!runtime || runtime.state.consecutiveRejections !== 0) return undefined;
+    const rejection = [...runtime.state.verdicts].reverse().find((verdict) => verdict.verdict === "reject");
+    if (!rejection) return undefined;
+    const diagnosis = isNonEmpty(runtime.paths.debug) ? readFileSync(runtime.paths.debug, "utf8").trim() : undefined;
+    return [`Checker rejection: ${rejection.reasons}`, rejection.requiredFixes, diagnosis].filter(Boolean).join("\n\n");
+  }
+
+  function rel(path: string): string {
+    return relative(runtime?.cwd ?? process.cwd(), path).replaceAll("\\", "/");
+  }
+
+  async function modelFailure(ctx: ExtensionContext, stage: string, attempted: string[]): Promise<void> {
+    const detail = attempted.length > 0 ? attempted.join(", ") : "no configured candidate is authenticated locally";
+    await interruptRun(ctx, `Lifecycle ${stage} model unavailable (${detail}). Configure a candidate in Pi and ~/.ai-orchestrator/config.json or ${ctx.cwd}/.ai-orchestrator.json, then resume.`);
+  }
+
+  function updateUi(ctx: ExtensionContext): void {
+    if (!runtime || !ctx.hasUI) return;
+    const selection = runtime.state.modelSelections.at(-1);
+    const model = selection ? `${selection.provider}/${selection.model}` : "selecting model";
+    ctx.ui.setStatus(STATUS_KEY, `lifecycle ${runtime.state.phase} ${model}`);
+    const verdict = runtime.state.verdicts.at(-1);
+    ctx.ui.setWidget(WIDGET_KEY, [
+      `Lifecycle: ${runtime.state.phase}`,
+      `Model: ${model}`,
+      `Build iterations: ${runtime.state.buildIterations}`,
+      `Consecutive rejections: ${runtime.state.consecutiveRejections}`,
+      verdict ? `Last verdict: ${verdict.stage} ${verdict.verdict} — ${truncate(verdict.reasons, 80)}` : "Last verdict: none",
+    ]);
+  }
+
+  function clearUi(ctx: ExtensionContext): void {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+    ctx.ui.setWidget(WIDGET_KEY, undefined);
+  }
+
+  function currentModelState(ctx: ExtensionContext): LifecycleState["originalModel"] {
+    return ctx.model
+      ? { provider: String(ctx.model.provider), id: String(ctx.model.id), thinking: pi.getThinkingLevel() as ThinkingLevel }
+      : undefined;
+  }
+
+  async function restoreRuntimeModel(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const originalModel = runtime.automatic ? runtime.state.originalModel : runtime.invocationOriginal;
+    await restoreOriginalModel(ctx, runtime.state, originalModel);
+  }
+
+  async function restoreOriginalModel(
+    ctx: ExtensionContext,
+    state: LifecycleState,
+    originalModel: LifecycleState["originalModel"] = state.originalModel,
+  ): Promise<void> {
+    const original = originalModel;
+    if (!original) {
+      state.modelRestored = true;
+      persistRestoredState(state);
+      return;
+    }
+    const model = ctx.modelRegistry.find(original.provider, original.id);
+    if (!model) {
+      notify(ctx, `Could not restore original model ${original.provider}/${original.id}: model not found.`, "warning");
+      return;
+    }
+    if (!(await pi.setModel(model))) {
+      notify(ctx, `Could not restore original model ${original.provider}/${original.id}: authentication unavailable.`, "warning");
+      return;
+    }
+    pi.setThinkingLevel(original.thinking);
+    state.modelRestored = true;
+    persistRestoredState(state);
+  }
+
+  function persistRestoredState(state: LifecycleState): void {
+    if (runtime?.state.runId === state.runId) writeState(runtime.paths, state);
+  }
+
+  function persistMirror(state: LifecycleState): void {
+    pi.appendEntry(ENTRY_TYPE, state);
+  }
+
+  function sendPrompt(prompt: string): void {
+    pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  }
+
+  function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
+    if (ctx.hasUI) ctx.ui.notify(message, level);
+    else pi.sendMessage({ customType: ENTRY_TYPE, content: `[${level}] ${message}`, display: true }, { triggerTurn: false });
+  }
+}
+
+function hasActiveFastPath(ctx: ExtensionContext): boolean {
+  const entries = ctx.sessionManager.getBranch();
+  const latest = entries.filter((entry) => entry.type === "custom" && entry.customType === "ai-orchestrator").pop();
+  if (!latest?.data || typeof latest.data !== "object") return false;
+  const phase = (latest.data as { phase?: unknown }).phase;
+  return typeof phase === "string" && phase !== "idle" && phase !== "done" && phase !== "failed";
+}
+
+function loadPiConfig(cwd: string): OrchestratorConfig {
+  return loadConfig(cwd, { ignoreMcpProviders: true });
+}
+
+function loadCurrent(cwd: string): { paths: RunPaths; state: LifecycleState } | undefined {
+  let config: OrchestratorConfig;
+  try {
+    config = loadPiConfig(cwd);
+  } catch {
+    config = DEFAULT_CONFIG;
+  }
+  const active = currentRun(cwd, config.lifecycle.artifactsDir);
+  if (!active) return undefined;
+  const state = readState(active.paths);
+  return state?.runId === active.runId ? { paths: active.paths, state } : undefined;
+}
+
+function parsePorcelainStatus(output: string): { paths: string[]; stagedPaths: string[] } {
+  const records = output.split("\0");
+  const paths: string[] = [];
+  const stagedPaths: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record || record.length < 4) continue;
+    const x = record[0];
+    const path = record.slice(3);
+    if (path) {
+      paths.push(path);
+      if (x !== " " && x !== "?") stagedPaths.push(path);
+    }
+    if (x === "R" || x === "C") index += 1;
+  }
+  return { paths: unique(paths), stagedPaths: unique(stagedPaths) };
+}
+
+function parseTaskArgs(args: string): { yolo: boolean; task: string } {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  let yolo = false;
+  while (parts[0] === "--yolo") {
+    yolo = true;
+    parts.shift();
+  }
+  return { yolo, task: parts.join(" ").trim() };
+}
+
+function readRequired(path: string, label: string): string {
+  if (!isNonEmpty(path)) throw new Error(`${label} artifact is missing or empty: ${path}`);
+  return readFileSync(path, "utf8");
+}
+
+function isNonEmpty(path: string): boolean {
+  return existsSync(path) && readFileSync(path, "utf8").trim().length > 0;
+}
+
+function isActivePhase(phase: LifecyclePhase): boolean {
+  return phase !== "idle" && phase !== "done" && phase !== "failed";
+}
+
+function lastAssistantStopReason(messages: unknown[]): string | undefined {
+  for (const message of [...messages].reverse()) {
+    if (!isRecord(message) || message.role !== "assistant") continue;
+    return typeof message.stopReason === "string" ? message.stopReason : undefined;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function stageLabel(phase: LifecyclePhase): string {
+  return phase.replaceAll("_", " ").toUpperCase();
+}
+
+function nextCommand(phase: LifecyclePhase): string {
+  return `/${nextStandaloneForPhase(phase)}`;
+}
+
+function nextStandaloneForPhase(phase: LifecyclePhase): StandaloneStage {
+  switch (phase) {
+    case "defining":
+    case "awaiting_spec_approval": return "spec";
+    case "planning":
+    case "awaiting_plan_approval": return "plan";
+    case "building": return "build";
+    case "verifying": return "test";
+    case "debugging": return "debug";
+    case "reviewing": return "review";
+    case "shipping":
+    case "awaiting_ship_approval":
+    case "finalizing":
+    case "done":
+    case "failed":
+    case "idle": return "ship";
+    default: return assertNever(phase);
+  }
+}
+
+function formatDiagnosis(diagnosis: PendingDiagnosis): string {
+  return [
+    "# DEBUG Diagnosis",
+    "",
+    "## Root Cause",
+    diagnosis.rootCause,
+    "",
+    "## Evidence",
+    diagnosis.evidence,
+    "",
+    `## Confidence\n${diagnosis.confidence}`,
+    "",
+    "## Recommended Fix",
+    diagnosis.recommendedFix,
+    "",
+    "## Files Likely Affected",
+    diagnosis.filesLikelyAffected.length > 0 ? diagnosis.filesLikelyAffected.map((file) => `- ${file}`).join("\n") : "- Unknown",
+    "",
+    "## Validation Commands",
+    diagnosis.validationCommands.length > 0 ? diagnosis.validationCommands.map((command) => `- \`${command}\``).join("\n") : "- Re-run the checker validation",
+    "",
+  ].join("\n");
+}
+
+function finalSummary(state: LifecycleState, paths: RunPaths): string {
+  return [
+    state.phase === "done" ? "Lifecycle completed." : "Lifecycle failed at the configured BUILD cap.",
+    `Task: ${state.task}`,
+    `Build iterations: ${state.buildIterations}`,
+    `Verdicts: ${state.verdicts.map((verdict) => `${verdict.stage}:${verdict.verdict}`).join(", ") || "none"}`,
+    `Journal: ${paths.journal}`,
+    state.debugPath ? `Latest diagnosis: ${paths.debug}` : undefined,
+    state.phase === "failed" ? "The working tree was left as-is for human review." : undefined,
+  ].filter(Boolean).join("\n\n");
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled lifecycle value: ${JSON.stringify(value)}`);
+}

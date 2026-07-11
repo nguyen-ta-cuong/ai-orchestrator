@@ -8,6 +8,7 @@ export interface RunPaths {
   root: string;
   spec: string;
   plan: string;
+  debug: string;
   state: string;
   journal: string;
 }
@@ -34,6 +35,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       mkdirSync(paths.root, { recursive: true });
       writeFileSync(paths.spec, "");
       writeFileSync(paths.plan, "");
+      writeFileSync(paths.debug, "");
       writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
@@ -59,7 +61,11 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
   if (!existsSync(paths.state)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(paths.state, "utf8")) as unknown;
-    return isLifecycleState(parsed) ? parsed : undefined;
+    if (!isLifecycleState(parsed)) return undefined;
+    return {
+      ...parsed,
+      modelSelections: parsed.modelSelections?.map((selection) => ({ ...selection })) ?? [],
+    };
   } catch {
     return undefined;
   }
@@ -96,6 +102,7 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
     root,
     spec: join(root, "spec.md"),
     plan: join(root, "plan.md"),
+    debug: join(root, "debug.md"),
     state: join(root, "state.json"),
     journal: join(root, "journal.md"),
   };
@@ -281,6 +288,7 @@ const LIFECYCLE_PHASES = new Set<LifecyclePhase>([
   "building",
   "verifying",
   "reviewing",
+  "debugging",
   "shipping",
   "awaiting_ship_approval",
   "finalizing",
@@ -306,7 +314,55 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     typeof candidate.consecutiveRejections === "number" &&
     Array.isArray(candidate.verdicts) &&
     candidate.verdicts.every(isLifecycleVerdict) &&
+    (candidate.modelSelections === undefined ||
+      (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
+    (candidate.debugPath === undefined || typeof candidate.debugPath === "string") &&
+    (candidate.debugDiagnosisVerdictIndex === undefined ||
+      (Number.isInteger(candidate.debugDiagnosisVerdictIndex) && candidate.debugDiagnosisVerdictIndex >= 0)) &&
+    (candidate.baselinePaths === undefined ||
+      (Array.isArray(candidate.baselinePaths) && candidate.baselinePaths.every((path) => typeof path === "string"))) &&
+    (candidate.baselineStagedPaths === undefined ||
+      (Array.isArray(candidate.baselineStagedPaths) && candidate.baselineStagedPaths.every((path) => typeof path === "string"))) &&
+    (candidate.modelRestored === undefined || typeof candidate.modelRestored === "boolean") &&
+    isLifecycleOriginalModel(candidate.originalModel) &&
+    isLifecycleFinalization(candidate.finalization) &&
     typeof candidate.yolo === "boolean"
+  );
+}
+
+function isLifecycleOriginalModel(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.provider === "string" && candidate.provider.length > 0 &&
+    typeof candidate.id === "string" && candidate.id.length > 0 && isThinkingLevel(candidate.thinking);
+}
+
+function isLifecycleFinalization(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (candidate.commitSha === undefined || typeof candidate.commitSha === "string") &&
+    (candidate.prUrl === undefined || typeof candidate.prUrl === "string");
+}
+
+function isThinkingLevel(value: unknown): boolean {
+  return value === "off" || value === "minimal" || value === "low" || value === "medium" ||
+    value === "high" || value === "xhigh" || value === "max";
+}
+
+function isLifecycleModelSelection(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.stage === "define" || candidate.stage === "plan" || candidate.stage === "verify" ||
+      candidate.stage === "review" || candidate.stage === "debug" || candidate.stage === "ship" ||
+      candidate.stage === "build") &&
+    typeof candidate.provider === "string" && candidate.provider.length > 0 &&
+    typeof candidate.model === "string" && candidate.model.length > 0 &&
+    isThinkingLevel(candidate.thinking) &&
+    typeof candidate.reason === "string" &&
+    typeof candidate.selectedAt === "string"
   );
 }
 
