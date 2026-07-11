@@ -100,4 +100,23 @@ describe("completeWithRole", () => {
       signal: controller.signal,
     })).rejects.toThrow("LLM request aborted by client");
   });
+
+  it("keeps Anthropic max thinking below max_tokens", async () => {
+    const config = configFor("anthropic-messages");
+    config.roles.planner.thinking = "max";
+    const fetchMock = vi.fn(async () => Response.json({
+      content: [{ type: "text", text: "planned" }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await completeWithRole({ config, role: "planner", prompt: "plan" });
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(request.body)) as {
+      max_tokens: number;
+      thinking: { budget_tokens: number };
+    };
+    expect(body.thinking.budget_tokens).toBe(8192);
+    expect(body.max_tokens).toBeGreaterThan(body.thinking.budget_tokens);
+  });
 });

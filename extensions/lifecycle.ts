@@ -527,7 +527,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       case "shipping":
         await enterRoutedStage("ship", "shipper", ctx);
-        activateReadOnlyTools("ship_decision", true);
+        activateReadOnlyTools("ship_decision");
         updateUi(ctx);
         sendPrompt(shipPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.state.verdicts));
         break;
@@ -777,11 +777,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function maybeCommit(ctx: ExtensionContext): Promise<"committed" | "skipped" | "failed"> {
     if (!runtime) return "failed";
+    const runId = runtime.state.runId;
     if (runtime.state.finalization?.commitSha) return "committed";
     if (runtime.config.ship.commit === "never") return "skipped";
     let shouldCommit = runtime.config.ship.commit === "auto";
     if (runtime.config.ship.commit === "ask") {
       shouldCommit = ctx.hasUI && await ctx.ui.confirm("Commit changes", "Commit the lifecycle changes now?");
+      if (!ownsRun(runId, "finalizing")) return "failed";
     }
     if (!shouldCommit) return "skipped";
     if (!runtime.state.baselinePaths || !runtime.state.baselineStagedPaths) {
@@ -831,9 +833,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function maybeOpenPr(ctx: ExtensionContext): Promise<"opened" | "skipped" | "failed"> {
     if (!runtime) return "failed";
+    const runId = runtime.state.runId;
     if (runtime.state.finalization?.prUrl) return "opened";
     if (runtime.config.ship.openPr === "never") return "skipped";
     const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
+    if (!ownsRun(runId, "finalizing")) return "failed";
     if (!confirmed) return "skipped";
     const result = await pi.exec("gh", ["pr", "create", "--fill"], { timeout: 60_000, signal: ctx.signal });
     if (result.code !== 0) {
@@ -962,10 +966,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     pi.setActiveTools(unique([...READ_TOOLS, "edit", "write", ...optionalQuestions]));
   }
 
-  function activateReadOnlyTools(verdictTool?: string, allowAgentTeam = false): void {
+  function activateReadOnlyTools(verdictTool?: string): void {
     if (!runtime) return;
-    const extra = allowAgentTeam && runtime.toolsBeforeRun.includes("agent_team") ? ["agent_team"] : [];
-    pi.setActiveTools(unique([...READ_TOOLS, ...(verdictTool ? [verdictTool] : []), ...extra]));
+    pi.setActiveTools(unique([...READ_TOOLS, ...(verdictTool ? [verdictTool] : [])]));
   }
 
   function restoreBuildTools(): void {
@@ -1069,13 +1072,18 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function restoreRuntimeModel(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     const originalModel = runtime.automatic ? runtime.state.originalModel : runtime.invocationOriginal;
-    await restoreOriginalModel(ctx, { ...runtime.state, originalModel });
+    await restoreOriginalModel(ctx, runtime.state, originalModel);
   }
 
-  async function restoreOriginalModel(ctx: ExtensionContext, state: LifecycleState): Promise<void> {
-    const original = state.originalModel;
+  async function restoreOriginalModel(
+    ctx: ExtensionContext,
+    state: LifecycleState,
+    originalModel: LifecycleState["originalModel"] = state.originalModel,
+  ): Promise<void> {
+    const original = originalModel;
     if (!original) {
       state.modelRestored = true;
+      persistRestoredState(state);
       return;
     }
     const model = ctx.modelRegistry.find(original.provider, original.id);
@@ -1089,7 +1097,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     pi.setThinkingLevel(original.thinking);
     state.modelRestored = true;
-    if (runtime?.state.runId === state.runId) writeState(runtime.paths, runtime.state);
+    persistRestoredState(state);
+  }
+
+  function persistRestoredState(state: LifecycleState): void {
+    if (runtime?.state.runId === state.runId) writeState(runtime.paths, state);
   }
 
   function persistMirror(state: LifecycleState): void {
