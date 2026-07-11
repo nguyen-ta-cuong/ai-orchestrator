@@ -100,7 +100,7 @@ These commands let you control or continue a lifecycle run:
 /ship                        Run the currently pending SHIP stage
 ```
 
-Standalone stage commands refuse to skip or rewind the saved phase. `/lifecycle-stop` preserves the run directory; use `/lifecycle resume` to continue it later.
+Standalone stage commands refuse to skip or rewind the saved phase. An interrupted active run can be continued with `/lifecycle resume`. `/lifecycle-stop` deliberately cancels the run and releases its active pointer; it preserves the run directory for inspection, but that stopped run cannot be resumed.
 
 For lifecycle runs, BUILD uses the configured coder (GPT-5.5 by default). DEFINE, PLAN, VERIFY, REVIEW, DEBUG, and SHIP choose the first available model from the configured local Fable/GPT-5.6 preference order. The chosen model and any fallback are written to `state.json` and `journal.md`.
 
@@ -315,7 +315,7 @@ Verify the MCP server is enabled in Cursor. If MCP is unavailable by policy, run
 
 ### A run stopped or Pi was restarted
 
-Use `/orchestrate-stop` to cancel a fast loop. For a lifecycle run, use `/lifecycle resume` to continue from disk or `/lifecycle-stop` to preserve artifacts and release the active run pointer.
+Use `/orchestrate-stop` to cancel a fast loop. For an interrupted lifecycle run that remains active, use `/lifecycle resume` to continue from disk. Use `/lifecycle-stop` to cancel a lifecycle run and preserve its artifacts for inspection; stopping releases the active run pointer, so that run cannot be resumed.
 
 ## Package contents
 
