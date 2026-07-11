@@ -240,6 +240,7 @@ function anthropicThinking(thinking: ThinkingLevel): Record<string, unknown> {
     medium: 1024,
     high: 2048,
     xhigh: 4096,
+    max: 8192,
   };
   return { thinking: { type: "enabled", budget_tokens: budgetByLevel[thinking] } };
 }

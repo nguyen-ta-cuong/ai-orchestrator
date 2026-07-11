@@ -34,6 +34,10 @@ function builtOnce(state = approvedPlan()): LifecycleState {
   return nextStage(state, { type: "build_produced" }, config);
 }
 
+function debugged(state: LifecycleState): LifecycleState {
+  return nextStage(state, { type: "debug_produced", debugPath: "debug.md" }, config);
+}
+
 describe("nextStage", () => {
   it("starts from terminal state without inheriting previous run restore state", () => {
     const previousDone = createIdleLifecycleState({
@@ -107,16 +111,21 @@ describe("nextStage", () => {
     expect(nextStage(planning, { type: "plan_produced" }, noApproval).phase).toBe("building");
   });
 
-  it("sends a verify rejection back to building and then can continue", () => {
+  it("diagnoses a verify rejection before rebuilding and then can continue", () => {
     const verifying = builtOnce();
-    const rebuilding = nextStage(
+    const debugging = nextStage(
       verifying,
       { type: "verdict", stage: "verify", verdict: "reject", reasons: "test failed", requiredFixes: "fix test" },
       config,
     );
+    expect(debugging.phase).toBe("debugging");
+    expect(debugging.buildIterations).toBe(1);
+    expect(debugging.consecutiveRejections).toBe(1);
+
+    const rebuilding = debugged(debugging);
     expect(rebuilding.phase).toBe("building");
+    expect(rebuilding.debugPath).toBe("debug.md");
     expect(rebuilding.buildIterations).toBe(1);
-    expect(rebuilding.consecutiveRejections).toBe(1);
 
     const reviewing = nextStage(
       builtOnce(rebuilding),
@@ -129,9 +138,12 @@ describe("nextStage", () => {
 
   it("escalates two consecutive review rejections to planning while preserving build iterations", () => {
     const reviewing = nextStage(builtOnce(), { type: "verdict", stage: "verify", verdict: "approve", reasons: "ok" }, config);
-    const building = nextStage(reviewing, { type: "verdict", stage: "review", verdict: "reject", reasons: "first" }, config);
+    const firstDebug = nextStage(reviewing, { type: "verdict", stage: "review", verdict: "reject", reasons: "first" }, config);
+    const building = debugged(firstDebug);
     const reviewingAgain = nextStage(builtOnce(building), { type: "verdict", stage: "verify", verdict: "approve", reasons: "ok" }, config);
-    const planning = nextStage(reviewingAgain, { type: "verdict", stage: "review", verdict: "reject", reasons: "second" }, config);
+    const secondDebug = nextStage(reviewingAgain, { type: "verdict", stage: "review", verdict: "reject", reasons: "second" }, config);
+    expect(secondDebug.phase).toBe("debugging");
+    const planning = debugged(secondDebug);
 
     expect(planning.phase).toBe("planning");
     expect(planning.buildIterations).toBe(2);
@@ -148,7 +160,9 @@ describe("nextStage", () => {
       consecutiveRejections: 0,
     };
 
-    const failed = nextStage(verifying, { type: "verdict", stage: "verify", verdict: "reject", reasons: "still broken" }, config);
+    const debugging = nextStage(verifying, { type: "verdict", stage: "verify", verdict: "reject", reasons: "still broken" }, config);
+    expect(debugging.phase).toBe("debugging");
+    const failed = debugged(debugging);
     expect(failed.phase).toBe("failed");
     expect(failed.buildIterations).toBe(3);
   });
@@ -215,7 +229,9 @@ describe("nextStage", () => {
       verdicts: [{ stage: "review", verdict: "reject", reasons: "previous" }],
     };
 
-    const failed = nextStage(verifying, { type: "verdict", stage: "verify", verdict: "reject", reasons: "cap wins" }, config);
+    const debugging = nextStage(verifying, { type: "verdict", stage: "verify", verdict: "reject", reasons: "cap wins" }, config);
+    expect(debugging.phase).toBe("debugging");
+    const failed = debugged(debugging);
     expect(failed.phase).toBe("failed");
     expect(failed.consecutiveRejections).toBe(2);
   });
@@ -272,6 +288,7 @@ describe("nextStage", () => {
 
     const verifying = builtOnce();
     expect(nextStage(verifying, { type: "verdict", stage: "review", verdict: "approve", reasons: "wrong tool" }, config)).toEqual(verifying);
+    expect(nextStage(verifying, { type: "debug_produced", debugPath: "too-early.md" }, config)).toEqual(verifying);
   });
 
   it("validates loop config", () => {

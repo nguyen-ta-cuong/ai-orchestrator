@@ -250,7 +250,11 @@ describe("loadConfig", () => {
     expect(config.roles.spec).toEqual(DEFAULT_CONFIG.roles.spec);
     expect(config.roles.verifier.model).toBe("claude-fable-5");
     expect(config.roles.reviewer.thinking).toBe("xhigh");
+    expect(config.roles.debugger.model).toBe("claude-fable-5");
     expect(config.roles.shipper.provider).toBe("anthropic");
+    expect(config.routing.lifecycle.enabled).toBe(true);
+    expect(config.routing.lifecycle.stages.define[0].model).toBe("claude-fable-5");
+    expect(config.routing.lifecycle.stages.verify[0].model).toBe("gpt-5.6-sol");
     expect(config.lifecycle.artifactsDir).toBe(".ai-orchestrator/runs");
     expect(config.build.commitPerTask).toBe(false);
     expect(config.ship).toEqual({ commit: "ask", openPr: "ask" });
@@ -267,6 +271,13 @@ describe("loadConfig", () => {
         verifier: { model: "fast-verifier" },
       },
       lifecycle: { artifactsDir: ".orch/runs" },
+      routing: {
+        lifecycle: {
+          stages: {
+            debug: [{ provider: "local", model: "debug-model", thinking: "high" }],
+          },
+        },
+      },
       build: { commitPerTask: true },
       ship: { commit: "auto", openPr: "never" },
     });
@@ -276,6 +287,10 @@ describe("loadConfig", () => {
     expect(config.roles.verifier.model).toBe("fast-verifier");
     expect(config.roles.verifier.provider).toBe(DEFAULT_CONFIG.roles.verifier.provider);
     expect(config.lifecycle.artifactsDir).toBe(".orch/runs");
+    expect(config.routing.lifecycle.stages.debug).toEqual([
+      { provider: "local", model: "debug-model", thinking: "high" },
+    ]);
+    expect(config.routing.lifecycle.stages.verify).toEqual(DEFAULT_CONFIG.routing.lifecycle.stages.verify);
     expect(config.build.commitPerTask).toBe(true);
     expect(config.ship).toEqual({ commit: "auto", openPr: "never" });
   });
@@ -310,6 +325,22 @@ describe("loadConfig", () => {
       ship: { openPr: "auto" },
     });
     expect(() => loadConfig(project)).toThrow("ship.openPr must be one of ask, never");
+  });
+
+  it("rejects empty or malformed lifecycle routing candidates", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      routing: { lifecycle: { stages: { verify: [] } } },
+    });
+    expect(() => loadConfig(project)).toThrow("routing.lifecycle.stages.verify must be a non-empty array");
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      routing: { lifecycle: { stages: { verify: [{ provider: "openai-codex", model: "gpt-5.6-sol", thinking: "maximum" }] } } },
+    });
+    expect(() => loadConfig(project)).toThrow("routing.lifecycle.stages.verify[0].thinking must be one of");
   });
 
   it("maps shared config to loop config", () => {

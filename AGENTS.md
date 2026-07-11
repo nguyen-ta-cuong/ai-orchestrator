@@ -1,130 +1,133 @@
 # AGENTS.md — ai-orchestrator
 
-Guidance for coding agents (Codex, pi, Cursor) implementing and maintaining this repository.
+Guidance for coding agents implementing and maintaining this repository.
 
-The authoritative, living specification is `plans/0001-ai-orchestrator.md` (an ExecPlan; **never commit files under `plans/`**). Read it fully before implementing anything. This file is the condensed map: architecture, folder layout, build order, and rules.
+## Read first
 
-## What this project is
+The living specifications are local ExecPlans under `plans/`, which are deliberately not committed:
 
-An AI orchestrator that automates a **Plan → Code → Judge** loop across different models:
+- `plans/0001-ai-orchestrator.md` describes the shipped Plan → Code → Judge fast path.
+- `plans/0003-loop-engineering-lifecycle.md` is authoritative for the durable lifecycle, dynamic local model routing, and DEBUG loop. It supersedes `plans/0002-lifecycle-loop-engineering.md` for lifecycle Pi implementation.
 
-- **Planner/Architect**: high-reasoning model (default `fable` @ thinking `xhigh`) writes an implementation plan.
-- **Human gate**: user approves the plan (default on; `--yolo` skips).
-- **Coder**: coding model (default `gpt-5.5` @ `xhigh`) implements the plan with file edits and commands.
-- **Judge**: the planner model again reviews `git diff` + test results, returns a structured verdict.
-- **Loop policy**: on reject → coder retries with feedback; after **2 consecutive rejections** → escalate back to the planner (re-plan); hard cap **3 total coder iterations** → fail with a report.
+Read the relevant plan completely before changing behavior. Keep its `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` current. **Never commit files under `plans/`.**
 
-All role→model mappings are **user-configurable**; Fable/GPT-5.5 are only shipped defaults.
+## Sticky Loop Engineering principles
 
-It ships as **one npm package** with three delivery surfaces:
+This project engineers the system that prompts agents; it does not rely on a human manually prompting every phase. Preserve these principles in every surface:
 
-1. **Pi package** — `extensions/` + `skills/` auto-discovered by `pi install`; an `/orchestrate` command switches the live session's model per phase.
-2. **MCP server** — `ai-orchestrator-mcp` stdio binary for Cursor; exposes `orchestrator_plan` and `orchestrator_judge`. Cursor's own agent is the coder (nothing can switch Cursor's model programmatically).
-3. **Cursor skill/rules bundle (no MCP)** — for orgs that ban MCP; pure Markdown instructions drive the same loop, prompting the user to switch models manually.
+1. **The repository remembers; the model does not.** Lifecycle truth lives in `.ai-orchestrator/runs/<run-id>/`: `spec.md`, `plan.md`, `debug.md`, `state.json`, and `journal.md`. Conversation/session entries are a UI mirror, never authoritative state.
+2. **Keep the maker away from the checker.** GPT-5.5 is the BUILD implementer. DEFINE, PLAN, VERIFY, REVIEW, DEBUG, and SHIP use a top-tier Fable/GPT-5.6 model chosen from models configured locally. A model that edits code must not decide that its own work is done.
+3. **DEBUG diagnoses; BUILD edits.** VERIFY or REVIEW rejection enters a read-only DEBUG phase. DEBUG gathers evidence and calls `debug_diagnosis`; the extension writes the structured result to `debug.md`. DEBUG never mutates source files. GPT-5.5 receives that diagnosis and implements it.
+4. **Skills externalize intent.** Project conventions and phase rules belong in `AGENTS.md` and `skills/*/SKILL.md`, not in one-off prompts that must be rediscovered every run.
+5. **Connectors perform real work, with gates.** Pi tools, Git, MCP, and `gh` are action surfaces. Read operations may be automated. Commit/PR/publication remains explicitly configured and confirmed. Never push automatically.
+6. **Automations need resumable entry points.** `/lifecycle resume` must be idempotent and safe for scheduled invocation. An unattended run still fails closed at missing human approval or unavailable models.
+7. **Use worktrees for parallel implementation.** Concurrent agents work in separate branch worktrees. Worktree isolation prevents file collisions but does not remove human review cost.
+8. **Structured evidence beats prose.** Checker outcomes use terminating typed tools. State transitions are pure functions. The journal records transitions, verdicts, selected models, and fallback reasons.
+9. **Stay the engineer.** Automation does not waive verification, comprehension, security review, or rollback responsibility. The tree is never reverted automatically; the human decides what to keep.
 
-## Architecture
+These principles are distilled from Addy Osmani's “Loop Engineering”: automations provide the heartbeat, worktrees isolate parallel work, skills preserve intent, connectors reach real systems, independent agents separate maker/checker, and state outside the conversation is the spine.
 
-    ┌──────────────────────────────────────────────────────────┐
-    │                     src/core/  (PURE)                    │
-    │  loop.ts (state machine) · config.ts · prompts.ts        │
-    │  tests.ts (test-command detection)                       │
-    │  — no pi, no MCP, no fs side effects beyond config read —│
-    └───────▲──────────────────▲──────────────────▲────────────┘
-            │                  │                  │
-    ┌───────┴────────┐ ┌───────┴────────┐ ┌───────┴───────────┐
-    │ extensions/    │ │ mcp/           │ │ skills/ + cursor/ │
-    │ orchestrator.ts│ │ server.ts      │ │ SKILL.md, .mdc    │
-    │ (pi surface)   │ │ llm.ts (fetch) │ │ (instruction-only)│
-    └────────────────┘ └────────────────┘ └───────────────────┘
+## Product surfaces
 
-Core design rules:
+The npm package exposes three surfaces:
 
-- **`src/core/` is pure and shared.** The loop state machine (`nextPhase(state, event, config)`) is the single source of truth for loop policy. Both the pi extension and the MCP server's `nextAction` computation call it. Never duplicate loop logic in a surface.
-- **State machine phases**: `idle → planning → awaiting_approval → coding → judging → (coding | replanning | done | failed)`. State is JSON-serializable (`OrchestratorState` in the ExecPlan).
-- **Config precedence**: built-in defaults ← `~/.ai-orchestrator/config.json` ← `<project>/.ai-orchestrator.json`. `$ENV_VAR` interpolation for `mcp.providers.*.apiKey` only — never shell execution.
-- **Pi surface** resolves role models against the user's local pi model registry (`ctx.modelRegistry.find(provider, id)`); it ignores the `mcp.providers` config block. API keys/endpoints are pi's problem.
-- **MCP surface** calls planner/judge models itself via a compact `fetch`-based client (`mcp/llm.ts`, `anthropic-messages` + `openai-responses`/`openai-completions`, no per-provider SDKs). It never touches the caller's filesystem: the Cursor agent supplies `diff` and `testOutput`.
-- **Judge verdicts are structured, never parsed from prose**: a `judge_verdict` tool on pi (with `terminate: true`), a JSON tool response on MCP.
+1. **Pi package** — `extensions/` and `skills/` are auto-discovered. `/orchestrate` is the fast path. `/lifecycle` and standalone stage commands provide the durable DEFINE → SHIP loop.
+2. **MCP server** — `ai-orchestrator-mcp` serves Cursor. Cursor's selected agent remains the coder; the server calls architect/checker roles.
+3. **Cursor rules/skills** — Markdown-only fallback for environments that forbid MCP; model switching is manual there.
 
-## Folder structure
+The fast path is additive and stable:
 
-    ai-orchestrator/
-    ├── AGENTS.md                     # this file (committed)
-    ├── README.md                     # user-facing install/config docs (Milestone 5)
-    ├── package.json                  # name "ai-orchestrator"; keywords ["pi-package","mcp","cursor"];
-    │                                 # bins: ai-orchestrator-mcp, ai-orchestrator; type: module
-    ├── tsconfig.json                 # nodenext / es2022 / strict / outDir dist
-    ├── plans/                        # ExecPlans — NOT committed
-    │   └── 0001-ai-orchestrator.md
-    ├── src/core/                     # pure shared logic (unit-tested)
-    │   ├── loop.ts                   # Phase, OrchestratorState, LoopEvent, nextPhase()
-    │   ├── config.ts                 # loadConfig(cwd): defaults + user + project merge, $ENV interp
-    │   ├── prompts.ts                # plannerPrompt, replanPrompt, coderPrompt, judgePrompt
-    │   └── tests.ts                  # detectTestCommand(cwd): npm test / pytest / cargo test / go test
-    ├── extensions/
-    │   └── orchestrator.ts           # pi extension: /orchestrate, /orchestrate-stop, model switching,
-    │                                 # judge_verdict tool, tool gating, state persistence, UI status
-    ├── skills/
-    │   └── orchestrate/
-    │       └── SKILL.md              # Agent-Skills-standard skill; shared verbatim by pi AND Cursor;
-    │                                 # includes "Without orchestrator tools" fallback section
-    ├── mcp/
-    │   ├── server.ts                 # McpServer + StdioServerTransport; orchestrator_plan/_judge tools
-    │   └── llm.ts                    # minimal provider client (fetch); AI_ORCH_FAKE_LLM=1 stub hook
-    ├── cursor/
-    │   ├── rules/ai-orchestrator.mdc # Cursor rule driving the loop (MCP path + no-MCP fallback)
-    │   └── mcp.json                  # snippet users merge into .cursor/mcp.json
-    ├── bin/
-    │   ├── ai-orchestrator-mcp.js    # #!/usr/bin/env node → dist/mcp/server.js
-    │   └── ai-orchestrator.js        # installer CLI: install-cursor [--no-mcp] [--global]
-    └── test/
-        ├── loop.test.ts              # loop policy: caps, escalation, yolo, counter resets
-        ├── config.test.ts            # precedence + $ENV interpolation
-        └── mcp.test.ts               # spawn server, raw JSON-RPC initialize/tools-list, nextAction
+    planning → approval → coding → judging → done
+                              ↑         |
+                              └ reject ┘
 
-Import direction is one-way: `extensions/`, `mcp/`, `bin/` may import `src/core/`; `src/core/` imports nothing from them. `skills/` and `cursor/` are data-only (Markdown/JSON), no code.
+The lifecycle is durable:
 
-## Implementation strategy (build order)
+    DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP
+                       ↑        |         |
+                       └─ DEBUG <─ reject ┘
 
-Follow the ExecPlan milestones strictly; each is independently verifiable. Update the ExecPlan's `Progress`, `Decision Log`, and `Surprises & Discoveries` sections as you go.
+Two consecutive checker rejections re-plan. Three total BUILD passes fail by default. Caps come from config.
 
-1. **M1 — Core** (`src/core/*`, `test/loop.test.ts`, `test/config.test.ts`). Scaffold package, tsconfig, deps. Get `npm test` and `npx tsc --noEmit` green. Everything else depends on this.
-2. **M2 — Pi extension** (`extensions/orchestrator.ts`, `skills/orchestrate/SKILL.md`). Before writing code, read the pi docs at
-   `~/.nvm/versions/node/v24.16.0/lib/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md` (fully), plus `examples/extensions/plan-mode/` and `examples/extensions/structured-output.ts` there. Validate manually per the ExecPlan transcript in a scratch repo, with roles pointed at a **cheap model** via project config. Verify the real default model ids against `pi --list-models` and record them in the ExecPlan Decision Log.
-3. **M3 — MCP server** (`mcp/*`, `bin/*`, `cursor/*`, `test/mcp.test.ts`). Consult `node_modules/@modelcontextprotocol/sdk/README.md` for the current registration API. Tests must run without real credentials or network via the `AI_ORCH_FAKE_LLM=1` stub; test harnesses may inject dummy API-key environment variables so fake mode still exercises provider config validation.
-4. **M4 — No-MCP Cursor fallback**: extend `SKILL.md`, conditionalize the rule, `install-cursor --no-mcp` path. Confirm pi loads the skill with zero validation warnings. The fallback is now implemented in the shared skill/rule; remaining M4 work is manual validation.
-5. **M5 — Docs + packaging**: README, `npm pack --dry-run` includes `extensions/ skills/ dist/ bin/ cursor/` and excludes `plans/ test/`.
+## Architecture and import direction
 
-## Coding conventions
+    src/core/                         pure shared policy
+      loop.ts                         /orchestrate state machine
+      lifecycle.ts                    lifecycle state machine
+      lifecycleRouting.ts             pure stage-aware model candidate ordering
+      prompts.ts                      fast-path prompts
+      lifecyclePrompts.ts             lifecycle + DEBUG prompts
+      config.ts                       merge/validation/defaults
+      tests.ts                        test-command detection
 
-- TypeScript, ESM (`"type": "module"`), `strict: true`. Node ≥ 20.
-- Runtime dependencies: `@modelcontextprotocol/sdk` and `zod`. Dev: `typescript`, `vitest`, `@types/node`. Peer (`"*"`, provided by pi at runtime, never bundled): `@earendil-works/pi-coding-agent`, `typebox`, `@earendil-works/pi-ai`.
-- In the pi extension: use `StringEnum` from `@earendil-works/pi-ai` for enum tool params (never `Type.Union` of literals — breaks Google API); guard dialogs with `ctx.hasUI`; throw from tool `execute` to signal errors; keep persisted state JSON-serializable via `pi.appendEntry("ai-orchestrator", state)`.
-- The pi extension is loaded uncompiled by pi (jiti); `tsc` exists for type-checking and for building `dist/mcp/` for the bins.
-- Tests: vitest, no network, no real API keys (dummy keys are allowed to exercise validation). New loop behavior requires a loop test first.
+    src/lifecycle/artifacts.ts        mutating disk adapter; atomic state/journal/run lock
+    extensions/orchestrator.ts        existing Pi fast path
+    extensions/lifecycle.ts           durable Pi lifecycle
+    mcp/                              MCP adapter
+    skills/ and cursor/               data-only instructions/assets
 
-## Invariants (do not break)
+Import direction is one-way: surfaces and filesystem adapters may import `src/core/`; `src/core/` must never import Pi, MCP, extension, or artifact modules. `src/core/` is pure except configuration file reads already owned by `config.ts`.
 
-- Loop caps come from config, defaults 3 / 2; **only** `src/core/loop.ts` decides transitions.
-- The pi extension **always restores the user's original model and thinking level** on `done`, `failed`, cancel (`/orchestrate-stop`, Esc-abort), and interrupted-session restart.
-- The judge phase must not mutate files: judge tool set is read-only + `bash` + `judge_verdict`, with a `tool_call` guard blocking `edit`/`write` while `phase === "judging"`.
-- The working tree is never reverted automatically on failure — the human decides.
-- The installer never overwrites an existing `.cursor/mcp.json`; it prints the snippet instead.
-- The orchestrator never hardcodes API keys, provider endpoints (outside config defaults), or model ids beyond config defaults.
+## Invariants — do not break
 
-## Commands
+- Only `src/core/loop.ts` decides `/orchestrate` transitions. Only `src/core/lifecycle.ts` decides lifecycle transitions. Surfaces never duplicate cap/escalation policy.
+- Existing `/orchestrate` behavior and tests remain unchanged unless a separate approved plan explicitly changes them.
+- Pi lifecycle routing starts from `ctx.modelRegistry.getAvailable()`, selects stage candidates through pure policy, and records the chosen model and rationale. BUILD bypasses routing and uses configured `roles.coder` (GPT-5.5 by default).
+- All role/model mappings and route candidates are configurable. Never hardcode credentials or provider endpoints outside config defaults.
+- Pi ignores `mcp.providers`; MCP never reads Pi's local model registry. MCP ignores project-level provider endpoint/key overrides because the repository is untrusted input.
+- Every active-run exit path restores the user's original model, thinking level, and active tools: done, failed, cancel, Escape abort, model/provider error, session shutdown, interrupted restart, and standalone stage completion.
+- VERIFY, REVIEW, DEBUG, and SHIP are read-only. Their active tools are read/search plus filtered `bash` and the matching verdict/diagnosis tool. Bash accepts only reviewed inspection forms and the exact detected test command; a `tool_call` guard also blocks `edit` and `write` regardless of active-tool configuration.
+- DEFINE and PLAN may write only their exact run artifact. BUILD is the only lifecycle phase with normal source mutation tools.
+- Verdicts are structured, never parsed from prose: `judge_verdict`, `verify_verdict`, `review_verdict`, and `ship_decision`. Use `StringEnum` from `@earendil-works/pi-ai`; never `Type.Union` of string literals.
+- Disk state is authoritative. Write it atomically after every transition, append journal evidence, and release `current` only when the caller still owns that run id.
+- Guard every async approval/editor/confirm callback with run id and expected phase checks.
+- Missing artifacts or verdicts get one reminder, then fail closed or synthesize a rejection as specified by the ExecPlan.
+- One active lifecycle run per repository. The working tree is never automatically stashed, reset, checked out, cleaned, or reverted.
+- `--yolo` skips human lifecycle gates but never grants publication consent. SHIP never pushes. Commit/PR actions obey config and explicit confirmation.
+- The installer never overwrites an existing `.cursor/mcp.json`.
 
-    npm install          # setup
-    npm test             # vitest run (loop, config, mcp)
-    npx tsc --noEmit     # type check
-    npm run build        # tsc → dist/ (needed for bins)
-    npm pack --dry-run   # packaging check
+## Pi implementation conventions
 
-Manual pi validation (see ExecPlan Milestone 2 for the full expected transcript):
+Before Pi extension work, read the installed Pi docs completely:
 
-    cd /tmp/orch-demo && pi install /Users/cuongnguyen/Documents/github/ai-orchestrator && pi
-    > /orchestrate <task>
+- `docs/extensions.md`
+- `docs/models.md` when routing or model behavior changes
+- `docs/packages.md` and `docs/skills.md` when packaging resources changes
+- `examples/extensions/plan-mode/`
+- `examples/extensions/structured-output.ts`
+
+Resolve these paths under the installed `@earendil-works/pi-coding-agent` package named by the coding harness, not relative to this repository.
+
+Use `ctx.waitForIdle()` at command entry, `ctx.hasUI` for dialogs, `ctx.mode === "tui"` for TUI-only custom components, `pi.appendEntry()` for session mirrors, and `pi.setActiveTools()` with exact restoration. Throw from tool `execute` to signal failure. Keep persisted data JSON-serializable. Pi loads extensions uncompiled through jiti; TypeScript compilation still must pass.
+
+The `github.com/khoi/pi` package is a useful reference for an explicit Pi manifest and typed, UI-guarded structured questions. Prefer one grouped clarification at DEFINE when requirements are ambiguous rather than allowing BUILD to guess.
+
+## Configuration and trust boundaries
+
+Precedence is built-in defaults ← `~/.ai-orchestrator/config.json` ← `<project>/.ai-orchestrator.json`.
+
+- Prototype-pollution keys are dropped.
+- Lifecycle artifact paths remain relative and contained in the project.
+- `$ENV_VAR` interpolation is limited to `mcp.providers.*.apiKey`; never execute shell syntax from orchestrator config.
+- MCP provider base URLs require HTTPS and project config cannot redirect trusted user credentials.
+- Pi resolves provider/model pairs through its own registry and credentials.
+
+## Testing and validation
+
+TypeScript is strict ESM, Node ≥20. Runtime dependencies are `@modelcontextprotocol/sdk` and `zod`; Pi packages are peers. Tests must not use real credentials or network.
+
+Run from repository root:
+
+    npm install
+    npm test
+    npx tsc --noEmit
+    npm run build
+    npm pack --dry-run
+
+New transition behavior requires a state-machine test first. Stateful filesystem changes require adversarial tests for corrupt state, stale ownership, path traversal, lock contention, and cleanup. Routing changes require tests for local availability filtering, priority, fallback, deduplication, disabled routing, and no candidate.
+
+Manual Pi validation belongs in a scratch repository with cheap configured models first. Verify model switches, write guards, approval identity checks, DEBUG handoff, resume after restart, original-model/tool restoration, no skill warnings, and package discovery. Record concise evidence in the active ExecPlan.
 
 ## Questions policy
 
-If a requirement is ambiguous, first check `plans/0001-ai-orchestrator.md` (especially the Decision Log). If still ambiguous, choose the conservative option, implement it, and record the decision + rationale in the ExecPlan's Decision Log rather than stalling — except for anything touching security (key handling, shell execution) or destructive behavior, which requires asking the user.
+If behavior is ambiguous, read the active ExecPlan and its Decision Log first. Ask the user when ambiguity affects security, credentials, destructive operations, publication, externally visible contracts, or model-cost policy. Otherwise choose the conservative fail-closed behavior and record the decision and rationale in the ExecPlan rather than silently guessing.

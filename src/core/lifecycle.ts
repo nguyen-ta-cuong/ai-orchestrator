@@ -1,5 +1,5 @@
 import { decideRejectedBuildOutcome, type LoopConfig } from "./loop.js";
-import type { ThinkingLevel } from "./config.js";
+import type { LifecycleRoutedStage, ThinkingLevel } from "./config.js";
 
 export type LifecyclePhase =
   | "idle"
@@ -10,6 +10,7 @@ export type LifecyclePhase =
   | "building"
   | "verifying"
   | "reviewing"
+  | "debugging"
   | "shipping"
   | "awaiting_ship_approval"
   | "finalizing"
@@ -32,6 +33,15 @@ export interface LifecycleStageVerdict {
   requiredFixes?: string;
 }
 
+export interface LifecycleModelSelection {
+  stage: LifecycleRoutedStage | "build";
+  provider: string;
+  model: string;
+  thinking: ThinkingLevel;
+  reason: string;
+  selectedAt: string;
+}
+
 export interface LifecycleState {
   version: 1;
   runId: string;
@@ -39,9 +49,15 @@ export interface LifecycleState {
   task: string;
   specPath?: string;
   planPath?: string;
+  debugPath?: string;
   buildIterations: number;
   consecutiveRejections: number;
   verdicts: LifecycleStageVerdict[];
+  modelSelections: LifecycleModelSelection[];
+  baselinePaths?: string[];
+  baselineStagedPaths?: string[];
+  modelRestored?: boolean;
+  finalization?: { commitSha?: string; prUrl?: string };
   shipReport?: string;
   yolo: boolean;
   originalModel?: LifecycleOriginalModelState;
@@ -56,6 +72,7 @@ export type LifecycleEvent =
   | { type: "plan_approved" }
   | { type: "plan_rejected_by_user" }
   | { type: "build_produced" }
+  | { type: "debug_produced"; debugPath?: string }
   | {
       type: "verdict";
       stage: LifecycleVerdictStage;
@@ -77,10 +94,18 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
     buildIterations: 0,
     consecutiveRejections: 0,
     verdicts: [],
+    modelSelections: [],
+    modelRestored: true,
     yolo: false,
     ...overrides,
   };
   state.verdicts = overrides.verdicts ? overrides.verdicts.map((verdict) => ({ ...verdict })) : [];
+  state.modelSelections = overrides.modelSelections
+    ? overrides.modelSelections.map((selection) => ({ ...selection }))
+    : [];
+  state.baselinePaths = overrides.baselinePaths ? [...overrides.baselinePaths] : undefined;
+  state.baselineStagedPaths = overrides.baselineStagedPaths ? [...overrides.baselineStagedPaths] : undefined;
+  state.finalization = overrides.finalization ? { ...overrides.finalization } : undefined;
   state.originalModel = overrides.originalModel ? { ...overrides.originalModel } : undefined;
   return state;
 }
@@ -159,6 +184,12 @@ export function nextStage(
       return next;
     }
 
+    case "debug_produced": {
+      if (next.phase !== "debugging") return next;
+      if (event.debugPath !== undefined) next.debugPath = event.debugPath;
+      return applyRejectedBuildOutcome(next, config);
+    }
+
     case "verdict": {
       if (!isVerdictValidForCurrentPhase(next.phase, event.stage)) return next;
 
@@ -182,21 +213,12 @@ export function nextStage(
       }
 
       next.consecutiveRejections += 1;
-
-      const outcome = decideRejectedBuildOutcome(next.buildIterations, next.consecutiveRejections, config);
-      if (outcome === "fail") {
-        next.phase = "failed";
+      if (event.stage === "verify" || event.stage === "review") {
+        next.phase = "debugging";
         return next;
       }
 
-      if (outcome === "replan") {
-        next.phase = "planning";
-        next.consecutiveRejections = 0;
-        return next;
-      }
-
-      next.phase = "building";
-      return next;
+      return applyRejectedBuildOutcome(next, config);
     }
 
     case "ship_confirmed": {
@@ -220,6 +242,21 @@ export function nextStage(
     default:
       return assertNever(event);
   }
+}
+
+function applyRejectedBuildOutcome(state: LifecycleState, config: LoopConfig): LifecycleState {
+  const outcome = decideRejectedBuildOutcome(state.buildIterations, state.consecutiveRejections, config);
+  if (outcome === "fail") {
+    state.phase = "failed";
+    return state;
+  }
+  if (outcome === "replan") {
+    state.phase = "planning";
+    state.consecutiveRejections = 0;
+    return state;
+  }
+  state.phase = "building";
+  return state;
 }
 
 function shouldResetRejectionsOnApproval(
@@ -276,6 +313,10 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
   return {
     ...state,
     verdicts: state.verdicts.map((verdict) => ({ ...verdict })),
+    modelSelections: state.modelSelections.map((selection) => ({ ...selection })),
+    baselinePaths: state.baselinePaths ? [...state.baselinePaths] : undefined,
+    baselineStagedPaths: state.baselineStagedPaths ? [...state.baselineStagedPaths] : undefined,
+    finalization: state.finalization ? { ...state.finalization } : undefined,
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
   };
 }
