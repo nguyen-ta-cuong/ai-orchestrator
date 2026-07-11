@@ -255,9 +255,88 @@ describe("loadConfig", () => {
     expect(config.routing.lifecycle.enabled).toBe(true);
     expect(config.routing.lifecycle.stages.define[0].model).toBe("claude-fable-5");
     expect(config.routing.lifecycle.stages.verify[0].model).toBe("gpt-5.6-sol");
+    expect(config.routing.engine).toBe("capability-shadow");
+    expect(config.routing.mode).toBe("balanced");
     expect(config.lifecycle.artifactsDir).toBe(".ai-orchestrator/runs");
     expect(config.build.commitPerTask).toBe(false);
     expect(config.ship).toEqual({ commit: "ask", openPr: "ask" });
+  });
+
+  it("loads additive capability routing policy without changing legacy routes", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      routing: {
+        engine: "legacy",
+        mode: "quality",
+        deny: { models: ["unsafe/model"] },
+        limits: { maxEstimatedUsdPerRun: 3, maxAttemptsPerStage: 2 },
+        stages: { review: { minimumScores: { review: 8_000 }, prefer: ["custom/reviewer"] } },
+        profiles: {
+          "custom/reviewer": {
+            family: "review-family",
+            confidence: 9_000,
+            provenance: "project",
+            version: "v1",
+            scores: { review: 9_000, architecture: 8_000 },
+          },
+        },
+      },
+    });
+
+    const config = loadConfig(project);
+    expect(config.routing.engine).toBe("legacy");
+    expect(config.routing.mode).toBe("quality");
+    expect(config.routing.profiles["custom/reviewer"]?.scores.review).toBe(9_000);
+    expect(config.routing.lifecycle.stages.review).toEqual(DEFAULT_CONFIG.routing.lifecycle.stages.review);
+  });
+
+  it("prevents project config from loosening user routing ceilings or deny rules", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      routing: {
+        deny: { providers: ["denied-provider"], models: ["denied/model"] },
+        limits: { maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 },
+        separation: { checkerMustDifferFromBuilder: true, requireDifferentProviderFamilyFor: ["review"] },
+      },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      routing: {
+        deny: { providers: [], models: [] },
+        limits: { maxEstimatedUsdPerRun: 20, maxAttemptsPerStage: 8 },
+        separation: { checkerMustDifferFromBuilder: false, requireDifferentProviderFamilyFor: [] },
+      },
+    });
+
+    const config = loadConfig(project);
+    expect(config.routing.deny.providers).toContain("denied-provider");
+    expect(config.routing.deny.models).toContain("denied/model");
+    expect(config.routing.limits).toEqual({ maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 });
+    expect(config.routing.separation.checkerMustDifferFromBuilder).toBe(true);
+    expect(config.routing.separation.requireDifferentProviderFamilyFor).toContain("review");
+  });
+
+  it.each([
+    [{ routing: { engine: "automatic" } }, "routing.engine must be one of"],
+    [{ routing: { mode: "fastest" } }, "routing.mode must be one of"],
+    [{ routing: { deny: { providers: "unsafe" } } }, "routing.deny.providers must be an array"],
+    [{ routing: { separation: { checkerMustDifferFromBuilder: "yes" } } }, "routing.separation.checkerMustDifferFromBuilder must be a boolean"],
+    [{ routing: { profiles: { "": { confidence: 1, scores: {} } } } }, "routing.profiles keys must be non-empty provider/model identities"],
+    [{ routing: { profiles: { "p/m": { confidence: 10_001, scores: {} } } } }, "routing.profiles.p/m.confidence must be an integer between 0 and 10000"],
+    [{ routing: { profiles: { "p/m": { confidence: 1, provenance: "marketing", scores: {} } } } }, "routing.profiles.p/m.provenance must be one of"],
+    [{ routing: { profiles: { "p/m": { confidence: 1, scores: { coding: -1 } } } } }, "routing.profiles.p/m.scores.coding must be an integer between 0 and 10000"],
+    [{ routing: { stages: { review: { minimumScores: { review: 10_001 } } } } }, "routing.stages.review.minimumScores.review must be an integer between 0 and 10000"],
+    [{ routing: { limits: { maxEstimatedUsdPerRun: -1 } } }, "routing.limits.maxEstimatedUsdPerRun must be a non-negative number"],
+  ])("rejects invalid capability routing config %#", (patch, message) => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+    writeJson(join(project, ".ai-orchestrator.json"), patch);
+    expect(() => loadConfig(project)).toThrow(message);
   });
 
   it("allows project config to override lifecycle roles and options", () => {
