@@ -30,6 +30,7 @@ SHIP NO-GO continues to use the existing rejection policy directly. DEBUG is spe
 - [x] (2026-07-11) Milestone 1: extended lifecycle state, artifacts, prompts, configuration, and tests for DEBUG and local stage routing.
 - [x] (2026-07-11) Milestone 2: implemented `extensions/lifecycle.ts` with pipeline/stage commands, structured verdict and diagnosis tools, read-only command policy, disk persistence/resume, routing UI, finalization checkpoints, and safe restoration.
 - [x] (2026-07-11) Milestone 3 automated scope: added `skills/lifecycle/SKILL.md`; after PR review fixes, `npm test` passes 12 files/112 tests; `npx tsc --noEmit`, build, pack dry-run, and direct Pi package load pass with no extension/skill warnings.
+- [x] (2026-07-11) Closed clean-checkout validation gaps: lifecycle extension tests now use test-only Pi runtime stubs instead of untracked global-package symlinks, and builds remove stale `dist/` output before packaging. `npm test` passes 13 files/117 tests and pack dry-run contains the expected 61 files.
 - [ ] Milestone 3 manual model-turn scope: run the full scratch-repository lifecycle, forced DEBUG rejection, and kill/restart transcript. This intentionally remains pending because it invokes paid models and requires an interactive Pi session.
 
 ## Surprises & Discoveries
@@ -57,6 +58,12 @@ SHIP NO-GO continues to use the existing rejection policy directly. DEBUG is spe
 
 - Observation: A stop command must not wait for the operation it is intended to stop, and a durable artifact needs a matching durable completion marker.
   Evidence: PR review found `/lifecycle-stop` called `waitForIdle()` before `ctx.abort()`, and DEBUG resume truncated a diagnosis written just before a crash because completion lived only in memory. The stop path now aborts immediately; `debugDiagnosisVerdictIndex` is persisted with `debug.md`, allowing resume to advance the exact rejected verdict without rerunning DEBUG.
+
+- Observation: The original automated evidence depended on untracked symlinks in the implementation worktree, so `test/lifecycleExtension.test.ts` failed from a clean checkout when Vitest resolved optional Pi peer imports. TypeScript declaration shims do not provide runtime modules.
+  Evidence: `npm ls @earendil-works/pi-ai` was empty in the clean worktree but reported an extraneous global-package symlink in the milestone worktree. Test-only Vitest aliases now provide the minimal runtime schemas without changing published peer dependencies.
+
+- Observation: Running `tsc` without cleaning its output can package JavaScript for source files that no longer exist.
+  Evidence: the first package dry-run contained 64 files, including stale `dist/src/core/artifacts.*`; cleaning `dist/` before compilation restored the expected 61-file tarball.
 
 ## Decision Log
 
@@ -106,6 +113,14 @@ SHIP NO-GO continues to use the existing rejection policy directly. DEBUG is spe
 
 - Decision: Persist `modelRestored`, initial dirty/staged paths, commit SHA, and PR URL in lifecycle state.
   Rationale: These checkpoints prevent stale model restoration on later sessions, avoid committing pre-existing work, and make finalization resumable after successful external side effects.
+  Date: 2026-07-11
+
+- Decision: Keep Pi packages as optional runtime peers and alias only Vitest resolution to local schema stubs.
+  Rationale: Pi supplies these modules when loading the package, while repository tests must be reproducible after a normal install without relying on a global Pi installation or pulling the full agent runtime into development dependencies.
+  Date: 2026-07-11
+
+- Decision: Make `npm run build` remove only generated `dist/` output before invoking TypeScript.
+  Rationale: A deterministic build must not retain compiled files deleted from `src/`; cleaning the generated directory is safe and makes repeated package builds match clean-checkout output.
   Date: 2026-07-11
 
 ## Context and Orientation
@@ -308,8 +323,8 @@ Loop Engineering principles incorporated from Addy Osmani's June 2026 article: s
 Automated implementation evidence:
 
     npm test
-    Test Files  12 passed (12)
-    Tests       112 passed (112)
+    Test Files  13 passed (13)
+    Tests       117 passed (117)
 
     npx tsc --noEmit
     # passed with no output
@@ -329,8 +344,12 @@ The paid interactive lifecycle transcript remains pending.
 
 Implemented the durable Pi lifecycle, dynamic authenticated-local Fable/GPT-5.6 routing, fixed GPT-5.5 BUILD, structured read-only DEBUG handoff, standalone stage commands, resume, model/tool restoration, mutual exclusion with `/orchestrate`, scoped finalization, skill guidance, and automated validation. The main deviation from the initial draft is stronger: DEBUG no longer asks a read-only model to write a file; it calls `debug_diagnosis` and the extension writes the artifact. Review also required a real bash policy and durable finalization/model-restoration checkpoints.
 
+Follow-up clean-checkout validation removed two hidden environmental dependencies: tests no longer need globally symlinked Pi peers, and packaging no longer retains stale compiler output. The automated lifecycle evidence is now reproducible from the repository's declared dependencies.
+
 Remaining work is interactive evidence against paid models plus the later MCP/Cursor lifecycle surface. Filesystem symlink containment and stale crash-lock reclamation are pre-existing artifact-adapter hardening opportunities that should receive a separate focused plan rather than an untested late change here.
 
 ---
 
 Revision note (2026-07-11): Created this plan from the two prior plans plus current repository state. It supersedes the lifecycle Pi milestone with dynamic local Fable/GPT-5.6 routing, a read-only DEBUG stage, durable model-selection records, updated Loop Engineering invariants, and a concrete implementation/validation path. The change responds to the availability of stronger GPT-5.6 models while retaining GPT-5.5 as the dedicated implementer.
+
+Revision note (2026-07-11): Recorded clean-checkout test isolation and deterministic packaging fixes after the merged implementation was validated without the milestone worktree's untracked global Pi symlinks.
