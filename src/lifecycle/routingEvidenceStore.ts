@@ -1,0 +1,108 @@
+import { existsSync, mkdirSync, realpathSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative } from "node:path";
+import { validateRoutingEvidenceEvent, type RoutingEvidenceEvent } from "../core/routingEvidence.js";
+import type { RunPaths } from "./artifacts.js";
+
+export interface AppendRoutingEvidenceInput {
+  runPaths: RunPaths;
+  event: RoutingEvidenceEvent;
+  userStoreRoot?: string;
+}
+
+export interface ReadRoutingEvidenceResult {
+  events: RoutingEvidenceEvent[];
+  warnings: string[];
+}
+
+const MAX_EVIDENCE_LINE_BYTES = 256 * 1024;
+
+export function appendRoutingEvidenceEvent(input: AppendRoutingEvidenceInput): void {
+  const validation = validateRoutingEvidenceEvent(input.event);
+  if (!validation.ok) throw new Error(`routing evidence event is invalid: ${validation.error}`);
+  appendJsonLine(input.runPaths.evidence, input.event);
+  if (input.userStoreRoot) {
+    appendJsonLine(join(input.userStoreRoot, "events.jsonl"), input.event);
+  }
+}
+
+export function readRoutingEvidenceEvents(path: string): ReadRoutingEvidenceResult {
+  if (!existsSync(path)) return { events: [], warnings: [] };
+  const events: RoutingEvidenceEvent[] = [];
+  const warnings: string[] = [];
+  const corruptLines: string[] = [];
+  const lines = readFileSync(path, "utf8").split(/\r?\n/);
+  lines.forEach((line, index) => {
+    if (line.length === 0) return;
+    if (Buffer.byteLength(line, "utf8") > MAX_EVIDENCE_LINE_BYTES) {
+      warnings.push(`line ${index + 1} exceeds ${MAX_EVIDENCE_LINE_BYTES} bytes`);
+      corruptLines.push(line);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      const validation = validateRoutingEvidenceEvent(parsed);
+      if (!validation.ok || !validation.event) {
+        warnings.push(`line ${index + 1} is invalid: ${validation.error}`);
+        corruptLines.push(line);
+        return;
+      }
+      events.push(validation.event);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(`line ${index + 1} is not JSON: ${message}`);
+      corruptLines.push(line);
+    }
+  });
+  if (corruptLines.length > 0) {
+    writeFileSync(`${path}.quarantine`, `${corruptLines.join("\n")}\n`);
+  }
+  return { events, warnings };
+}
+
+export function resolveUserEvidenceRoot(home = homedir(), configured = "routing-evidence"): string {
+  if (configured.trim().length === 0 || isAbsolute(configured) || configured.startsWith("/") || configured.startsWith("\\") || /^[A-Za-z]:/.test(configured)) {
+    throw new Error("routing evidence user store must be inside the user ai-orchestrator directory");
+  }
+  const base = join(home, ".ai-orchestrator");
+  const root = join(base, ...normalizeRelativePath(configured).split("/"));
+  mkdirSync(base, { recursive: true });
+  if (existsSync(root)) {
+    const realBase = realpathSync(base);
+    const realRoot = realpathSync(root);
+    const inside = relative(realBase, realRoot);
+    if (inside.length === 0 || inside.startsWith("..") || isAbsolute(inside)) {
+      throw new Error("routing evidence user store must stay inside the user ai-orchestrator directory");
+    }
+  }
+  return root;
+}
+
+function appendJsonLine(path: string, value: RoutingEvidenceEvent): void {
+  const line = JSON.stringify(value);
+  if (Buffer.byteLength(line, "utf8") > MAX_EVIDENCE_LINE_BYTES) {
+    throw new Error(`routing evidence event exceeds ${MAX_EVIDENCE_LINE_BYTES} bytes`);
+  }
+  mkdirSync(join(path, ".."), { recursive: true });
+  if (existsSync(path)) {
+    const existing = statSync(path);
+    if (!existing.isFile()) throw new Error(`routing evidence path is not a file: ${path}`);
+  }
+  writeFileSync(path, `${line}\n`, { flag: "a" });
+}
+
+function normalizeRelativePath(value: string): string {
+  const stack: string[] = [];
+  for (const part of value.split(/[\\/]+/)) {
+    if (part.length === 0 || part === ".") continue;
+    if (part === "..") {
+      throw new Error("routing evidence user store must stay inside the user ai-orchestrator directory");
+    }
+    if (/[\u0000-\u001f\u007f]/.test(part)) {
+      throw new Error("routing evidence user store must not contain control characters");
+    }
+    stack.push(part);
+  }
+  if (stack.length === 0) throw new Error("routing evidence user store must be inside the user ai-orchestrator directory");
+  return stack.join("/");
+}

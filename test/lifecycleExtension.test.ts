@@ -105,6 +105,9 @@ describe("lifecycle Pi extension safety", () => {
     expect(readState(run.paths)?.modelSelections.at(-1)).toMatchObject({
       stage: "build", model: "coder", family: "maker", routing: { engine: "capability" },
     });
+    const evidence = JSON.parse(readFileSync(run.paths.evidence, "utf8").trim());
+    expect(evidence).toMatchObject({ stage: "build", selected: { provider: "invented", model: "coder" } });
+    expect(JSON.stringify(evidence)).not.toContain("# Plan");
 
     const resumeHarness = extensionHarness(run.cwd, models);
     await resumeHarness.commands.get("lifecycle")!("resume", resumeHarness.ctx);
@@ -120,6 +123,28 @@ describe("lifecycle Pi extension safety", () => {
       stage: "verify", model: "checker", family: "checker", routing: { separation: "different-family" },
     });
     expect(readFileSync(run.paths.routing, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("pauses before model activation when a routing budget would be exceeded", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability",
+        budgets: { maxEstimatedUsdPerStage: 0.001 },
+        profiles: {
+          "invented/coder": { confidence: 9000, version: "test", scores: { coding: 9500 } },
+        },
+      },
+    }));
+    const harness = extensionHarness(run.cwd, [{
+      provider: "invented", id: "coder", reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
+      cost: { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 },
+    }]);
+
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(harness.pi.setModel).not.toHaveBeenCalledWith(expect.objectContaining({ id: "coder" }));
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("paused by routing budget");
   });
 
   it("does not access runtime tool state while the extension factory is loading", () => {

@@ -8,6 +8,12 @@ import {
   type RoutingStage,
   type StageRoutingPolicy,
 } from "./modelRouting.js";
+import {
+  DEFAULT_ROUTING_BUDGETS,
+  DEFAULT_ROUTING_CIRCUIT_BREAKERS,
+  type RoutingBudgets,
+  type RoutingCircuitBreakers,
+} from "./routingBudget.js";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -37,6 +43,16 @@ export interface LifecycleRoutingConfig {
 export interface CapabilityRoutingConfig extends RoutingPolicy {
   engine: "legacy" | "capability-shadow" | "capability";
   profiles: Record<string, ModelCapabilityProfile>;
+  evidence: RoutingEvidenceConfig;
+  budgets: RoutingBudgets;
+  circuitBreakers: RoutingCircuitBreakers;
+}
+
+export interface RoutingEvidenceConfig {
+  enabled: boolean;
+  userStoreDir: string;
+  shadowComparisons: boolean;
+  minRecommendationSamples: number;
 }
 
 export interface OrchestratorConfig {
@@ -81,6 +97,9 @@ type ConfigPatch = Partial<{
     deny?: Partial<RoutingPolicy["deny"]>;
     separation?: Partial<RoutingPolicy["separation"]>;
     limits?: Partial<RoutingPolicy["limits"]>;
+    evidence?: Partial<RoutingEvidenceConfig>;
+    budgets?: Partial<RoutingBudgets>;
+    circuitBreakers?: Partial<RoutingCircuitBreakers>;
     stages?: Partial<Record<RoutingStage, Partial<StageRoutingPolicy>>>;
   };
   ship: Partial<OrchestratorConfig["ship"]>;
@@ -135,6 +154,14 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     ...cloneConfig(DEFAULT_ROUTING_POLICY),
     engine: "capability-shadow",
     profiles: {},
+    evidence: {
+      enabled: true,
+      userStoreDir: "routing-evidence",
+      shadowComparisons: true,
+      minRecommendationSamples: 10,
+    },
+    budgets: cloneConfig(DEFAULT_ROUTING_BUDGETS),
+    circuitBreakers: cloneConfig(DEFAULT_ROUTING_CIRCUIT_BREAKERS),
     lifecycle: {
       enabled: true,
       stages: {
@@ -362,6 +389,31 @@ function validateCapabilityRouting(routing: Record<string, unknown>): void {
   requireNonNegativeNumber(limits.maxEstimatedUsdPerRun, "routing.limits.maxEstimatedUsdPerRun");
   requirePositiveInteger(limits.maxAttemptsPerStage, "routing.limits.maxAttemptsPerStage");
 
+  const evidence = requirePlainObject(routing.evidence, "routing.evidence");
+  requireBoolean(evidence.enabled, "routing.evidence.enabled");
+  requireUserStoreRelativePath(evidence.userStoreDir, "routing.evidence.userStoreDir");
+  requireBoolean(evidence.shadowComparisons, "routing.evidence.shadowComparisons");
+  requirePositiveInteger(evidence.minRecommendationSamples, "routing.evidence.minRecommendationSamples");
+
+  const budgets = requirePlainObject(routing.budgets, "routing.budgets");
+  for (const key of [
+    "maxEstimatedUsdPerStage",
+    "maxEstimatedUsdPerRun",
+    "maxObservedUsdPerRun",
+    "maxEstimatedUsdPerDay",
+    "maxObservedUsdPerDay",
+  ] as const) {
+    requireNonNegativeNumber(budgets[key], `routing.budgets.${key}`);
+  }
+  requireNonNegativeInteger(budgets.maxPaidFallbacksPerRun, "routing.budgets.maxPaidFallbacksPerRun");
+  requireBoolean(budgets.allowUnknownCost, "routing.budgets.allowUnknownCost");
+
+  const circuitBreakers = requirePlainObject(routing.circuitBreakers, "routing.circuitBreakers");
+  requirePositiveInteger(circuitBreakers.maxSelectionFailures, "routing.circuitBreakers.maxSelectionFailures");
+  requirePositiveInteger(circuitBreakers.repeatedRejectionFingerprintLimit, "routing.circuitBreakers.repeatedRejectionFingerprintLimit");
+  requirePositiveInteger(circuitBreakers.maxBuildPassesWithoutImprovement, "routing.circuitBreakers.maxBuildPassesWithoutImprovement");
+  requireBoolean(circuitBreakers.requireIndependentChecker, "routing.circuitBreakers.requireIndependentChecker");
+
   const stages = requirePlainObject(routing.stages, "routing.stages");
   for (const stageName of ROUTING_STAGES) validateCapabilityStage(stages[stageName], `routing.stages.${stageName}`);
 
@@ -506,6 +558,19 @@ function requireSafeRelativePath(value: unknown, path: string): void {
   }
 }
 
+function requireUserStoreRelativePath(value: unknown, path: string): void {
+  requireNonEmptyString(value, path);
+  const text = value as string;
+  if (isAbsolute(text) || text.startsWith("/") || text.startsWith("\\") || /^[A-Za-z]:/.test(text)) {
+    throw new Error(`${path} must be a relative path inside the user ai-orchestrator directory`);
+  }
+  for (const part of text.split(/[\\/]+/)) {
+    if (part === ".." || /[\u0000-\u001f\u007f]/.test(part)) {
+      throw new Error(`${path} must be a relative path inside the user ai-orchestrator directory`);
+    }
+  }
+}
+
 function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): ConfigPatch {
   if (!ignoreMcpProviders || patch.mcp === undefined) {
     return patch;
@@ -519,6 +584,8 @@ function constrainProjectRoutingPatch(patch: ConfigPatch, userRouting: Capabilit
   const routing = cloneConfig(patch.routing) as unknown as Record<string, unknown>;
   protectDenyRules(routing, userRouting);
   protectLimits(routing, userRouting);
+  protectBudgets(routing, userRouting);
+  protectCircuitBreakers(routing, userRouting);
   protectSeparation(routing, userRouting);
   return { ...patch, routing: routing as unknown as ConfigPatch["routing"] };
 }
@@ -547,6 +614,52 @@ function protectLimits(routing: Record<string, unknown>, userRouting: Capability
   routing.limits.maxAttemptsPerStage = protectedMinimum(
     userRouting.limits.maxAttemptsPerStage,
     routing.limits.maxAttemptsPerStage,
+  );
+}
+
+function protectBudgets(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.budgets === undefined) {
+    routing.budgets = cloneConfig(userRouting.budgets);
+    return;
+  }
+  if (!isPlainObject(routing.budgets)) return;
+  for (const key of [
+    "maxEstimatedUsdPerStage",
+    "maxEstimatedUsdPerRun",
+    "maxObservedUsdPerRun",
+    "maxEstimatedUsdPerDay",
+    "maxObservedUsdPerDay",
+    "maxPaidFallbacksPerRun",
+  ] as const) {
+    routing.budgets[key] = protectedMinimum(userRouting.budgets[key], routing.budgets[key]);
+  }
+  routing.budgets.allowUnknownCost = protectedBoolean(!userRouting.budgets.allowUnknownCost, invertBoolean(routing.budgets.allowUnknownCost));
+  if (typeof routing.budgets.allowUnknownCost === "boolean") {
+    routing.budgets.allowUnknownCost = !routing.budgets.allowUnknownCost;
+  }
+}
+
+function protectCircuitBreakers(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.circuitBreakers === undefined) {
+    routing.circuitBreakers = cloneConfig(userRouting.circuitBreakers);
+    return;
+  }
+  if (!isPlainObject(routing.circuitBreakers)) return;
+  routing.circuitBreakers.maxSelectionFailures = protectedMinimum(
+    userRouting.circuitBreakers.maxSelectionFailures,
+    routing.circuitBreakers.maxSelectionFailures,
+  );
+  routing.circuitBreakers.repeatedRejectionFingerprintLimit = protectedMinimum(
+    userRouting.circuitBreakers.repeatedRejectionFingerprintLimit,
+    routing.circuitBreakers.repeatedRejectionFingerprintLimit,
+  );
+  routing.circuitBreakers.maxBuildPassesWithoutImprovement = protectedMinimum(
+    userRouting.circuitBreakers.maxBuildPassesWithoutImprovement,
+    routing.circuitBreakers.maxBuildPassesWithoutImprovement,
+  );
+  routing.circuitBreakers.requireIndependentChecker = protectedBoolean(
+    userRouting.circuitBreakers.requireIndependentChecker,
+    routing.circuitBreakers.requireIndependentChecker,
   );
 }
 
@@ -580,6 +693,10 @@ function protectedMinimum(base: number, patch: unknown): unknown {
 
 function protectedBoolean(base: boolean, patch: unknown): unknown {
   return patch === undefined ? base : typeof patch === "boolean" ? base || patch : patch;
+}
+
+function invertBoolean(value: unknown): unknown {
+  return typeof value === "boolean" ? !value : value;
 }
 
 function deepMerge<T>(base: T, patch: unknown): T {

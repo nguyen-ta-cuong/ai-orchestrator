@@ -83,6 +83,8 @@ plan.md       approved implementation plan
 debug.md      read-only diagnosis after a failed verification or review
 state.json    current phase, counters, model selections, and recovery state
 journal.md    transitions, verdicts, and routing decisions
+routing.jsonl full routing decisions and fallback attempts
+evidence.jsonl privacy-minimized usage, cost, and outcome events
 ```
 
 These commands let you control or continue a lifecycle run:
@@ -103,7 +105,7 @@ These commands let you control or continue a lifecycle run:
 
 Standalone stage commands refuse to skip or rewind the saved phase. An interrupted active run can be continued with `/lifecycle resume`. `/lifecycle-stop` deliberately cancels the run and releases its active pointer; it preserves the run directory for inspection, but that stopped run cannot be resumed.
 
-For lifecycle runs, BUILD uses the configured coder (GPT-5.5 by default). DEFINE, PLAN, VERIFY, REVIEW, DEBUG, and SHIP choose the first available model from the configured local Fable/GPT-5.6 preference order. The chosen model and any fallback are written to `state.json` and `journal.md`.
+For lifecycle runs, routing depends on `routing.engine`. In legacy and shadow modes, the old configured route remains active. In capability mode, every lifecycle stage including BUILD chooses from the callable local registry using stage policy, task features, model profiles, budgets, and maker/checker separation. The chosen model, fallbacks, and budget/evidence records are written to the run directory.
 
 VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses the root cause and recommends a smallest safe fix; it does not edit code or consume a BUILD iteration. SHIP never pushes. A commit or pull request requires both the appropriate configuration and explicit interactive confirmation unless configured otherwise.
 
@@ -247,7 +249,7 @@ Each legacy routing stage must have at least one candidate. These lists drive `l
 
 Capability routing is shared by the durable lifecycle and the fast Plan → Code → Judge loop. Set `routing.engine` to `"capability"` to make it active for every role, including BUILD. The conservative fresh default remains `"capability-shadow"`, which keeps legacy selection active while exposing the read-only ranking preview. Set `"legacy"` for the one-setting rollback.
 
-In capability mode, a `roles.*` provider or model written in user or project config is an exact pin. An untouched built-in role (including `openai-codex/gpt-5.5` for BUILD) is only a tie-breaking preference. Checkers cannot select the exact latest BUILD identity; strict family separation can additionally be required per stage. Each lifecycle run stores a compact selection summary in `state.json`, an explanation in `journal.md`, and the full append-only decision and fallback trace in `routing.jsonl`.
+In capability mode, a `roles.*` provider or model written in user or project config is an exact pin. An untouched built-in role (including `openai-codex/gpt-5.5` for BUILD) is only a tie-breaking preference. Checkers cannot select the exact latest BUILD identity; strict family separation can additionally be required per stage. Each lifecycle run stores a compact selection summary in `state.json`, an explanation in `journal.md`, the full append-only decision and fallback trace in `routing.jsonl`, and privacy-minimized cost/outcome events in `evidence.jsonl`.
 
 Run the read-only preview with any lifecycle stage or `fast-judge`:
 
@@ -274,6 +276,27 @@ Profiles contain subjective, user-overridable policy claims. All capability scor
     "limits": {
       "maxEstimatedUsdPerRun": 8,
       "maxAttemptsPerStage": 3
+    },
+    "budgets": {
+      "maxEstimatedUsdPerStage": 3,
+      "maxEstimatedUsdPerRun": 8,
+      "maxObservedUsdPerRun": 8,
+      "maxEstimatedUsdPerDay": 24,
+      "maxObservedUsdPerDay": 24,
+      "maxPaidFallbacksPerRun": 2,
+      "allowUnknownCost": true
+    },
+    "circuitBreakers": {
+      "maxSelectionFailures": 3,
+      "repeatedRejectionFingerprintLimit": 2,
+      "maxBuildPassesWithoutImprovement": 3,
+      "requireIndependentChecker": true
+    },
+    "evidence": {
+      "enabled": true,
+      "userStoreDir": "routing-evidence",
+      "shadowComparisons": true,
+      "minRecommendationSamples": 10
     },
     "separation": {
       "checkerMustDifferFromBuilder": true,
@@ -305,7 +328,9 @@ Profiles contain subjective, user-overridable policy claims. All capability scor
 }
 ```
 
-Modes are `quality`, `balanced`, `economy`, `pinned`, and `custom`. Hard constraints always run before scoring. Unknown profiles are excluded unless `allowInferredProfiles` is enabled; inferred profiles start with zero confidence and do not satisfy normal stage floors. Unknown cost follows `unknownCost: "exclude" | "penalize" | "allow"` and is never treated as free. User-level deny lists, cost/attempt ceilings, and separation requirements cannot be weakened by project configuration; a project may only add denials or tighten those limits. To reproduce the old behavior exactly, use `"engine": "legacy"`; to keep capability ranking observational, use `"capability-shadow"`.
+Modes are `quality`, `balanced`, `economy`, `pinned`, and `custom`. Hard constraints always run before scoring. Unknown profiles are excluded unless `allowInferredProfiles` is enabled; inferred profiles start with zero confidence and do not satisfy normal stage floors. Unknown cost follows `unknownCost: "exclude" | "penalize" | "allow"` during ranking and `budgets.allowUnknownCost` during pre-stage budget enforcement; it is never treated as free. User-level deny lists, cost/attempt ceilings, budget ceilings, circuit-breaker strictness, and separation requirements cannot be weakened by project configuration; a project may only add denials or tighten those limits. To reproduce the old behavior exactly, use `"engine": "legacy"`; to keep capability ranking observational, use `"capability-shadow"`.
+
+Routing evidence intentionally excludes prompts, source, diffs, artifact text, credentials, endpoint headers, and repository remotes. The local analyzer in `src/core/routingEvidence.ts` aggregates comparable completed stage samples and can produce report-only recommendations after the configured minimum sample count. Recommendations include the sample count, uncertainty, downstream evidence, trade-off, and rollback text; they do not edit active project policy automatically.
 
 ### MCP provider configuration
 

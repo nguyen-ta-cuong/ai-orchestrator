@@ -3,6 +3,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, loadConfigWithProvenance, loopConfigFrom, type ConfigProvenance, type OrchestratorConfig, type RoleConfig } from "../src/core/config.js";
 import { createPiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
+import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
 import type { ModelSelectionIdentity, RoutingStage } from "../src/core/modelRouting.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
@@ -39,6 +40,7 @@ interface RuntimeState extends OrchestratorState {
     policyVersion: string;
     taskFeaturesHash: string;
     fallbackCount: number;
+    estimatedCostUsd?: number;
   }>;
 }
 
@@ -533,6 +535,20 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     });
     const failed: string[] = [];
     for (const candidate of plan.candidates) {
+      const estimate: RoutingCostEstimate = candidate.estimatedCostUsd === undefined
+        ? { status: "unknown", reason: "candidate cost metadata unavailable" }
+        : { status: "known", estimatedUsd: candidate.estimatedCostUsd };
+      const budget = enforceRoutingBudget({
+        stage,
+        estimate,
+        budgets: resolved.config.routing.budgets,
+        snapshot: fastBudgetSnapshot(state),
+        unattended: state.yolo || !ctx.hasUI,
+      });
+      if (budget.allowed !== true) {
+        await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
+        return false;
+      }
       const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
       if (!model) {
         failed.push(`${candidate.provider}/${candidate.model} (not found)`);
@@ -559,6 +575,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
           policyVersion: plan.policyVersion,
           taskFeaturesHash: plan.taskFeaturesHash,
           fallbackCount: failed.length,
+          ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
         }],
       };
       persist();
@@ -567,6 +584,22 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
     await abortForModelError(ctx, `${role} has no eligible model (${[...failed, ...exclusions].join(", ") || "no candidates"})`);
     return false;
+  }
+
+  function fastBudgetSnapshot(current: RuntimeState): RoutingBudgetSnapshot {
+    return {
+      estimatedRunUsd: (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0),
+      observedRunUsd: 0,
+      estimatedDayUsd: (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0),
+      observedDayUsd: 0,
+      paidFallbacks: (current.modelSelections ?? []).reduce((sum, selection) => sum + selection.fallbackCount, 0),
+      attemptsByStage: Object.fromEntries(
+        (current.modelSelections ?? []).map((selection) => [
+          selection.stage,
+          (current.modelSelections ?? []).filter((item) => item.stage === selection.stage).length,
+        ]),
+      ) as Partial<Record<RoutingStage, number>>,
+    };
   }
 
   async function abortForModelError(ctx: ExtensionContext, reason: string): Promise<void> {
