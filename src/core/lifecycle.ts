@@ -37,9 +37,22 @@ export interface LifecycleModelSelection {
   stage: LifecycleRoutedStage | "build";
   provider: string;
   model: string;
+  family?: string;
   thinking: ThinkingLevel;
   reason: string;
   selectedAt: string;
+  routing?: {
+    decisionId: string;
+    engine: "legacy" | "capability-shadow" | "capability";
+    policyVersion: string;
+    taskFeaturesHash: string;
+    selectedRank: number;
+    score?: number;
+    separation: "not-applicable" | "different-model" | "different-family";
+    fallbackCount: number;
+    attemptedModels: string[];
+    failureCategories: string[];
+  };
 }
 
 export interface LifecycleState {
@@ -102,7 +115,14 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
   };
   state.verdicts = overrides.verdicts ? overrides.verdicts.map((verdict) => ({ ...verdict })) : [];
   state.modelSelections = overrides.modelSelections
-    ? overrides.modelSelections.map((selection) => ({ ...selection }))
+    ? overrides.modelSelections.map((selection) => ({
+      ...selection,
+      routing: selection.routing ? {
+        ...selection.routing,
+        attemptedModels: [...selection.routing.attemptedModels],
+        failureCategories: [...selection.routing.failureCategories],
+      } : undefined,
+    }))
     : [];
   state.baselinePaths = overrides.baselinePaths ? [...overrides.baselinePaths] : undefined;
   state.baselineStagedPaths = overrides.baselineStagedPaths ? [...overrides.baselineStagedPaths] : undefined;
@@ -314,7 +334,14 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
   return {
     ...state,
     verdicts: state.verdicts.map((verdict) => ({ ...verdict })),
-    modelSelections: state.modelSelections.map((selection) => ({ ...selection })),
+    modelSelections: state.modelSelections.map((selection) => ({
+      ...selection,
+      routing: selection.routing ? {
+        ...selection.routing,
+        attemptedModels: [...selection.routing.attemptedModels],
+        failureCategories: [...selection.routing.failureCategories],
+      } : undefined,
+    })),
     baselinePaths: state.baselinePaths ? [...state.baselinePaths] : undefined,
     baselineStagedPaths: state.baselineStagedPaths ? [...state.baselineStagedPaths] : undefined,
     finalization: state.finalization ? { ...state.finalization } : undefined,

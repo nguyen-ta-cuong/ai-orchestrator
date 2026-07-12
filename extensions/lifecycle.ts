@@ -6,13 +6,15 @@ import { Type } from "typebox";
 import {
   DEFAULT_CONFIG,
   loadConfig,
+  loadConfigWithProvenance,
   loopConfigFrom,
+  type ConfigProvenance,
   type LifecycleRoutedStage,
   type OrchestratorConfig,
-  type RoleConfig,
   type RoleName,
   type ThinkingLevel,
 } from "../src/core/config.js";
+import { createPiRoutingPlan, type PiRoutingCandidate, type PiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
 import {
   debugPrompt,
   buildPrompt,
@@ -22,7 +24,6 @@ import {
   taskPlanPrompt,
   verifyPrompt,
 } from "../src/core/lifecyclePrompts.js";
-import { lifecycleModelChoices } from "../src/core/lifecycleRouting.js";
 import {
   nextStage,
   type LifecycleEvent,
@@ -34,6 +35,7 @@ import { detectTestCommand } from "../src/core/tests.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import {
   appendJournal,
+  appendRoutingTrace,
   createRun,
   currentRun,
   readState,
@@ -65,6 +67,7 @@ type PendingVerdict =
 
 interface Runtime {
   config: OrchestratorConfig;
+  provenance: ConfigProvenance;
   cwd: string;
   paths: RunPaths;
   state: LifecycleState;
@@ -92,7 +95,6 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   });
 
   registerVerdictTools();
-  deactivateVerdictTools();
 
   pi.registerCommand("lifecycle", {
     description: "Run or resume the durable DEFINE → SHIP lifecycle",
@@ -344,7 +346,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    const config = loadPiConfig(ctx.cwd);
+    const resolved = loadPiResolvedConfig(ctx.cwd);
+    const config = resolved.config;
     const yolo = parsed.yolo || pi.getFlag("lifecycle-yolo") === true;
     const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
     const state = readState(created.paths);
@@ -354,7 +357,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     state.baselineStagedPaths = baseline?.stagedPaths;
     state.originalModel = currentModelState(ctx);
     writeState(created.paths, state);
-    runtime = makeRuntime(config, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
+    runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
     appendJournal(created.paths, "Lifecycle pipeline started");
     persistMirror(state);
     await runCurrentPhase(ctx);
@@ -376,7 +379,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    const config = loadPiConfig(ctx.cwd);
+    const resolved = loadPiResolvedConfig(ctx.cwd);
+    const config = resolved.config;
     const yolo = parsed.yolo || pi.getFlag("lifecycle-yolo") === true;
     const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
     const state = readState(created.paths);
@@ -386,7 +390,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     state.baselineStagedPaths = baseline?.stagedPaths;
     state.originalModel = currentModelState(ctx);
     writeState(created.paths, state);
-    runtime = makeRuntime(config, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
+    runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
     appendJournal(created.paths, "Standalone DEFINE started");
     persistMirror(state);
     await runCurrentPhase(ctx);
@@ -406,12 +410,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, `Lifecycle run ${loaded.state.runId} is ${loaded.state.phase}; it cannot be resumed.`, "info");
       return;
     }
-    const config = loadPiConfig(ctx.cwd);
+    const resolved = loadPiResolvedConfig(ctx.cwd);
+    const config = resolved.config;
     if (!loaded.state.originalModel) {
       loaded.state.originalModel = currentModelState(ctx);
       writeState(loaded.paths, loaded.state);
     }
-    runtime = makeRuntime(config, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
+    runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
     appendJournal(loaded.paths, `Resumed at ${loaded.state.phase}`);
     persistMirror(loaded.state);
     await runCurrentPhase(ctx);
@@ -431,10 +436,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, `Run ${loaded.state.runId} is at ${loaded.state.phase}; next command is ${nextCommand(loaded.state.phase)}.`, "error");
       return;
     }
-    const config = loadPiConfig(ctx.cwd);
+    const resolved = loadPiResolvedConfig(ctx.cwd);
+    const config = resolved.config;
     if (!loaded.state.originalModel) loaded.state.originalModel = currentModelState(ctx);
     writeState(loaded.paths, loaded.state);
-    runtime = makeRuntime(config, ctx.cwd, loaded.paths, loaded.state, false, stage, currentModelState(ctx));
+    runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, false, stage, currentModelState(ctx));
     appendJournal(loaded.paths, `Standalone ${stage.toUpperCase()} started`);
     persistMirror(loaded.state);
     await runCurrentPhase(ctx);
@@ -442,6 +448,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function makeRuntime(
     config: OrchestratorConfig,
+    provenance: ConfigProvenance,
     cwd: string,
     paths: RunPaths,
     state: LifecycleState,
@@ -451,6 +458,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   ): Runtime {
     return {
       config,
+      provenance,
       cwd,
       paths,
       state,
@@ -552,62 +560,145 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     restoreBuildTools();
-    await switchFixedRole("coder", "build", ctx);
+    await enterModelStage("build", "coder", ctx);
     updateUi(ctx);
     sendPrompt(buildPrompt(readRequired(runtime.paths.plan, "plan"), buildFeedback(), runtime.config.build.commitPerTask));
   }
 
   async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<void> {
-    if (!runtime) return;
-    const available = ctx.modelRegistry.getAvailable().map((model) => ({ provider: String(model.provider), model: String(model.id) }));
-    const choices = lifecycleModelChoices(stage, runtime.config, available, runtime.config.roles[role]);
-    runtime.attemptedModels = [];
-    for (const choice of choices) {
-      const label = `${choice.candidate.provider}/${choice.candidate.model}`;
-      runtime.attemptedModels.push(label);
-      const model = ctx.modelRegistry.find(choice.candidate.provider, choice.candidate.model);
-      if (!model || !(await pi.setModel(model))) continue;
-      pi.setThinkingLevel(choice.candidate.thinking);
-      const fallback = runtime.attemptedModels.length > 1
-        ? `; fell back after ${runtime.attemptedModels.slice(0, -1).join(", ")}`
-        : "";
-      recordModelSelection(stage, choice.candidate, `${choice.reason}${fallback}`);
-      return;
-    }
-    await modelFailure(ctx, stage, runtime.attemptedModels);
-    throw new Error(`no locally configured model for ${stage}`);
+    await enterModelStage(stage, role, ctx);
   }
 
-  async function switchFixedRole(role: RoleName, stage: "build", ctx: ExtensionContext): Promise<void> {
+  async function enterModelStage(stage: LifecycleRoutedStage | "build", role: RoleName, ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
-    const choice = runtime.config.roles[role];
-    const model = ctx.modelRegistry.find(choice.provider, choice.model);
-    if (!model || !(await pi.setModel(model))) {
-      await modelFailure(ctx, stage, [`${choice.provider}/${choice.model}`]);
-      throw new Error(`configured ${role} model is unavailable`);
+    const available = ctx.modelRegistry.getAvailable();
+    const plan = createPiRoutingPlan({
+      config: runtime.config,
+      provenance: runtime.provenance,
+      stage,
+      role,
+      available,
+      evidence: routingEvidence(),
+      priorSelections: runtime.state.modelSelections.map((selection) => ({
+        stage: selection.stage,
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.family ? { family: selection.family } : {}),
+      })),
+    });
+    const saved = [...runtime.state.modelSelections].reverse().find((selection) => selection.stage === stage && selection.routing);
+    if (saved) {
+      if (saved.routing!.policyVersion !== plan.policyVersion || saved.routing!.engine !== plan.engine) {
+        await modelFailure(ctx, stage, [`saved decision ${saved.routing!.decisionId} uses a different routing policy`]);
+        throw new Error(`saved routing policy for ${stage} no longer matches`);
+      }
+      const eligible = plan.candidates.some((candidate) => candidate.provider === saved.provider && candidate.model === saved.model);
+      const model = eligible ? ctx.modelRegistry.find(saved.provider, saved.model) : undefined;
+      if (!model || !(await pi.setModel(model))) {
+        await modelFailure(ctx, stage, [`saved selection ${saved.provider}/${saved.model} is unavailable or ineligible`]);
+        throw new Error(`saved model for ${stage} is unavailable`);
+      }
+      pi.setThinkingLevel(saved.thinking);
+      runtime.state.modelRestored = false;
+      writeState(runtime.paths, runtime.state);
+      appendJournal(runtime.paths, `Model ${stage}: reused saved decision ${saved.routing!.decisionId} (${saved.provider}/${saved.model})`);
+      return;
     }
-    pi.setThinkingLevel(choice.thinking);
-    recordModelSelection(stage, choice, "BUILD uses the configured implementer role; dynamic routing is intentionally disabled");
+
+    runtime.attemptedModels = [];
+    const attempts: { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[] = [];
+    for (const candidate of plan.candidates) {
+      const label = `${candidate.provider}/${candidate.model}`;
+      runtime.attemptedModels.push(label);
+      const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
+      if (!model) {
+        attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unconfigured" });
+        continue;
+      }
+      const expectedRunId = runtime.state.runId;
+      const expectedPhase = runtime.state.phase;
+      if (!(await pi.setModel(model))) {
+        attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
+        continue;
+      }
+      if (!runtime || runtime.state.runId !== expectedRunId || runtime.state.phase !== expectedPhase) return;
+      attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "selected" });
+      pi.setThinkingLevel(candidate.thinking);
+      recordModelSelection(stage, candidate, plan, attempts);
+      return;
+    }
+    persistRoutingTrace(stage, plan, attempts);
+    await modelFailure(ctx, stage, runtime.attemptedModels.length > 0 ? runtime.attemptedModels : plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? []);
+    throw new Error(`no eligible locally configured model for ${stage}`);
   }
 
   function recordModelSelection(
     stage: LifecycleRoutedStage | "build",
-    candidate: RoleConfig,
-    reason: string,
+    candidate: PiRoutingCandidate,
+    plan: PiRoutingPlan,
+    attempts: readonly { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[],
   ): void {
     if (!runtime) return;
+    const decisionId = `${runtime.state.runId}:${stage}:${runtime.state.modelSelections.length + 1}`;
+    const builder = [...runtime.state.modelSelections].reverse().find((selection) => selection.stage === "build");
+    const separation = !builder || stage === "build" ? "not-applicable"
+      : builder.family && candidate.family && builder.family !== candidate.family ? "different-family" : "different-model";
+    const fallbackCount = attempts.filter((attempt) => attempt.outcome !== "selected").length;
+    const reason = `${candidate.reason}${fallbackCount > 0 ? `; fallback count ${fallbackCount}` : ""}`;
     runtime.state.modelRestored = false;
     runtime.state.modelSelections.push({
       stage,
       provider: candidate.provider,
       model: candidate.model,
+      ...(candidate.family ? { family: candidate.family } : {}),
       thinking: candidate.thinking,
       reason,
       selectedAt: new Date().toISOString(),
+      routing: {
+        decisionId,
+        engine: plan.engine,
+        policyVersion: plan.policyVersion,
+        taskFeaturesHash: plan.taskFeaturesHash,
+        selectedRank: candidate.rank,
+        ...(candidate.score === undefined ? {} : { score: candidate.score }),
+        separation,
+        fallbackCount,
+        attemptedModels: attempts.map((attempt) => `${attempt.provider}/${attempt.model}`),
+        failureCategories: attempts.filter((attempt) => attempt.outcome !== "selected").map((attempt) => attempt.outcome),
+      },
     });
     writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `Model ${stage}: ${candidate.provider}/${candidate.model} (${candidate.thinking}) — ${reason}`);
+    persistRoutingTrace(stage, plan, attempts, decisionId);
+    appendJournal(runtime.paths, `Model ${stage}: ${candidate.provider}/${candidate.model} (${candidate.thinking}) — ${reason}; ${separation}; ${plan.engine}`);
     persistMirror(runtime.state);
+  }
+
+  function persistRoutingTrace(
+    stage: LifecycleRoutedStage | "build",
+    plan: PiRoutingPlan,
+    attempts: readonly { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[],
+    decisionId = `${runtime?.state.runId ?? "unknown"}:${stage}:failed`,
+  ): void {
+    if (!runtime) return;
+    appendRoutingTrace(runtime.paths, {
+      decisionId,
+      runId: runtime.state.runId,
+      stage,
+      recordedAt: new Date().toISOString(),
+      plan,
+      attempts,
+    });
+  }
+
+  function routingEvidence() {
+    if (!runtime) return {};
+    return {
+      task: runtime.state.task,
+      spec: existsSync(runtime.paths.spec) ? readFileSync(runtime.paths.spec, "utf8") : undefined,
+      plan: existsSync(runtime.paths.plan) ? readFileSync(runtime.paths.plan, "utf8") : undefined,
+      changedPaths: runtime.state.baselinePaths,
+      verdictCategory: runtime.state.verdicts.at(-1)?.reasons,
+    };
   }
 
   async function artifactStageEnded(ctx: ExtensionContext, artifact: "spec" | "plan"): Promise<void> {
@@ -917,7 +1008,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           notify(ctx, "No active lifecycle run.", "info");
           return;
         }
-        runtime = makeRuntime(loadPiConfig(ctx.cwd), ctx.cwd, loaded.paths, loaded.state, false, undefined, currentModelState(ctx));
+        const resolved = loadPiResolvedConfig(ctx.cwd);
+        runtime = makeRuntime(resolved.config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, false, undefined, currentModelState(ctx));
       }
       const stopped = runtime.state;
       if (!ctx.isIdle()) ctx.abort();
@@ -1048,11 +1140,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const model = selection ? `${selection.provider}/${selection.model}` : "selecting model";
     ctx.ui.setStatus(STATUS_KEY, `lifecycle ${runtime.state.phase} ${model}`);
     const verdict = runtime.state.verdicts.at(-1);
+    const routing = selection?.routing;
     ctx.ui.setWidget(WIDGET_KEY, [
       `Lifecycle: ${runtime.state.phase}`,
       `Model: ${model}`,
       `Build iterations: ${runtime.state.buildIterations}`,
       `Consecutive rejections: ${runtime.state.consecutiveRejections}`,
+      routing ? `Routing: ${routing.engine}; rank ${routing.selectedRank}; ${routing.separation}; fallback ${routing.fallbackCount}` : "Routing: legacy selection",
       verdict ? `Last verdict: ${verdict.stage} ${verdict.verdict} — ${truncate(verdict.reasons, 80)}` : "Last verdict: none",
     ]);
   }
@@ -1128,6 +1222,10 @@ function hasActiveFastPath(ctx: ExtensionContext): boolean {
 
 function loadPiConfig(cwd: string): OrchestratorConfig {
   return loadConfig(cwd, { ignoreMcpProviders: true });
+}
+
+function loadPiResolvedConfig(cwd: string) {
+  return loadConfigWithProvenance(cwd, { ignoreMcpProviders: true });
 }
 
 function loadCurrent(cwd: string): { paths: RunPaths; state: LifecycleState } | undefined {

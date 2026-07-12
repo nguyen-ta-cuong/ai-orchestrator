@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG, UNCONFIGURED_FABLE_BASE_URL, loadConfig, loopConfigFrom } from "../src/core/config.js";
+import { DEFAULT_CONFIG, UNCONFIGURED_FABLE_BASE_URL, loadConfig, loadConfigWithProvenance, loopConfigFrom } from "../src/core/config.js";
 
 const tempDirs: string[] = [];
 
@@ -25,6 +25,26 @@ afterEach(() => {
 });
 
 describe("loadConfig", () => {
+  it("reports explicit role identity provenance without treating thinking-only changes as pins", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      roles: { coder: { model: "user-coder" }, judge: { thinking: "medium" } },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      roles: { planner: { provider: "project-provider" } },
+    });
+
+    expect(loadConfigWithProvenance(project).provenance.roles).toMatchObject({
+      planner: "project",
+      coder: "user",
+      judge: "builtin",
+      verifier: "builtin",
+    });
+  });
+
   it("applies precedence: project config beats user config which beats defaults", () => {
     const home = makeTempDir();
     const project = makeTempDir();

@@ -1,0 +1,81 @@
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import orchestratorExtension from "../extensions/orchestrator.js";
+
+const dirs: string[] = [];
+
+describe("fast Pi capability routing", () => {
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("routes planner, coder, and an independent judge without changing loop transitions", async () => {
+    const cwd = join(tmpdir(), `ai-orchestrator-fast-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(cwd, { recursive: true });
+    dirs.push(cwd);
+    writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability",
+        unknownCost: "allow",
+        profiles: {
+          "invented/planner": { family: "architect", confidence: 9000, version: "test", scores: { architecture: 9500, coding: 6000, verification: 6000, review: 6000 } },
+          "invented/coder": { family: "maker", confidence: 9000, version: "test", scores: { architecture: 6000, coding: 9500, verification: 6000, review: 6000 } },
+          "invented/checker": { family: "checker", confidence: 9000, version: "test", scores: { architecture: 6000, coding: 6000, verification: 9500, review: 9500 } },
+        },
+      },
+    }));
+    const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
+    const events = new Map<string, (event: any, ctx: ExtensionContext) => Promise<void>>();
+    let activeTools = ["read", "edit", "bash"];
+    const setModel = vi.fn(async () => true);
+    const appendEntry = vi.fn();
+    const pi = {
+      registerFlag: vi.fn(),
+      registerTool: vi.fn(),
+      registerCommand: vi.fn((name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => commands.set(name, command.handler)),
+      on: vi.fn((name: string, handler: (event: any, ctx: ExtensionContext) => Promise<void>) => events.set(name, handler)),
+      getFlag: vi.fn(() => false),
+      getThinkingLevel: vi.fn(() => "high"),
+      setThinkingLevel: vi.fn(),
+      setModel,
+      getActiveTools: vi.fn(() => [...activeTools]),
+      setActiveTools: vi.fn((tools: string[]) => { activeTools = [...tools]; }),
+      appendEntry,
+      sendUserMessage: vi.fn(),
+      sendMessage: vi.fn(),
+      exec: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })),
+    };
+    orchestratorExtension(pi as unknown as ExtensionAPI);
+    const models = ["planner", "coder", "checker"].map((id) => ({
+      provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
+    }));
+    const ctx = {
+      cwd,
+      hasUI: true,
+      mode: "tui",
+      signal: new AbortController().signal,
+      model: { provider: "original", id: "model" },
+      modelRegistry: { getAvailable: () => models, find: (provider: string, id: string) => ({ provider, id }) },
+      sessionManager: { getBranch: () => [] },
+      ui: { notify: vi.fn(), select: vi.fn(async () => "Approve and code"), editor: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      waitForIdle: vi.fn(async () => undefined),
+      isIdle: vi.fn(() => true),
+      abort: vi.fn(),
+    } as unknown as ExtensionCommandContext;
+
+    await commands.get("orchestrate")!("--yolo build a feature", ctx);
+    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
+    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implemented" }] }, ctx as unknown as ExtensionContext);
+
+    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "coder", "checker"]);
+    const latest = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; modelSelections: Array<{ stage: string; model: string }> };
+    expect(latest.phase).toBe("judging");
+    expect(latest.modelSelections.map(({ stage, model }) => [stage, model])).toEqual([
+      ["plan", "planner"], ["build", "coder"], ["fast-judge", "checker"],
+    ]);
+    expect(activeTools).toContain("judge_verdict");
+  });
+});

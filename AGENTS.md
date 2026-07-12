@@ -16,8 +16,8 @@ Read the relevant plan completely before changing behavior. Keep its `Progress`,
 This project engineers the system that prompts agents; it does not rely on a human manually prompting every phase. Preserve these principles in every surface:
 
 1. **The repository remembers; the model does not.** Lifecycle truth lives in `.ai-orchestrator/runs/<run-id>/`: `spec.md`, `plan.md`, `debug.md`, `state.json`, and `journal.md`. Conversation/session entries are a UI mirror, never authoritative state.
-2. **Keep the maker away from the checker.** GPT-5.5 is the BUILD implementer. DEFINE, PLAN, VERIFY, REVIEW, DEBUG, and SHIP use a top-tier Fable/GPT-5.6 model chosen from models configured locally. A model that edits code must not decide that its own work is done.
-3. **DEBUG diagnoses; BUILD edits.** VERIFY or REVIEW rejection enters a read-only DEBUG phase. DEBUG gathers evidence and calls `debug_diagnosis`; the extension writes the structured result to `debug.md`. DEBUG never mutates source files. GPT-5.5 receives that diagnosis and implements it.
+2. **Keep the maker away from the checker.** BUILD uses an explicit configured pin or a capability-selected implementer (GPT-5.5 remains the built-in preference). DEFINE, PLAN, VERIFY, REVIEW, DEBUG, and SHIP use eligible models from the callable local registry. A model that edits code must not decide that its own work is done.
+3. **DEBUG diagnoses; BUILD edits.** VERIFY or REVIEW rejection enters a read-only DEBUG phase. DEBUG gathers evidence and calls `debug_diagnosis`; the extension writes the structured result to `debug.md`. DEBUG never mutates source files. The independently selected BUILD implementer receives that diagnosis and implements it.
 4. **Skills externalize intent.** Project conventions and phase rules belong in `AGENTS.md` and `skills/*/SKILL.md`, not in one-off prompts that must be rediscovered every run.
 5. **Connectors perform real work, with gates.** Pi tools, Git, MCP, and `gh` are action surfaces. Read operations may be automated. Commit/PR/publication remains explicitly configured and confirmed. Never push automatically.
 6. **Automations need resumable entry points.** `/lifecycle resume` must be idempotent and safe for scheduled invocation. An unattended run still fails closed at missing human approval or unavailable models.
@@ -72,7 +72,7 @@ Import direction is one-way: surfaces and filesystem adapters may import `src/co
 
 - Only `src/core/loop.ts` decides `/orchestrate` transitions. Only `src/core/lifecycle.ts` decides lifecycle transitions. Surfaces never duplicate cap/escalation policy.
 - Existing `/orchestrate` behavior and tests remain unchanged unless a separate approved plan explicitly changes them.
-- Pi lifecycle routing starts from `ctx.modelRegistry.getAvailable()`, selects stage candidates through pure policy, and records the chosen model and rationale. BUILD bypasses routing and uses configured `roles.coder` (GPT-5.5 by default).
+- Pi lifecycle routing starts from `ctx.modelRegistry.getAvailable()`, selects every stage including BUILD through pure capability policy when enabled, and records the chosen model and rationale. Explicit user/project `roles.*` identities are pins; built-in role identities are preferences. Legacy and shadow engines retain the prior exact-route behavior.
 - All role/model mappings and route candidates are configurable. Never hardcode credentials or provider endpoints outside config defaults.
 - Pi ignores `mcp.providers`; MCP never reads Pi's local model registry. MCP ignores project-level provider endpoint/key overrides because the repository is untrusted input.
 - Every active-run exit path restores the user's original model, thinking level, and active tools: done, failed, cancel, Escape abort, model/provider error, session shutdown, interrupted restart, and standalone stage completion.

@@ -187,7 +187,22 @@ export interface LoadConfigOptions {
   ignoreProjectMcpProviders?: boolean;
 }
 
+export type ConfigSource = "builtin" | "user" | "project";
+
+export interface ConfigProvenance {
+  roles: Record<RoleName, ConfigSource>;
+}
+
+export interface ResolvedOrchestratorConfig {
+  config: OrchestratorConfig;
+  provenance: ConfigProvenance;
+}
+
 export function loadConfig(cwd: string, options: LoadConfigOptions = {}): OrchestratorConfig {
+  return loadConfigWithProvenance(cwd, options).config;
+}
+
+export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions = {}): ResolvedOrchestratorConfig {
   const userPath = join(homedir(), ".ai-orchestrator", "config.json");
   const projectPath = join(cwd, ".ai-orchestrator.json");
 
@@ -198,7 +213,24 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Orches
   const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
   const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing));
 
-  return interpolateMcpApiKeys(validateConfig(merged));
+  return {
+    config: interpolateMcpApiKeys(validateConfig(merged)),
+    provenance: { roles: roleProvenance(userConfig, projectConfig) },
+  };
+}
+
+function roleProvenance(user: ConfigPatch, project: ConfigPatch): Record<RoleName, ConfigSource> {
+  const roles = {} as Record<RoleName, ConfigSource>;
+  for (const role of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "debugger", "shipper"] as const) {
+    roles[role] = hasRoleIdentityOverride(project.roles?.[role])
+      ? "project"
+      : hasRoleIdentityOverride(user.roles?.[role]) ? "user" : "builtin";
+  }
+  return roles;
+}
+
+function hasRoleIdentityOverride(value: Partial<RoleConfig> | undefined): boolean {
+  return value !== undefined && (Object.hasOwn(value, "provider") || Object.hasOwn(value, "model"));
 }
 
 export function loopConfigFrom(config: OrchestratorConfig): {

@@ -11,6 +11,16 @@ export interface RunPaths {
   debug: string;
   state: string;
   journal: string;
+  routing: string;
+}
+
+export interface RoutingTraceRecord {
+  decisionId: string;
+  runId: string;
+  stage: string;
+  recordedAt: string;
+  plan: unknown;
+  attempts: readonly { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[];
 }
 
 export function createRun(cwd: string, artifactsDir: string, task: string, yolo = false): { runId: string; paths: RunPaths } {
@@ -37,6 +47,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeFileSync(paths.plan, "");
       writeFileSync(paths.debug, "");
       writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
+      writeFileSync(paths.routing, "");
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
       currentPointerWritten = true;
@@ -64,7 +75,14 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
     if (!isLifecycleState(parsed)) return undefined;
     return {
       ...parsed,
-      modelSelections: parsed.modelSelections?.map((selection) => ({ ...selection })) ?? [],
+      modelSelections: parsed.modelSelections?.map((selection) => ({
+        ...selection,
+        routing: selection.routing ? {
+          ...selection.routing,
+          attemptedModels: [...selection.routing.attemptedModels],
+          failureCategories: [...selection.routing.failureCategories],
+        } : undefined,
+      })) ?? [],
     };
   } catch {
     return undefined;
@@ -92,6 +110,14 @@ export function appendJournal(paths: RunPaths, line: string): void {
   writeFileSync(paths.journal, `- ${timestamp} ${line}\n`, { flag: "a" });
 }
 
+export function appendRoutingTrace(paths: RunPaths, record: RoutingTraceRecord): void {
+  if (!isRoutingTraceRecord(record)) throw new Error("routing trace record is invalid");
+  const line = JSON.stringify(record);
+  if (Buffer.byteLength(line, "utf8") > 256 * 1024) throw new Error("routing trace record exceeds 256 KiB");
+  mkdirSync(paths.root, { recursive: true });
+  writeFileSync(paths.routing, `${line}\n`, { flag: "a" });
+}
+
 export function releaseRun(cwd: string, artifactsDir: string, runId: string): boolean {
   return withCurrentRunLock(cwd, artifactsDir, () => releaseCurrentPointerIfMatches(cwd, artifactsDir, runId));
 }
@@ -105,6 +131,7 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
     debug: join(root, "debug.md"),
     state: join(root, "state.json"),
     journal: join(root, "journal.md"),
+    routing: join(root, "routing.jsonl"),
   };
 }
 
@@ -360,10 +387,41 @@ function isLifecycleModelSelection(value: unknown): boolean {
       candidate.stage === "build") &&
     typeof candidate.provider === "string" && candidate.provider.length > 0 &&
     typeof candidate.model === "string" && candidate.model.length > 0 &&
+    (candidate.family === undefined || typeof candidate.family === "string") &&
     isThinkingLevel(candidate.thinking) &&
     typeof candidate.reason === "string" &&
-    typeof candidate.selectedAt === "string"
+    typeof candidate.selectedAt === "string" && isRoutingSummary(candidate.routing)
   );
+}
+
+function isRoutingSummary(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.decisionId === "string" && candidate.decisionId.length > 0 &&
+    (candidate.engine === "legacy" || candidate.engine === "capability-shadow" || candidate.engine === "capability") &&
+    typeof candidate.policyVersion === "string" && typeof candidate.taskFeaturesHash === "string" &&
+    Number.isInteger(candidate.selectedRank) && (candidate.selectedRank as number) > 0 &&
+    (candidate.score === undefined || typeof candidate.score === "number") &&
+    (candidate.separation === "not-applicable" || candidate.separation === "different-model" || candidate.separation === "different-family") &&
+    Number.isInteger(candidate.fallbackCount) && (candidate.fallbackCount as number) >= 0 &&
+    Array.isArray(candidate.attemptedModels) && candidate.attemptedModels.every((item) => typeof item === "string") &&
+    Array.isArray(candidate.failureCategories) && candidate.failureCategories.every((item) => typeof item === "string");
+}
+
+function isRoutingTraceRecord(value: unknown): value is RoutingTraceRecord {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.decisionId === "string" && candidate.decisionId.length > 0 &&
+    typeof candidate.runId === "string" && candidate.runId.length > 0 &&
+    typeof candidate.stage === "string" && candidate.stage.length > 0 &&
+    typeof candidate.recordedAt === "string" && candidate.plan !== undefined && Array.isArray(candidate.attempts) &&
+    candidate.attempts.every((attempt) => {
+      if (!attempt || typeof attempt !== "object") return false;
+      const item = attempt as Record<string, unknown>;
+      return typeof item.provider === "string" && typeof item.model === "string" &&
+        (item.outcome === "selected" || item.outcome === "unavailable" || item.outcome === "unconfigured");
+    });
 }
 
 function isLifecycleVerdict(value: unknown): boolean {

@@ -5,4 +5,5 @@ export * from "./core/lifecycleRouting.js";
 export * from "./core/loop.js";
 export * from "./core/modelRouting.js";
 export * from "./core/prompts.js";
+export * from "./core/taskFeatures.js";
 export * from "./core/tests.js";
