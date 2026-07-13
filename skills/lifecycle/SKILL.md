@@ -48,7 +48,7 @@ Read the approved specification. Produce dependency-ordered vertical tasks, each
 
 ### BUILD
 
-Execute the approved plan in dependency order. Add or update a failing test first when practical, implement the minimum safe change, refactor while green, and run relevant validation. Address every checker finding and DEBUG diagnosis. Do not approve, review, ship, or publish your own work.
+Execute the approved plan in dependency order with the active read/search/edit/write tools. Add or update a failing test first when practical, implement the minimum safe change, and address every checker finding and DEBUG diagnosis. BUILD has no arbitrary shell or connector authority; the independent VERIFY phase runs the exact detected test command. Do not approve, review, ship, or publish your own work.
 
 ### VERIFY (`/test`)
 
