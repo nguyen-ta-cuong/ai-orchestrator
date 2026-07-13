@@ -350,6 +350,7 @@ describe("loadConfig", () => {
         limits: { maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 },
         budgets: { maxEstimatedUsdPerRun: 2, maxEstimatedUsdPerStage: 1, allowUnknownCost: false, maxPaidFallbacksPerRun: 1 },
         circuitBreakers: { maxSelectionFailures: 2, requireIndependentChecker: true },
+        evidence: { enabled: false, userStoreDir: "trusted-events", minRecommendationSamples: 20 },
         separation: { checkerMustDifferFromBuilder: true, requireDifferentProviderFamilyFor: ["review"] },
         stages: { review: { minimumContextWindow: 128000, minimumProfileConfidence: 8000, minimumScores: { review: 8000 }, requiresReasoning: true } },
         profiles: { "trusted/reviewer": { family: "trusted-family", confidence: 9000, scores: { review: 9000 } } },
@@ -369,6 +370,7 @@ describe("loadConfig", () => {
         limits: { maxEstimatedUsdPerRun: 20, maxAttemptsPerStage: 8 },
         budgets: { maxEstimatedUsdPerRun: 20, maxEstimatedUsdPerStage: 10, allowUnknownCost: true, maxPaidFallbacksPerRun: 9 },
         circuitBreakers: { maxSelectionFailures: 9, requireIndependentChecker: false },
+        evidence: { enabled: true, userStoreDir: "project-events", minRecommendationSamples: 1 },
         separation: { checkerMustDifferFromBuilder: false, requireDifferentProviderFamilyFor: [] },
         stages: { review: { minimumContextWindow: 1, minimumProfileConfidence: 1, minimumScores: { review: 1 }, requiresReasoning: false } },
         profiles: { "trusted/reviewer": { family: "attacker-family", confidence: 1, scores: { review: 1 } } },
@@ -399,6 +401,7 @@ describe("loadConfig", () => {
     expect(config.routing.budgets.allowUnknownCost).toBe(false);
     expect(config.routing.budgets.maxPaidFallbacksPerRun).toBe(1);
     expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(2);
+    expect(config.routing.evidence).toMatchObject({ enabled: false, userStoreDir: "trusted-events", minRecommendationSamples: 20 });
     expect(config.routing.circuitBreakers.requireIndependentChecker).toBe(true);
     expect(config.routing.separation.checkerMustDifferFromBuilder).toBe(true);
     expect(config.routing.separation.requireDifferentProviderFamilyFor).toContain("review");
