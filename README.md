@@ -3,7 +3,7 @@
 AI Orchestrator separates planning, implementation, and checking instead of asking one model to approve its own work. It provides:
 
 - **Pi fast path:** `/orchestrate` runs an approval-gated Plan → Code → Judge loop.
-- **Pi lifecycle:** `/lifecycle` runs a durable DEFINE → PLAN → BUILD → VERIFY → DEBUG → REVIEW → SHIP workflow.
+- **Pi lifecycle:** `/lifecycle` runs a durable DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP workflow, with read-only DEBUG after checker rejection.
 - **Cursor with MCP:** the MCP server plans, previews trusted planner/checker routes, and judges evidence supplied by Cursor.
 - **Cursor without MCP:** installed Markdown instructions preserve the same gates with manual model handoffs.
 
@@ -20,8 +20,8 @@ How to read the canvas:
 1. **Choose where you work.** Pi can run the fast or durable workflow; Cursor can use MCP-routed planner/checker calls or manual model handoffs.
 2. **Keep the user at the gates.** Plans require approval by default, and routing metadata never grants permission to edit, commit, or publish.
 3. **Use the fast loop for focused changes.** PLAN → approval → BUILD → independent JUDGE; rejection returns actionable fixes, and repeated rejection re-plans within bounded attempts.
-4. **Use the lifecycle for durable work.** DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP persists state on disk. VERIFY or REVIEW rejection enters read-only DEBUG before BUILD applies a diagnosis.
-5. **Rely on the safety spine.** Capability routing, maker/checker separation, restart recovery, budgets/minimized evidence, and fresh Git confirmations apply around the workflow. SHIP evaluates readiness but never pushes.
+4. **Use the lifecycle for durable work.** DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP persists state on disk and uses the same default three-build/two-rejection caps. VERIFY or REVIEW rejection enters read-only DEBUG; SHIP NO-GO skips DEBUG. Loop policy then selects BUILD, PLAN, or failed.
+5. **Match features to the host.** Pi and MCP apply capability routing; every workflow keeps the maker separate from the checker. Pi adds cumulative budgets and minimized evidence, while the lifecycle adds restart recovery and fresh Git confirmations. MCP is stateless across calls, and Cursor manual mode relies on installed guidance rather than enforced automation. SHIP never pushes.
 
 ## Documentation
 
@@ -32,7 +32,7 @@ How to read the canvas:
 
 ## Architecture and surface parity
 
-All surfaces use the same pure routing concepts: stage requirements, task features, capability profiles, pins/preferences, deny rules, cost-aware ranking, policy versions, and maker/checker separation. The fast planner maps to `plan`; the fast judge maps to `fast-judge`, a combined verification/review policy. Existing loop state machines remain authoritative for counters and escalation.
+Automated Pi and MCP surfaces use the same pure routing concepts: stage requirements, task features, capability profiles, pins/preferences, deny rules, cost-aware ranking, policy versions, and maker/checker separation. Cursor's instructions-only surface mirrors the gates and separation rules through manual handoffs but cannot enforce routing itself. The fast planner maps to `plan`; the fast judge maps to `fast-judge`, a combined verification/review policy. Existing loop state machines remain authoritative for counters and escalation.
 
 The adapters intentionally differ where their hosts differ:
 
@@ -111,7 +111,8 @@ The extension plans, waits for approval unless `--yolo` was supplied, lets the s
 
 ```text
 DEFINE → approve → PLAN → approve → BUILD → VERIFY → REVIEW → SHIP
-                                           ↘ reject → DEBUG → BUILD / PLAN / failed
+VERIFY / REVIEW reject → DEBUG ────────────→ BUILD / PLAN / failed
+SHIP NO-GO ────────────────────────────────→ BUILD / PLAN / failed
 ```
 
 Commands:
@@ -134,7 +135,9 @@ Commands:
 /ship                        Run SHIP at the saved phase
 ```
 
-The run directory is authoritative:
+Lifecycle `--yolo` skips the DEFINE, PLAN, and SHIP approval pauses; it never grants commit, PR, or publication consent and does not bypass verification, separation, budgets, or loop caps.
+
+By default, the authoritative run directory is:
 
 ```text
 .ai-orchestrator/runs/<run-id>/
@@ -384,7 +387,7 @@ These are starting defaults, not model requirements:
 | Fast planner/judge roles | `anthropic/claude-fable-5`, `xhigh` |
 | Fast coder / lifecycle BUILD preference | `openai-codex/gpt-5.5`, `xhigh` |
 | Legacy lifecycle route preferences | Fable first for DEFINE/PLAN/SHIP; GPT-5.6 Sol first for VERIFY/REVIEW/DEBUG |
-| Fast coder passes | 3 |
+| Fast coder / lifecycle BUILD passes | 3 |
 | Rejections before re-plan | 2 consecutive |
 | Plan approval | Required |
 | Lifecycle commit / PR | Ask; never push |
