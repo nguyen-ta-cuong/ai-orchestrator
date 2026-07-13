@@ -1344,6 +1344,29 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     return createHash("sha256").update(value.trim().replace(/\s+/g, " ").toLowerCase()).digest("hex").slice(0, 16);
   }
 
+  function persistHumanOverride(stage: "define" | "plan"): void {
+    if (!runtime?.config.routing.evidence.enabled) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing) return;
+    const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
+      event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
+    if (!started) return;
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
+      event: {
+        ...started,
+        eventId: `${selection.routing.decisionId}:human-override:${runtime.state.verdicts.length}`,
+        recordedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+        rejectionCategory: "human-override",
+        usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+        cost: { estimatedUsd: started.cost.estimatedUsd, observedUsd: "unknown" },
+        outcome: { type: "human-override", humanOverride: true, verdict: "reject", buildIteration: runtime.state.buildIterations },
+      },
+    });
+  }
+
   function persistDownstreamReversal(stage: "verify" | "review", reason: string): void {
     if (!runtime?.config.routing.evidence.enabled) return;
     const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
@@ -1486,6 +1509,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       if (artifact === "spec") runtime.specRevisionFeedback = feedback.trim();
       else runtime.planRevisionFeedback = feedback.trim();
+      persistHumanOverride(artifact === "spec" ? "define" : "plan");
       await transition({ type: artifact === "spec" ? "spec_rejected_by_user" : "plan_rejected_by_user" }, `${artifact.toUpperCase()} revision requested`, ctx);
       await runCurrentPhase(ctx);
       return;
