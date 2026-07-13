@@ -126,6 +126,8 @@ export function validateRoutingEvidenceEvent(value: unknown): RoutingEvidenceVal
   const forbidden = findDisallowedKey(value);
   if (forbidden) return { ok: false, error: `routing evidence contains disallowed field ${forbidden}` };
   if (!isRecord(value)) return { ok: false, error: "routing evidence event must be an object" };
+  const unexpected = unexpectedEvidenceField(value);
+  if (unexpected) return { ok: false, error: `routing evidence contains unexpected field ${unexpected}` };
   if (value.version !== 1) return { ok: false, error: "routing evidence event version must be 1" };
   for (const key of ["eventId", "runId", "decisionId", "recordedAt", "policyVersion", "profileVersion"] as const) {
     if (typeof value[key] !== "string" || value[key].length === 0) return { ok: false, error: `${key} must be a non-empty string` };
@@ -306,6 +308,34 @@ function isOutcome(value: unknown): boolean {
 
 function isEvidenceNumber(value: unknown): value is EvidenceNumber {
   return value === "unknown" || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
+function unexpectedEvidenceField(value: Record<string, unknown>): string | undefined {
+  const top = unexpectedKey(value, ["version", "eventId", "runId", "decisionId", "stage", "recordedAt", "policyVersion", "profileVersion", "task", "selected", "fallback", "usage", "cost", "outcome"]);
+  if (top) return top;
+  const nested: Array<[unknown, readonly string[], string]> = [
+    [value.task, ["workKind", "risk", "languages", "fileCount"], "task"],
+    [value.selected, ["provider", "model", "family"], "selected"],
+    [value.usage, ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"], "usage"],
+    [value.cost, ["estimatedUsd", "observedUsd"], "cost"],
+    [value.outcome, ["type", "structuredToolCompliance", "verdict", "laterReversal", "buildIteration", "humanOverride", "finalRunStatus"], "outcome"],
+  ];
+  if (value.fallback !== undefined) nested.push([value.fallback, ["from", "reason"], "fallback"]);
+  for (const [candidate, keys, prefix] of nested) {
+    if (!isRecord(candidate)) continue;
+    const extra = unexpectedKey(candidate, keys);
+    if (extra) return `${prefix}.${extra}`;
+  }
+  if (isRecord(value.fallback) && isRecord(value.fallback.from)) {
+    const extra = unexpectedKey(value.fallback.from, ["provider", "model", "family"]);
+    if (extra) return `fallback.from.${extra}`;
+  }
+  return undefined;
+}
+
+function unexpectedKey(value: Record<string, unknown>, allowed: readonly string[]): string | undefined {
+  const allowedSet = new Set(allowed);
+  return Object.keys(value).find((key) => !allowedSet.has(key));
 }
 
 function identityKey(identity: EvidenceModelIdentity): string {
