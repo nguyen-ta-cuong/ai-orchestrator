@@ -106,20 +106,25 @@ The repository, not the conversation, remembers lifecycle truth:
 .ai-orchestrator/
   active-run.json
   current.lock
-  runs/<run-id>/
-    spec.md
-    plan.md
-    debug.md
-    state.json
-    journal.md
-    routing.jsonl
-    evidence.jsonl
+  runs/
+    current                         active run pointer
+    <run-id>/
+      spec.md
+      plan.md
+      debug.md
+      state.json
+      journal.md
+      routing.jsonl
+      evidence.jsonl
+      execution.lock               transient process lease
 
 ~/.ai-orchestrator/routing-evidence/
-  budget.jsonl
+  events.jsonl                     minimized cross-run analytical evidence
+  budget.jsonl                     strict cumulative budget ledger
+  recommendations/<id>.json        apply/rollback transaction records
 ```
 
-Only one lifecycle run may own a Git worktree, including commands started from different subdirectories. State writes are atomic, locks and process leases are reclaimable after a proven stale owner, and corrupt or ambiguous ownership fails closed.
+`state.json`, the journal, run evidence, and trusted-user evidence are persistent until removed. `current.lock` and `execution.lock` are transient ownership/lease files. Only one lifecycle run may own a Git worktree, including commands started from different subdirectories. State writes are atomic, locks and process leases are reclaimable after a proven stale owner, and corrupt or ambiguous ownership fails closed.
 
 Use `/lifecycle resume` after an interruption. Resume re-reads state after obtaining the execution lease, restores any pending structured checker verdict, reconciles recoverable commit/PR intent, and continues only from the saved phase. Missing artifacts, policy drift, unsafe paths, unavailable models, unknown budget state, or ownership loss pause/fail rather than silently guessing.
 
@@ -140,13 +145,13 @@ Past decisions remain evidence; migration affects the unfinished phase and later
 
 `/lifecycle-routing-report` is read-only. It groups only compatible policy/profile versions and requires the configured minimum evidence before recommending a preference.
 
-`/lifecycle-routing-apply <number>` is a global trusted-user change, not a project-local tweak. The confirmation identifies the stage, evidence category, sample basis, current preference, and proposed preference. On approval it updates `~/.ai-orchestrator/config.json`, advances the routing version, and writes a private recoverable transaction record.
+`/lifecycle-routing-apply <number>` is a global trusted-user change, not a project-local tweak. The confirmation identifies the stage, evidence category, sample basis, tradeoff/proposal, and global scope. On approval it updates `~/.ai-orchestrator/config.json`, advances the routing version, and writes a private recoverable transaction record.
 
 Use the returned ID with `/lifecycle-routing-rollback <id>`. Rollback succeeds only when every field changed by application still matches the applied transaction; it refuses to overwrite newer policy.
 
 ### Cost and privacy evidence
 
-Pi maintains `budget.jsonl` independently of optional recommendation evidence, so disabling analytics never disables cumulative run/day ceilings. Unknown usage or corrupt budget state fails closed under strict policy.
+Pi maintains `budget.jsonl` independently of optional recommendation evidence, so disabling analytics never disables cumulative run/day ceilings. Estimated ceilings continue to constrain planned spend. When a provider does not report observed usage, the event records `unknown` and adds no amount to observed totals; corrupt ledger state fails closed.
 
 Routing and evidence files contain bounded identities, policy/profile versions, task categories/features, typed failure reasons, usage/cost values (or `unknown`), and outcomes. They exclude prompts, source text, diffs, artifact text, credentials, request headers, and repository remotes.
 
@@ -160,15 +165,28 @@ The MCP server routes only its planner and checker calls. Cursor's selected host
 4. Select a coding-capable Cursor model and record its exact host identity as canonical `provider/model` in `coderIdentity`.
 5. Implement, run relevant tests in Cursor, and collect `git diff`, `git diff --staged`, and test output.
 6. Call `orchestrator_models` with `stage: "fast-judge"` and `coderIdentity`; verify independent checking is satisfied.
-7. Call `orchestrator_judge` with task, plan, diff, tests, counters, and `coderIdentity`.
+7. On the first pass, call `orchestrator_judge` with these required counter values:
+
+   ```json
+   {
+     "task": "the original task",
+     "plan": "the approved plan",
+     "diff": "the current unstaged and staged diff",
+     "testOutput": "the relevant test output",
+     "iteration": 1,
+     "consecutiveRejections": 0,
+     "coderIdentity": "provider/model"
+   }
+   ```
+
 8. Record the actual checker, fallback history, verdict, reasons, and required fixes.
 9. Follow the returned `nextAction`, `nextIteration`, and `nextConsecutiveRejections` exactly:
    - `done`: report the independently approved result.
-   - `retry_coding`: address every required fix, retest, and refresh the diff.
-   - `replan`: request and approve a revised plan before editing again.
+   - `retry_coding`: address every required fix, retest, refresh the diff, and use the returned counters on the next judge call.
+   - `replan`: call `orchestrator_plan` with the original `task`, the last approved plan as `previousPlan`, accumulated `judgeReports`, and the refreshed `diffSummary`; present and approve the revised plan before editing again.
    - `stop_failed`: stop and report remaining work without reverting the tree.
 
-MCP is stateless across tool calls. It enforces per-request estimate and fallback caps, returns minimized routing metadata, and does not write project artifacts or cumulative run/day evidence. Keep client-side run notes when durable audit history is required.
+`previousPlan` is mandatory whenever `judgeReports` or `diffSummary` is supplied. MCP is stateless across tool calls. It enforces per-request estimate and fallback caps, returns minimized routing metadata, and does not write project artifacts or cumulative run/day evidence. Keep client-side run notes when durable audit history is required.
 
 ## Cursor without MCP
 
