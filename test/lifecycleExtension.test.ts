@@ -237,6 +237,20 @@ describe("lifecycle Pi extension safety", () => {
     expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
   });
 
+  it("refuses PR creation until an explicitly pushed upstream matches HEAD", async () => {
+    const run = makeRun("finalizing");
+    const state = readState(run.paths)!;
+    state.finalization = { commitSha: "abc123" };
+    writeState(run.paths, state);
+    const harness = extensionHarness(run.cwd);
+
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(harness.exec).toHaveBeenCalledWith("git", ["rev-parse", "@{upstream}"], expect.anything());
+    expect(harness.exec).not.toHaveBeenCalledWith("gh", expect.arrayContaining(["create"]), expect.anything());
+    expect(harness.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("explicitly pushed"), "error");
+  });
+
   it("does not open a pull request after a stale confirmation cancels the run", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
