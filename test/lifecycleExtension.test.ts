@@ -197,6 +197,35 @@ describe("lifecycle Pi extension safety", () => {
     expect(readFileSync(run.paths.journal, "utf8")).toContain("paused by routing budget");
   });
 
+  it("counts prior user-store events toward the daily routing ceiling", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability",
+        budgets: { maxEstimatedUsdPerDay: 0.5 },
+        profiles: { "invented/coder": { confidence: 9000, scores: { coding: 9500 } } },
+      },
+    }));
+    const harness = extensionHarness(run.cwd, [{
+      provider: "invented", id: "coder", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 16000,
+      cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const userStore = join(run.cwd, "home", ".ai-orchestrator", "routing-evidence");
+    mkdirSync(userStore, { recursive: true });
+    writeFileSync(join(userStore, "events.jsonl"), `${JSON.stringify({
+      version: 1, eventId: "prior", runId: "prior-run", decisionId: "prior-decision", stage: "build",
+      recordedAt: new Date().toISOString(), policyVersion: "v1", profileVersion: "v1",
+      task: { workKind: "feature", risk: "medium", languages: [], fileCount: 1 }, selected: { provider: "p", model: "m" },
+      usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+      cost: { estimatedUsd: 0.5, observedUsd: "unknown" }, outcome: { type: "stage-started", buildIteration: 0 },
+    })}\n`);
+
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("daily estimated budget");
+    expect(harness.pi.setModel).not.toHaveBeenCalledWith(expect.objectContaining({ id: "coder" }));
+  });
+
   it("does not access runtime tool state while the extension factory is loading", () => {
     const getActiveTools = vi.fn(() => {
       throw new Error("Extension runtime not initialized");
