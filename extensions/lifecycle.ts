@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -836,22 +836,26 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return { estimatedRunUsd: 0, observedRunUsd: 0, estimatedDayUsd: 0, observedDayUsd: 0, paidFallbacks: 0, attemptsByStage: {} };
     }
     const events = readRoutingEvidenceEvents(runtime.paths.evidence).events;
+    const userRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyEvents = readRoutingEvidenceEvents(join(userRoot, "events.jsonl")).events
+      .filter((event) => event.recordedAt.startsWith(today));
     const snapshot: RoutingBudgetSnapshot = {
       estimatedRunUsd: 0,
       observedRunUsd: 0,
-      estimatedDayUsd: 0,
-      observedDayUsd: 0,
+      estimatedDayUsd: dailyEvents.reduce((sum, event) =>
+        sum + (event.outcome.type === "stage-started" && typeof event.cost.estimatedUsd === "number" ? event.cost.estimatedUsd : 0), 0),
+      observedDayUsd: dailyEvents.reduce((sum, event) =>
+        sum + (event.outcome.type === "stage-ended" && typeof event.cost.observedUsd === "number" ? event.cost.observedUsd : 0), 0),
       paidFallbacks: runtime.state.modelSelections.reduce((sum, selection) => sum + (selection.routing?.fallbackCount ?? 0), 0),
       attemptsByStage: {},
     };
     for (const event of events) {
       if (event.outcome.type === "stage-started" && typeof event.cost.estimatedUsd === "number") {
         snapshot.estimatedRunUsd += event.cost.estimatedUsd;
-        snapshot.estimatedDayUsd += event.cost.estimatedUsd;
       }
       if (typeof event.cost.observedUsd === "number") {
         snapshot.observedRunUsd += event.cost.observedUsd;
-        snapshot.observedDayUsd += event.cost.observedUsd;
       }
     }
     for (const selection of runtime.state.modelSelections) {
