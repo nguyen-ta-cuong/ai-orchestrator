@@ -194,8 +194,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (event.toolName === "bash") {
       const command = typeof event.input.command === "string" ? event.input.command : "";
       if (state.phase === "building") {
-        const metadataRoot = resolve(activeRuntime.paths.root, "../..");
-        if (isBlockedBuildCommand(command, activeRuntime.config.lifecycle.artifactsDir, metadataRoot)) {
+        const artifactsRoot = resolve(activeRuntime.paths.root, "..");
+        if (isBlockedBuildCommand(command, activeRuntime.config.lifecycle.artifactsDir, artifactsRoot)) {
           return { block: true, reason: "BUILD may edit source but cannot modify orchestrator metadata, perform destructive Git operations, or stage, commit, tag, push, open a PR, or publish." };
         }
         return;
@@ -215,7 +215,6 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
       const protectedRoots = [
         resolve(activeRuntime.paths.root, ".."),
-        resolve(activeRuntime.paths.root, "../.."),
         resolve(activeRuntime.cwd, ".ai-orchestrator"),
       ];
       if (!protectedRoots.some((root) => requestedPath === root || requestedPath.startsWith(`${root}/`))) return;
@@ -1339,10 +1338,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     appendJournal(runtime.paths, `${stage.toUpperCase()} downstream outcome reversed: ${truncate(reason, 120)}`);
   }
 
-  function isBlockedBuildCommand(command: string, artifactsDir: string, metadataRoot: string): boolean {
+  function isBlockedBuildCommand(command: string, artifactsDir: string, artifactsRoot: string): boolean {
     const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
     return PUBLICATION_COMMAND.test(normalized) || DESTRUCTIVE_GIT_COMMAND.test(normalized) ||
-      normalized.includes(artifactsDir) || normalized.includes(metadataRoot) || normalized.includes(".ai-orchestrator") ||
+      normalized.includes(artifactsDir) || normalized.includes(artifactsRoot) || normalized.includes(".ai-orchestrator") ||
       /\brm\b[\s\S]*?(?:\s\.\/?(?:\s|$)|\s\*|\/\*)/i.test(normalized) ||
       /\bfind\b[\s\S]*?\s-delete\b/i.test(normalized);
   }
