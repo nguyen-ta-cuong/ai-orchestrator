@@ -19,7 +19,7 @@ const WIDGET_KEY = "ai-orchestrator";
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
 const JUDGE_TOOLS = [...READ_ONLY_TOOLS, "judge_verdict"];
 const MUTATION_TOOLS = new Set(["edit", "write"]);
-const PUBLICATION_COMMAND = /(?:^|[\s;&|])(?:git\s+(?:add|commit|push|tag)|gh\s+pr\s+create|(?:npm|pnpm|yarn)\s+publish)(?:\s|$)/i;
+const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
 
 interface JudgeVerdictParams {
   verdict: Verdict;
@@ -222,7 +222,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
     if (state.phase === "coding" && event.toolName === "bash") {
       const command = (event.input as { command?: unknown }).command;
-      if (typeof command !== "string" || PUBLICATION_COMMAND.test(command)) {
+      if (typeof command !== "string" || isPublicationCommand(command)) {
         return { block: true, reason: "ai-orchestrator coding cannot stage, commit, tag, push, open a PR, or publish; those actions require orchestrator-owned gates." };
       }
     }
@@ -934,6 +934,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       { triggerTurn: false },
     );
   }
+}
+
+function isPublicationCommand(command: string): boolean {
+  // Normalize quoting and shell escapes so equivalent forms such as
+  // `git -C . push`, `g\\it push`, and `bash -lc 'git push'` remain gated.
+  const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
+  return PUBLICATION_COMMAND.test(normalized);
 }
 
 function createRuntimeState(overrides: Partial<RuntimeState> = {}): RuntimeState {
