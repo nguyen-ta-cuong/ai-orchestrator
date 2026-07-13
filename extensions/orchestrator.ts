@@ -1,15 +1,17 @@
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, loadConfigWithProvenance, loopConfigFrom, type ConfigProvenance, type OrchestratorConfig, type RoleConfig } from "../src/core/config.js";
 import { createPiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
 import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
-import type { ModelSelectionIdentity, RoutingStage } from "../src/core/modelRouting.js";
+import type { ModelSelectionIdentity, RoutingStage, TaskFeatures } from "../src/core/modelRouting.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
 import { currentRun, readState } from "../src/lifecycle/artifacts.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
+import { appendUserRoutingEvidenceEvent, readRoutingEvidenceEvents, resolveUserEvidenceRoot } from "../src/lifecycle/routingEvidenceStore.js";
 
 const STATE_TYPE = "ai-orchestrator";
 const STATUS_KEY = "ai-orchestrator";
@@ -47,7 +49,17 @@ interface RuntimeState extends OrchestratorState {
     fallbackCount: number;
     estimatedCostUsd?: number;
     failureCategories?: string[];
+    decisionId: string;
+    profileVersion: string;
+    task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
   }>;
+  lastUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    observedUsd: number;
+  };
 }
 
 interface RuntimeConfig {
@@ -216,6 +228,17 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("message_end", async (event) => {
+    if (!runtime || !event.message || event.message.role !== "assistant" || !event.message.usage) return;
+    state.lastUsage = {
+      inputTokens: event.message.usage.input,
+      outputTokens: event.message.usage.output,
+      cacheReadTokens: event.message.usage.cacheRead,
+      cacheWriteTokens: event.message.usage.cacheWrite,
+      observedUsd: event.message.usage.cost.total,
+    };
+  });
+
   pi.on("agent_end", async (event) => {
     if (isActiveRunPhase(state.phase)) {
       pendingSettlement = { runId: state.runId, messages: event.messages };
@@ -241,16 +264,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       }
 
       if (state.phase === "planning" || state.phase === "replanning") {
+        persistFastStageOutcome("plan", "unknown", "unknown");
         await handlePlanProduced(ctx, extractLastAssistantText(messages));
         return;
       }
 
       if (state.phase === "coding") {
+        persistFastStageOutcome("build", "unknown", "unknown");
         await handleCodeProduced(ctx);
         return;
       }
 
       if (state.phase === "judging") {
+        persistFastStageOutcome("fast-judge", state.pendingVerdict?.verdict ?? "unknown", Boolean(state.pendingVerdict));
         await handleJudgingEnded(ctx);
       }
     } catch (error) {
@@ -647,24 +673,31 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       }
       if (state.runId !== runId || state.phase !== phase) return false;
       pi.setThinkingLevel(candidate.thinking);
-      state = {
-        ...state,
-        modelSelections: [...(state.modelSelections ?? []), {
-          stage,
-          provider: candidate.provider,
-          model: candidate.model,
-          ...(candidate.family ? { family: candidate.family } : {}),
-          thinking: candidate.thinking,
-          reason: candidate.reason,
-          engine: plan.engine,
-          policyVersion: plan.policyVersion,
-          taskFeaturesHash: plan.taskFeaturesHash,
-          fallbackCount: failed.length,
-          ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
-          failureCategories: [],
-        }],
+      const selection: NonNullable<RuntimeState["modelSelections"]>[number] = {
+        stage,
+        provider: candidate.provider,
+        model: candidate.model,
+        ...(candidate.family ? { family: candidate.family } : {}),
+        thinking: candidate.thinking,
+        reason: candidate.reason,
+        engine: plan.engine,
+        policyVersion: plan.policyVersion,
+        taskFeaturesHash: plan.taskFeaturesHash,
+        fallbackCount: failed.length,
+        ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
+        failureCategories: [],
+        decisionId: `${state.runId ?? "unknown"}:${stage}:${(state.modelSelections?.length ?? 0) + 1}`,
+        profileVersion: candidate.profileVersion ?? "legacy-role",
+        task: {
+          workKind: plan.taskFeatures.workKind,
+          risk: plan.taskFeatures.risk,
+          languages: [...plan.taskFeatures.languages],
+          fileCount: plan.taskFeatures.fileCount,
+        },
       };
+      state = { ...state, modelSelections: [...(state.modelSelections ?? []), selection] };
       persist();
+      persistFastStageStarted(selection);
       return true;
     }
     const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
@@ -701,12 +734,70 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     return true;
   }
 
+  function persistFastStageStarted(selection: NonNullable<RuntimeState["modelSelections"]>[number]): void {
+    if (!runtime?.config.routing.evidence.enabled || !state.runId) return;
+    appendUserRoutingEvidenceEvent(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), {
+      version: 1,
+      eventId: `${selection.decisionId}:stage-started`,
+      runId: state.runId,
+      decisionId: selection.decisionId,
+      stage: selection.stage,
+      recordedAt: new Date().toISOString(),
+      policyVersion: selection.policyVersion,
+      profileVersion: selection.profileVersion,
+      task: selection.task,
+      selected: { provider: selection.provider, model: selection.model, ...(selection.family ? { family: selection.family } : {}) },
+      usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+      cost: { estimatedUsd: selection.estimatedCostUsd ?? "unknown", observedUsd: "unknown" },
+      outcome: { type: "stage-started", structuredToolCompliance: "unknown", verdict: "unknown", buildIteration: state.coderIterations },
+    });
+  }
+
+  function persistFastStageOutcome(
+    stage: "plan" | "build" | "fast-judge",
+    verdict: "approve" | "reject" | "unknown",
+    structuredToolCompliance: boolean | "unknown",
+  ): void {
+    if (!runtime?.config.routing.evidence.enabled || !state.runId) return;
+    const selection = [...(state.modelSelections ?? [])].reverse().find((item) => item.stage === stage);
+    if (!selection) return;
+    const usage = state.lastUsage;
+    appendUserRoutingEvidenceEvent(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), {
+      version: 1,
+      eventId: `${selection.decisionId}:stage-ended`,
+      runId: state.runId,
+      decisionId: selection.decisionId,
+      stage,
+      recordedAt: new Date().toISOString(),
+      policyVersion: selection.policyVersion,
+      profileVersion: selection.profileVersion,
+      task: selection.task,
+      selected: { provider: selection.provider, model: selection.model, ...(selection.family ? { family: selection.family } : {}) },
+      usage: {
+        inputTokens: usage?.inputTokens ?? "unknown",
+        outputTokens: usage?.outputTokens ?? "unknown",
+        cacheReadTokens: usage?.cacheReadTokens ?? "unknown",
+        cacheWriteTokens: usage?.cacheWriteTokens ?? "unknown",
+      },
+      cost: { estimatedUsd: selection.estimatedCostUsd ?? "unknown", observedUsd: usage?.observedUsd ?? "unknown" },
+      outcome: { type: "stage-ended", structuredToolCompliance, verdict, buildIteration: state.coderIterations },
+    });
+    state.lastUsage = undefined;
+  }
+
   function fastBudgetSnapshot(current: RuntimeState): RoutingBudgetSnapshot {
+    const events = runtime?.config.routing.evidence.enabled
+      ? readRoutingEvidenceEvents(join(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), "events.jsonl")).events
+      : [];
+    const runEvents = events.filter((event) => event.runId === current.runId);
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyEvents = events.filter((event) => event.recordedAt.startsWith(today));
+    const estimatedSelections = (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0);
     return {
-      estimatedRunUsd: (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0),
-      observedRunUsd: 0,
-      estimatedDayUsd: (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0),
-      observedDayUsd: 0,
+      estimatedRunUsd: runEvents.length > 0 ? evidenceCost(runEvents, "stage-started", "estimatedUsd") : estimatedSelections,
+      observedRunUsd: evidenceCost(runEvents, "stage-ended", "observedUsd"),
+      estimatedDayUsd: evidenceCost(dailyEvents, "stage-started", "estimatedUsd"),
+      observedDayUsd: evidenceCost(dailyEvents, "stage-ended", "observedUsd"),
       paidFallbacks: (current.modelSelections ?? []).reduce((sum, selection) => sum + selection.fallbackCount, 0),
       attemptsByStage: Object.fromEntries(
         (current.modelSelections ?? []).map((selection) => [
@@ -715,6 +806,14 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         ]),
       ) as Partial<Record<RoutingStage, number>>,
     };
+  }
+
+  function evidenceCost(
+    events: ReturnType<typeof readRoutingEvidenceEvents>["events"],
+    outcome: "stage-started" | "stage-ended",
+    field: "estimatedUsd" | "observedUsd",
+  ): number {
+    return events.reduce((sum, event) => sum + (event.outcome.type === outcome && typeof event.cost[field] === "number" ? event.cost[field] : 0), 0);
   }
 
   async function abortForModelError(ctx: ExtensionContext, reason: string): Promise<void> {
