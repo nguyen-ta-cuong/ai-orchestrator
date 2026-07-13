@@ -84,6 +84,9 @@ describe("fast Pi capability routing", () => {
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "edit", "bash"]);
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git -C . push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "bash -lc 'git push origin main'" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "g\\it push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
     await events.get("message_end")!({ message: { role: "assistant", usage: { input: 200, output: 40, cacheRead: 0, cacheWrite: 0, cost: { total: 0.04 } } } }, ctx as unknown as ExtensionContext);
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implemented" }] }, ctx as unknown as ExtensionContext);
