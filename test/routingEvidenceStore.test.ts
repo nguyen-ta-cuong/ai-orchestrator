@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRun } from "../src/lifecycle/artifacts.js";
 import {
+  appendRoutingBudgetLedgerEvent,
   appendRoutingEvidenceEvent,
+  readRoutingBudgetLedger,
   readRoutingEvidenceEvents,
   resolveUserEvidenceRoot,
 } from "../src/lifecycle/routingEvidenceStore.js";
@@ -45,6 +47,18 @@ describe("routing evidence store", () => {
     expect(result.events).toHaveLength(1);
     expect(result.warnings).toHaveLength(2);
     expect(existsSync(`${run.paths.evidence}.quarantine`)).toBe(true);
+  });
+
+  it("keeps the independent budget ledger strict and idempotent", () => {
+    const home = makeTempDir();
+    const root = resolveUserEvidenceRoot(home, "routing-evidence");
+    const event = { version: 1 as const, eventId: "budget-1", runId: "run-1", recordedAt: new Date().toISOString(), outcome: "stage-started" as const, estimatedUsd: 0.1 };
+    appendRoutingBudgetLedgerEvent(root, event);
+    appendRoutingBudgetLedgerEvent(root, event);
+    expect(readRoutingBudgetLedger(join(root, "budget.jsonl"))).toEqual([event]);
+
+    writeFileSync(join(root, "budget.jsonl"), `${JSON.stringify({ ...event, rawPrompt: "SECRET" })}\n`);
+    expect(() => readRoutingBudgetLedger(join(root, "budget.jsonl"))).toThrow(/corrupt/);
   });
 
   it("keeps user evidence storage inside the trusted user root", () => {
