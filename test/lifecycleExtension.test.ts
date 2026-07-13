@@ -269,6 +269,34 @@ describe("lifecycle Pi extension safety", () => {
     expect(getActiveTools).not.toHaveBeenCalled();
   });
 
+  it("persists provider errors and resumes with the next eligible candidate", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability", unknownCost: "allow",
+        profiles: {
+          "invented/first": { confidence: 9000, version: "test", scores: { coding: 9500 } },
+          "invented/second": { confidence: 9000, version: "test", scores: { coding: 8500 } },
+        },
+      },
+    }));
+    const models = ["first", "second"].map((id) => ({
+      provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
+    }));
+    const first = extensionHarness(run.cwd, models);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    await first.events.get("agent_end")!({ messages: [{ role: "assistant", stopReason: "error" }] }, first.ctx as unknown as ExtensionContext);
+    await first.events.get("agent_settled")!({}, first.ctx as unknown as ExtensionContext);
+
+    const resumed = extensionHarness(run.cwd, models);
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+
+    expect(readState(run.paths)?.modelSelections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: "first", routing: expect.objectContaining({ failureCategories: expect.arrayContaining(["provider-error"]) }) }),
+      expect.objectContaining({ model: "second" }),
+    ]));
+  });
+
   it("records a typed fallback when the highest-ranked model cannot be activated", async () => {
     const run = makeRun("building");
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
