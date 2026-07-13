@@ -223,6 +223,7 @@ Pi uses its own model registry and credentials and ignores `mcp.*`. MCP loads pr
         "input": ["text"],
         "contextWindow": 128000,
         "maxOutputTokens": 8192,
+        "privacy": "private",
         "cost": {
           "input": 3,
           "output": 15,
@@ -235,6 +236,11 @@ Pi uses its own model registry and credentials and ignores `mcp.*`. MCP loads pr
   },
   "routing": {
     "engine": "capability-shadow",
+    "privacy": {
+      "allowed": ["local", "private"],
+      "allowUnknown": false,
+      "providers": { "acme": "private" }
+    },
     "profiles": {
       "team/planner-v1": {
         "family": "acme-reasoning",
@@ -265,6 +271,7 @@ Catalog fields are:
 | `input` | Supported `text`/`image` inputs |
 | `contextWindow`, `maxOutputTokens` | Positive token limits used as hard eligibility checks |
 | `cost` | Optional input/output/cache prices in USD per million tokens; all four values are required when present. Current MCP ranking estimates from input/output; cache prices are validated but not used by its stateless estimate |
+| `privacy` | Optional `local`, `private`, `public`, or `unknown` classification; catalog classification takes precedence over the trusted provider classification |
 | `profile` | Optional key in `routing.profiles`; defaults to the entry's `provider/model` identity |
 
 Profile confidence and capability scores are integer basis points from `0` to `10000`. Missing profiles are excluded unless inferred profiles are enabled and stage floors permit them. For MCP, a referenced trusted profile is treated as user provenance. A catalog declaration is a trust assertion: verify capability, limits, family, and pricing against the provider before enabling active routing.
@@ -279,7 +286,9 @@ The fresh default is `routing.engine: "capability-shadow"`.
 | `capability-shadow` | Exact configured legacy roles/routes | Capability candidates are ranked observationally |
 | `capability` | Capability ranking is active | Shows the same candidate policy used by active calls |
 
-For MCP, active capability routing requires a non-empty trusted `mcp.models` catalog and fails closed when none is configured. `legacy` and `capability-shadow` continue to use exact planner/judge roles and report `legacyFallback: true`; preview can still explain the exact fallback when no catalog exists. In active MCP capability mode, identity pins are `routing.stages.plan.pins` and `routing.stages.fast-judge.pins`; `roles.*` are legacy routes, not implicit catalog pins. Pi additionally interprets explicitly configured role identities through its local-registry pin policy.
+For MCP, active capability routing requires a non-empty trusted `mcp.models` catalog and fails closed when none is configured. `legacy` and `capability-shadow` continue to use exact planner/judge roles and report `legacyFallback: true`; preview can still explain the exact fallback when no catalog exists. In active MCP capability mode, identity pins are `routing.stages.plan.pins` and `routing.stages.fast-judge.pins`; `roles.*` are legacy routes, not implicit catalog pins. Pi additionally interprets explicitly configured role identities through its local-registry pin policy. Pin and preference selectors accept either exact `provider/model` identities or `family:<family-name>` selectors.
+
+Privacy is a hard eligibility gate before scoring. Configure trusted provider classifications under `routing.privacy.providers`, permitted classes under `routing.privacy.allowed`, and unknown handling with `routing.privacy.allowUnknown`. Project config may narrow the permitted classes or reject unknown classifications, but it cannot relabel trusted providers or broaden user policy.
 
 `orchestrator_models` accepts `stage: "plan" | "fast-judge"`, a task, optional validated task features, and optional `coderIdentity`. It invokes no model and returns no endpoint, header, credential, or key state. It returns:
 
@@ -323,7 +332,7 @@ Active capability calls try ranked eligible candidates in order within cumulativ
 
 Unknown price follows the explicit `routing.unknownCost` policy (`exclude`, `penalize`, or `allow`) rather than being silently assumed known. During MCP ranking, catalog costs and task token estimates affect score; the lowest of `routing.limits.maxEstimatedUsdPerRun`, `routing.budgets.maxEstimatedUsdPerStage`, and `routing.budgets.maxEstimatedUsdPerRun` is the per-request candidate ceiling. `budgets.allowUnknownCost: false` excludes unknown-price candidates. Active MCP fallback attempts are bounded by the strictest configured attempt, selection-failure, and paid-fallback cap.
 
-Pi workflows additionally enforce stateful `routing.budgets` before activation. Lifecycle evidence is retained in the run directory until the user removes it: `routing.jsonl` contains routing decisions/fallbacks and `evidence.jsonl` contains minimized task category, selected identity, usage/cost values or `unknown`, and outcome fields. Evidence excludes prompts, source, diffs, artifact text, credentials, headers, and repository remotes. Report-only analyzers do not rewrite policy.
+Pi workflows additionally enforce stateful `routing.budgets` before activation. A lifecycle run holds a recoverable process lease, freezes the complete routing/role policy version on first model entry, and pauses rather than silently rerouting if that policy changes. Provider/model execution errors are recorded as typed fallback evidence; resume skips the failed identity and tries the next eligible candidate within configured caps. Lifecycle evidence is retained in the run directory until the user removes it: `routing.jsonl` contains routing decisions/fallbacks and `evidence.jsonl` contains minimized task category, selected identity, usage/cost values or `unknown`, and outcome fields. Evidence excludes prompts, source, diffs, artifact text, credentials, headers, and repository remotes. Report-only analyzers do not rewrite policy.
 
 MCP is deliberately stateless across tool calls. It enforces per-request estimated-cost and fallback-attempt ceilings but cannot reconcile observed usage or enforce cumulative run/day budgets across independent requests. It does not write `routing.jsonl`/`evidence.jsonl`; its durable evidence boundary is the structured metadata returned to the client. Cursor should retain that metadata and manual identities in project-defined notes when audit history is required.
 
