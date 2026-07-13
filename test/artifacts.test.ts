@@ -334,6 +334,16 @@ describe("lifecycle artifacts", () => {
     expect(exclude).not.toContain("/.orch/current.lock/");
   });
 
+  it("keeps repository ownership visible after artifactsDir changes", () => {
+    const cwd = makeTempDir();
+    const first = createRun(cwd, ".one/runs", "first");
+
+    expect(currentRun(cwd, ".two/runs")?.paths.root).toBe(first.paths.root);
+    expect(() => createRun(cwd, ".two/runs", "second")).toThrow(/already active/);
+    expect(releaseRun(cwd, ".two/runs", first.runId)).toBe(true);
+    expect(currentRun(cwd, ".two/runs")).toBeUndefined();
+  });
+
   it("appends journal entries and releases the current run pointer", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, artifactsDir, "task");
