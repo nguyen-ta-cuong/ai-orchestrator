@@ -326,6 +326,7 @@ describe("lifecycle Pi extension safety", () => {
     }));
     const first = extensionHarness(run.cwd, models);
     await first.commands.get("lifecycle")!("resume", first.ctx);
+    await first.events.get("message_end")!({ message: { role: "assistant", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 0.03 } } } }, first.ctx as unknown as ExtensionContext);
     await first.events.get("agent_end")!({ messages: [{ role: "assistant", stopReason: "error" }] }, first.ctx as unknown as ExtensionContext);
     await first.events.get("agent_settled")!({}, first.ctx as unknown as ExtensionContext);
 
@@ -334,8 +335,11 @@ describe("lifecycle Pi extension safety", () => {
 
     expect(readState(run.paths)?.modelSelections).toEqual(expect.arrayContaining([
       expect.objectContaining({ model: "first", routing: expect.objectContaining({ failureCategories: expect.arrayContaining(["provider-error"]) }) }),
-      expect.objectContaining({ model: "second" }),
+      expect.objectContaining({ model: "second", routing: expect.objectContaining({ fallbackCount: 0 }) }),
     ]));
+    const ledger = readFileSync(join(run.cwd, "home", ".ai-orchestrator", "routing-evidence", "budget.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(ledger).toEqual(expect.arrayContaining([expect.objectContaining({ outcome: "stage-ended", observedUsd: 0.03 })]));
   });
 
   it("records a typed fallback when the highest-ranked model cannot be activated", async () => {
