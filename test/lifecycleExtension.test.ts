@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -176,13 +176,15 @@ describe("lifecycle Pi extension safety", () => {
       outcome: { type: "stage-ended", verdict: index < 7 ? "approve" : "reject", finalRunStatus: index < 7 ? "done" : "failed", buildIteration: 1 },
     }));
     writeFileSync(join(store, "events.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    const userConfigPath = join(cwd, "home", ".ai-orchestrator", "config.json");
+    writeFileSync(userConfigPath, "{}\n", { mode: 0o600 });
     const harness = extensionHarness(cwd);
 
     await harness.commands.get("lifecycle-routing-apply")!("1", harness.ctx);
-    const userConfigPath = join(cwd, "home", ".ai-orchestrator", "config.json");
     expect(JSON.parse(readFileSync(userConfigPath, "utf8"))).toMatchObject({
       routing: { stages: { build: { prefer: ["p/strong"] } }, version: expect.stringContaining("recommendation-") },
     });
+    expect(statSync(userConfigPath).mode & 0o777).toBe(0o600);
     const appliedNotice = vi.mocked(harness.ctx.ui.notify).mock.calls.map(([message]) => String(message)).find((message) => message.includes("Applied routing recommendation"));
     const id = /recommendation (\d+-[a-f0-9-]{8})/.exec(appliedNotice ?? "")?.[1];
     expect(id).toBeTruthy();
