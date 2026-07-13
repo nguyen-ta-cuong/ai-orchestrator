@@ -27,7 +27,8 @@
     "mcp",
     "src",
     "docs/setup.md",
-    "docs/user-guide.md"
+    "docs/user-guide.md",
+    "docs/images/ai-orchestrator-workflow.svg"
   ],
   "repository": {
     "type": "git",
