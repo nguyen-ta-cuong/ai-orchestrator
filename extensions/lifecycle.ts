@@ -1405,8 +1405,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       verdict: "unknown",
     });
     if (artifact === "plan") {
-      runtime.state.rejectionFingerprints = [];
-      runtime.state.buildEvidenceFingerprints = [];
+      const nextPlanFingerprint = convergenceFingerprint(readFileSync(path, "utf8"));
+      if (runtime.state.planFingerprint && runtime.state.planFingerprint !== nextPlanFingerprint) {
+        runtime.state.rejectionFingerprints = [];
+        runtime.state.buildEvidenceFingerprints = [];
+      }
+      runtime.state.planFingerprint = nextPlanFingerprint;
       writeState(runtime.paths, runtime.state);
     }
     await transition(
