@@ -186,6 +186,23 @@ describe("lifecycle Pi extension safety", () => {
     });
   });
 
+  it("keeps BUILD away from artifacts/publication and keeps PLAN bash read-only", async () => {
+    const buildRun = makeRun("building");
+    const buildHarness = extensionHarness(buildRun.cwd);
+    await buildHarness.commands.get("lifecycle")!("resume", buildHarness.ctx);
+
+    await expect(buildHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(buildHarness.events.get("tool_call")!({ toolName: "edit", input: { path: buildRun.paths.plan } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(buildHarness.events.get("tool_call")!({ toolName: "edit", input: { path: join(buildRun.cwd, "src.ts") } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
+
+    const planRun = makeRun("planning");
+    writeFileSync(join(planRun.cwd, "package.json"), JSON.stringify({ scripts: { test: "vitest run" } }));
+    const planHarness = extensionHarness(planRun.cwd);
+    await planHarness.commands.get("lifecycle")!("resume", planHarness.ctx);
+    await expect(planHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "npm test" } }, planHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(planHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git diff" } }, planHarness.ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
+  });
+
   it("does not expose agent_team during SHIP", async () => {
     const run = makeRun("shipping");
     const harness = extensionHarness(run.cwd);
