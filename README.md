@@ -9,6 +9,20 @@ AI Orchestrator separates planning, implementation, and checking instead of aski
 
 The working tree is never reverted automatically. SHIP never pushes. Built-in model names are defaults or preferences, not universal requirements.
 
+## Workflow and features at a glance
+
+[![AI Orchestrator workflow showing Pi and Cursor entry points, the fast Plan-Code-Judge loop, the durable lifecycle and its routing, recovery, evidence, and delivery features](docs/images/ai-orchestrator-workflow.svg)](docs/images/ai-orchestrator-workflow.svg)
+
+[Open the workflow canvas at full size](docs/images/ai-orchestrator-workflow.svg).
+
+How to read the canvas:
+
+1. **Choose where you work.** Pi can run the fast or durable workflow; Cursor can use MCP-routed planner/checker calls or manual model handoffs.
+2. **Keep the user at the gates.** Plans require approval by default, and routing metadata never grants permission to edit, commit, or publish.
+3. **Use the fast loop for focused changes.** PLAN → approval → BUILD → independent JUDGE; rejection returns actionable fixes, and repeated rejection re-plans within bounded attempts.
+4. **Use the lifecycle for durable work.** DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP persists state on disk. VERIFY or REVIEW rejection enters read-only DEBUG before BUILD applies a diagnosis.
+5. **Rely on the safety spine.** Capability routing, maker/checker separation, restart recovery, budgets/minimized evidence, and fresh Git confirmations apply around the workflow. SHIP evaluates readiness but never pushes.
+
 ## Documentation
 
 - [Setup guide](docs/setup.md): install Pi or Cursor, configure trusted MCP providers/models, and verify the installation.
