@@ -40,6 +40,19 @@ describe("Pi capability routing plan", () => {
     expect(verify.decision?.excluded).toContainEqual(expect.objectContaining({ code: "same-builder-model" }));
   });
 
+  it("keeps thinking clamp rationale in the selected candidate explanation", () => {
+    const config = capableConfig();
+    const plan = createPiRoutingPlan({
+      config,
+      provenance: builtin,
+      stage: "build",
+      role: "coder",
+      available: [{ ...available("invented", "coder"), thinkingLevelMap: { medium: null, low: "low", high: null } }],
+      evidence: "build a feature",
+    });
+    expect(plan.candidates[0]).toMatchObject({ thinking: "low", reason: expect.stringContaining("clamped to low") });
+  });
+
   it("turns an explicit role override into an exact pin", () => {
     const config = capableConfig();
     config.roles.coder = { provider: "invented", model: "checker", thinking: "high" };
