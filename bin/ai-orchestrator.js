@@ -53,9 +53,12 @@ reportCopy("Cursor skill", copyIfAbsentOrIdentical(join(root, "skills", "orchest
 if (noMcp) {
   process.stdout.write("Skipped MCP config because --no-mcp was supplied. Cursor will use the manual no-tool workflow from the installed skill.\n");
 } else {
-  const snippet = localMcpSnippet();
+  const portableNpx = isEphemeralNpxExecution();
+  const snippet = portableNpx ? portableMcpSnippet() : localMcpSnippet();
   const mcpPath = join(cursorDir, "mcp.json");
-  const portabilityNote = "Note: this local-package snippet uses machine-specific absolute paths. Do not commit it unchanged for teammates; use cursor/mcp.json as the portable pinned-npx example after publishing.\n";
+  const portabilityNote = portableNpx
+    ? "Installed the version-pinned portable npx MCP command so npm cache cleanup cannot invalidate an absolute package path.\n"
+    : "Note: this local-package snippet uses machine-specific absolute paths. Do not commit it unchanged for teammates; use cursor/mcp.json as the portable pinned-npx example after publishing.\n";
   if (existsSync(mcpPath)) {
     process.stdout.write(`\nMCP config already exists at ${mcpPath}; it was not modified. Merge this local-package snippet manually:\n\n${snippet}\n${portabilityNote}`);
   } else {
@@ -63,6 +66,14 @@ if (noMcp) {
     writeFileSync(mcpPath, `${snippet}\n`, { flag: "wx" });
     process.stdout.write(`Wrote MCP config: ${mcpPath}\n${portabilityNote}`);
   }
+}
+
+function isEphemeralNpxExecution() {
+  return process.env.npm_command === "exec" || root.split(/[\\/]+/).includes("_npx");
+}
+
+function portableMcpSnippet() {
+  return JSON.stringify(JSON.parse(readFileSync(join(root, "cursor", "mcp.json"), "utf8")), null, 2);
 }
 
 function localMcpSnippet() {
