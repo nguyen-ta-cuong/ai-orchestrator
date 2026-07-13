@@ -125,6 +125,17 @@ describe("lifecycle Pi extension safety", () => {
     expect(readFileSync(run.paths.routing, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
+  it("rejects missing prerequisite artifacts before changing model or tools", async () => {
+    const run = makeRun("planning");
+    writeFileSync(run.paths.spec, "");
+    const harness = extensionHarness(run.cwd);
+
+    await expect(harness.commands.get("lifecycle")!("resume", harness.ctx)).rejects.toThrow(/spec artifact is missing/);
+
+    expect(harness.pi.setModel).not.toHaveBeenCalled();
+    expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+  });
+
   it("pauses before model activation when a routing budget would be exceeded", async () => {
     const run = makeRun("building");
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
