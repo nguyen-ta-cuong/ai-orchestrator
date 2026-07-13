@@ -556,6 +556,7 @@ describe("loadConfig", () => {
     [{ mcp: { models: [{ provider: "openai", model: "x", reasoning: true, supportedThinking: [], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].supportedThinking must be non-empty"],
     [{ mcp: { models: [{ provider: "open/ai", model: "x", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].provider must not contain slashes or whitespace"],
     [{ mcp: { models: [{ provider: "openai", model: "bad model", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].model must use canonical non-whitespace model syntax"],
+    [{ mcp: { models: [{ provider: "missing", model: "x", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].provider must reference mcp.providers.missing"],
   ])("validates trusted MCP catalog %#", (patch, message) => {
     const home = makeTempDir();
     const project = makeTempDir();
