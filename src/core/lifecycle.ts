@@ -69,6 +69,7 @@ export interface LifecycleState {
   consecutiveRejections: number;
   verdicts: LifecycleStageVerdict[];
   modelSelections: LifecycleModelSelection[];
+  routingPolicyVersion?: string;
   baselinePaths?: string[];
   baselineStagedPaths?: string[];
   modelRestored?: boolean;
