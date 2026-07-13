@@ -178,7 +178,7 @@ describe("lifecycle Pi extension safety", () => {
     }));
     writeFileSync(join(store, "events.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
     const userConfigPath = join(cwd, "home", ".ai-orchestrator", "config.json");
-    writeFileSync(userConfigPath, "{}\n", { mode: 0o600 });
+    writeFileSync(userConfigPath, `${JSON.stringify({ mcp: { providers: { custom: { baseUrl: "https://provider.example/v1", api: "openai-responses", apiKey: "literal-secret" } } } })}\n`, { mode: 0o600 });
     const harness = extensionHarness(cwd);
 
     await harness.commands.get("lifecycle-routing-apply")!("1", harness.ctx);
@@ -186,6 +186,7 @@ describe("lifecycle Pi extension safety", () => {
       routing: { stages: { build: { prefer: ["p/strong"] } }, version: expect.stringContaining("recommendation-") },
     });
     expect(statSync(userConfigPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(userConfigPath, "utf8")).toContain("literal-secret");
     const appliedNotice = vi.mocked(harness.ctx.ui.notify).mock.calls.map(([message]) => String(message)).find((message) => message.includes("Applied routing recommendation"));
     const id = /recommendation (\d+-[a-f0-9-]{8})/.exec(appliedNotice ?? "")?.[1];
     expect(id).toBeTruthy();
