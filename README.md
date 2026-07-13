@@ -393,7 +393,7 @@ Change roles, legacy candidate lists, catalog entries, profiles, and policy to m
 
 ## Clean install, package contents, and validation
 
-The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, `src/`, and the user-facing setup/user guides under `docs/`. npm also includes package metadata and this README. Plans, internal design documents, and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
+The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, `src/`, and the user-facing setup guide, user guide, and workflow canvas under `docs/`. npm also includes package metadata and this README. Plans, internal design documents, and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
 
 The MCP binary uses the runtime dependencies `@modelcontextprotocol/sdk` and `zod`; it does not require optional Pi peer packages. Pi peers remain optional so a clean MCP/Cursor install does not need Pi.
 
