@@ -226,8 +226,8 @@ For Cursor, re-run the installer after an npm version update. Customized files a
 - Delete only the AI Orchestrator server entry and installed rule/skill under project `.cursor/`; preserve unrelated servers, rules, and skills.
 - Remove global installation from `~/.cursor/` with the same care.
 - After all Pi and Cursor installations are removed, delete `~/.ai-orchestrator/config.json` only if no other installation needs its provider credentials or routing policy.
-- Review and remove `~/.ai-orchestrator/routing-evidence/` when its budget, evidence, and recommendation history is no longer required.
-- Do not delete a project's `.ai-orchestrator/` metadata for an active lifecycle run unless you intend to abandon its durable state. Remove terminal run artifacts only after retaining any evidence your project requires.
+- Review and remove `~/.ai-orchestrator/<routing.evidence.userStoreDir>/` when its budget, evidence, recommendation records, and possible `events.jsonl.quarantine` history are no longer required. The default directory is `routing-evidence`; also check previously configured locations after a path change.
+- Do not delete `<git-worktree>/.ai-orchestrator/{active-run.json,current.lock}` or `<run-start-cwd>/<lifecycle.artifactsDir>/` for an active lifecycle run unless you intend to abandon its durable state. The artifact directory defaults to `.ai-orchestrator/runs`, but it is relative to the directory where the run started. Remove terminal run artifacts only after retaining any evidence your project requires.
 
 ## Next steps
 
