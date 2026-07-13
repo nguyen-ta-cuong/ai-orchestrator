@@ -31,6 +31,10 @@ describe("routing evidence", () => {
       ...baseEvent,
       prompt: "do not store me",
     })).toMatchObject({ ok: false, error: expect.stringContaining("disallowed field") });
+    expect(validateRoutingEvidenceEvent({ ...baseEvent, rawPrompt: "SECRET" }))
+      .toMatchObject({ ok: false, error: expect.stringContaining("unexpected field rawPrompt") });
+    expect(validateRoutingEvidenceEvent({ ...baseEvent, task: { ...baseEvent.task, sourceText: "SECRET" } }))
+      .toMatchObject({ ok: false, error: expect.stringContaining("task.sourceText") });
   });
 
   it("aggregates observed cost without converting unknown values to zero", () => {
