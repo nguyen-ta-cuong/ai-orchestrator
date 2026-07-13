@@ -87,6 +87,28 @@ describe("Pi capability routing plan", () => {
     expect(plan.candidates[0]).toMatchObject({ provider: "private", model: "trusted-coder" });
   });
 
+  it("retains known cost and fails closed on strict legacy family separation", () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.routing.engine = "capability-shadow";
+    config.roles.coder = { provider: "p", model: "maker", thinking: "high" };
+    config.roles.judge = { provider: "p", model: "checker", thinking: "high" };
+    config.routing.profiles = {
+      "p/maker": { family: "same", confidence: 9000, scores: {} },
+      "p/checker": { family: "same", confidence: 9000, scores: {} },
+    };
+    config.routing.separation.requireDifferentProviderFamilyFor = ["fast-judge"];
+    const models = ["maker", "checker"].map((id) => ({
+      ...available("p", id), cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+    }));
+    const build = createPiRoutingPlan({ config, provenance: builtin, stage: "build", role: "coder", available: models, evidence: "task" });
+    expect(build.candidates[0]?.estimatedCostUsd).toBeGreaterThan(0);
+    const judge = createPiRoutingPlan({
+      config, provenance: builtin, stage: "fast-judge", role: "judge", available: models, evidence: "task",
+      priorSelections: [{ stage: "build", provider: "p", model: "maker", family: "same" }],
+    });
+    expect(judge.candidates).toEqual([]);
+  });
+
   it("keeps legacy and shadow engines on exact legacy selection without allowing self-review", () => {
     for (const engine of ["legacy", "capability-shadow"] as const) {
       const config = structuredClone(DEFAULT_CONFIG);
