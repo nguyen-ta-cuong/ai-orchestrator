@@ -261,10 +261,14 @@ function gitExcludePatterns(cwd: string, worktreeRoot: string, artifactsDir: str
   const realWorktreeRoot = realpathSync(worktreeRoot);
   const artifactRoot = join(realCwd, ...normalized.split("/"));
   const relativeArtifactRoot = relative(realWorktreeRoot, artifactRoot);
+  const coordinatorRoot = relative(realWorktreeRoot, join(realCwd, ".ai-orchestrator"));
+  const coordinatorPatterns = coordinatorRoot.length > 0 && !coordinatorRoot.startsWith("..") && !isAbsolute(coordinatorRoot)
+    ? ["active-run.json", "current.lock"].map((name) => `/${gitIgnorePath([...coordinatorRoot.split(/[\\/]+/), name])}`)
+    : [];
   if (relativeArtifactRoot.length === 0 || relativeArtifactRoot.startsWith("..") || isAbsolute(relativeArtifactRoot)) {
-    return [`/${gitIgnorePath(normalized.split("/"))}/`];
+    return [`/${gitIgnorePath(normalized.split("/"))}/`, ...coordinatorPatterns];
   }
-  return [`/${gitIgnorePath(relativeArtifactRoot.split(/[\\/]+/))}/`];
+  return [`/${gitIgnorePath(relativeArtifactRoot.split(/[\\/]+/))}/`, ...coordinatorPatterns];
 }
 
 function gitIgnorePath(segments: string[]): string {
