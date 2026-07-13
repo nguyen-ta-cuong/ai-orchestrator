@@ -5,27 +5,28 @@ alwaysApply: false
 
 # AI Orchestrator Cursor Workflow
 
-For any non-trivial implementation task, follow this loop.
+For non-trivial implementation work, keep planning, implementation, and checking separate. Cursor rules and MCP tools cannot switch Cursor's selected host model.
 
 ## With orchestrator MCP tools
 
-Use this path when `orchestrator_plan` and `orchestrator_judge` are available.
+Use this path when `orchestrator_plan`, `orchestrator_models`, and `orchestrator_judge` are available.
 
-1. Tell the user to select the coder model in Cursor's model picker before implementation (for example, GPT-5.5 with high reasoning). Cursor rules cannot switch models automatically.
-2. Call `orchestrator_plan` with the task and any repository context you have gathered.
-3. Show the returned plan to the user and wait for explicit approval before editing files.
-4. Initialize `judgeReports` as an empty list. Implement the approved plan as the coder. For the first judge call use `iteration: 1` and `consecutiveRejections: 0`.
-5. Run the project's relevant tests. Gather `git diff` and `git diff --staged` output yourself; the MCP server deliberately does not read the filesystem.
-6. Call `orchestrator_judge` with `{ task, plan, diff, testOutput, iteration, consecutiveRejections }`.
-7. Parse the judge result. If the tool reports an error, stop and show the error to the user instead of improvising loop state. Otherwise, append `{ verdict, reasons, requiredFixes }` to `judgeReports`; store `nextIteration` and `nextConsecutiveRejections` from the result; use those exact values on the next judge call after following `nextAction`. Do not apply your own increment/reset policy.
-8. Obey the returned `nextAction` exactly:
-   - `done`: summarize the approved result.
-   - `retry_coding`: address every `requiredFixes` item, run tests, gather the new diff, call `orchestrator_judge` again using the stored `nextIteration` and `nextConsecutiveRejections`.
-   - `replan`: call `orchestrator_plan` again with `previousPlan`, `judgeReports` containing the full accumulated list, and `diffSummary` from the last judged diff; reset `judgeReports` to an empty list only after the revised plan is approved; show the revised plan, wait for user approval, implement it, run tests, gather the new diff, call `orchestrator_judge` again using the stored `nextIteration` and `nextConsecutiveRejections`.
-   - `stop_failed`: stop, report the final judge reasons and required fixes, and leave the working tree as-is for the user.
+1. Call `orchestrator_models` with `stage: "plan"` and the task. Inspect the ranked trusted **server-side** planner candidates. This preview invokes no model and does not imply that those identities exist in Cursor's picker.
+2. Call `orchestrator_plan` with the task, repository context, and structured task features when known. Record its returned routing metadata in run notes or repository-defined run artifacts.
+3. Show the plan to the user and wait for explicit approval before editing.
+4. Select a configured coding-capable model in Cursor, and record its exact host `provider/model` identity as `coderIdentity`. The MCP server does not select or switch this coder.
+5. Implement the approved plan, run relevant tests, and gather `git diff` plus `git diff --staged`. For the first judge call use `iteration: 1` and `consecutiveRejections: 0`.
+6. Call `orchestrator_models` with `stage: "fast-judge"` and `coderIdentity`. Confirm that the trusted server-side catalog has an eligible checker independent of the declared coder.
+7. Call `orchestrator_judge` with `{ task, plan, diff, testOutput, iteration, consecutiveRejections, coderIdentity }`. Record the actual checker identity and fallback history from its routing metadata. If strict separation fails, stop rather than self-approving.
+8. Append `{ verdict, reasons, requiredFixes }` to `judgeReports`. Use `nextIteration` and `nextConsecutiveRejections` exactly as returned; do not invent counter changes.
+9. Obey `nextAction`:
+   - `done`: summarize the independently approved result and recorded model identities.
+   - `retry_coding`: address all required fixes with the Cursor coder, rerun tests, refresh the diff, and call the server-side independent judge with the returned counters.
+   - `replan`: call `orchestrator_plan` with `previousPlan`, full `judgeReports`, and the last `diffSummary`; obtain approval for the revision before implementation.
+   - `stop_failed`: stop, report remaining fixes, and leave the working tree unchanged for the user.
 
-Loop policy values come from the MCP server configuration and are reflected in `nextAction`, `nextIteration`, and `nextConsecutiveRejections`. Never skip the approval gate unless the user explicitly asks for yolo/no-approval behavior.
+The MCP server owns loop counters and routes only its planner/judge calls within the trusted user MCP catalog. Routing metadata is evidence, not permission to skip approval or publication gates.
 
 ## Without orchestrator MCP tools
 
-If the tools are unavailable, follow `.cursor/skills/orchestrate/SKILL.md` section "Without orchestrator tools". In short: write a plan, stop for approval, implement, run tests, self-review the diff against the plan, and apply the same 3-iteration / 2-rejection default loop unless project config says otherwise.
+Follow `.cursor/skills/orchestrate/SKILL.md` section **Without orchestrator tools**. Produce and approve a plan, record each manually selected Cursor model identity, implement with a coding-capable maker, manually switch to an independent checker for diff review, and use the configured loop caps. If an independent checker is unavailable under strict policy, fail closed. A named model may be a configured preference or example, never a universal requirement.

@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -215,7 +215,7 @@ describe("MCP server", () => {
     await withServer(async (client) => {
       const result = (await client.request("tools/list")) as { tools: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown>; required?: string[] }; outputSchema?: { properties?: Record<string, unknown>; required?: string[] } }> };
       const names = result.tools.map((tool) => tool.name).sort();
-      expect(names).toEqual(["orchestrator_judge", "orchestrator_plan"]);
+      expect(names).toEqual(["orchestrator_judge", "orchestrator_models", "orchestrator_plan"]);
 
       const plan = result.tools.find((tool) => tool.name === "orchestrator_plan");
       expect(plan?.inputSchema?.properties).toHaveProperty("task");
@@ -244,8 +244,15 @@ describe("MCP server", () => {
         arguments: { task: "add a flag" },
       });
       expect(toolText(result)).toContain("Inspect the relevant files");
+      expect(toolStructuredContent(result)).toMatchObject({
+        routing: { selectedIdentity: { provider: "anthropic", model: "claude-fable-5" } },
+      });
     }, {}, (cwd) => {
       writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({
+        roles: {
+          planner: { provider: "anthropic", model: "repository-selected-expensive", thinking: "max" },
+          judge: { provider: "anthropic", model: "repository-selected-self-judge", thinking: "max" },
+        },
         mcp: {
           providers: {
             anthropic: {
@@ -262,7 +269,7 @@ describe("MCP server", () => {
   it("starts through the packaged MCP bin", async () => {
     await withServerCommand([resolve("bin/ai-orchestrator-mcp.js")], async (client) => {
       const result = (await client.request("tools/list")) as { tools: Array<{ name: string }> };
-      expect(result.tools.map((tool) => tool.name).sort()).toEqual(["orchestrator_judge", "orchestrator_plan"]);
+      expect(result.tools.map((tool) => tool.name).sort()).toEqual(["orchestrator_judge", "orchestrator_models", "orchestrator_plan"]);
     });
   });
 
@@ -286,6 +293,58 @@ describe("MCP server", () => {
       });
       expect(toolText(replan)).toContain("Inspect the relevant files");
       expect(toolText(replan, 1)).toContain("Present this plan to the user for approval");
+    });
+  });
+
+  it("previews trusted routed models without a completion and returns routed planner metadata", async () => {
+    const setupCatalog = (_cwd: string, home: string): void => {
+      const configDir = join(home, ".ai-orchestrator");
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, "config.json"), JSON.stringify({
+        mcp: {
+          providers: { routed: { baseUrl: "https://routed.example/v1", api: "openai-responses", apiKey: "literal-test-key" } },
+          models: [{ provider: "routed", model: "planner", reasoning: true, supportedThinking: ["off", "high"], input: ["text"], contextWindow: 64000, maxOutputTokens: 8000 }],
+        },
+        routing: {
+          engine: "capability",
+          circuitBreakers: { requireIndependentChecker: false },
+          profiles: { "routed/planner": { confidence: 9000, provenance: "user", scores: { architecture: 9000, structuredOutput: 9000 } } },
+        },
+      }));
+    };
+    // Fake mode is explicitly disabled: success proves preview performs no provider call.
+    await withServerCommand([resolve("dist/mcp/server.js")], async (client) => {
+      const preview = await client.request("tools/call", { name: "orchestrator_models", arguments: { stage: "plan", task: "add a flag" } });
+      const previewJson = JSON.parse(toolText(preview)) as { eligible: Array<{ identity: string }>; policyVersion: string };
+      expect(previewJson.eligible[0]?.identity).toBe("routed/planner");
+      expect(toolText(preview)).not.toContain("literal-test-key");
+      expect(toolText(preview)).not.toContain("routed.example");
+    }, { AI_ORCH_FAKE_LLM: "0" }, setupCatalog);
+
+    await withServerCommand([resolve("dist/mcp/server.js")], async (client) => {
+      const planned = await client.request("tools/call", { name: "orchestrator_plan", arguments: { task: "add a flag" } });
+      expect(toolStructuredContent(planned)).toMatchObject({
+        plan: expect.stringContaining("Inspect"),
+        routing: { selectedIdentity: { provider: "routed", model: "planner" }, policyVersion: expect.any(String), fallbackHistory: [] },
+      });
+    }, {}, setupCatalog);
+  });
+
+  it("fails strict routed judge separation closed when coder identity is omitted", async () => {
+    await withServerCommand([resolve("dist/mcp/server.js")], async (client) => {
+      const result = await client.request("tools/call", {
+        name: "orchestrator_judge",
+        arguments: { task: "x", plan: "plan", diff: "diff", iteration: 1, consecutiveRejections: 0 },
+      }) as { isError?: boolean; content: Array<{ text: string }> };
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toMatch(/requires coderIdentity/);
+    }, {}, (_cwd, home) => {
+      const configDir = join(home, ".ai-orchestrator");
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, "config.json"), JSON.stringify({
+        mcp: { models: [{ provider: "openai", model: "checker", reasoning: true, supportedThinking: ["high"], input: ["text"], contextWindow: 64000, maxOutputTokens: 8000 }] },
+        routing: { engine: "capability", profiles: { "openai/checker": { confidence: 9000, provenance: "user", scores: { verification: 9000, review: 9000, structuredOutput: 9000 } } } },
+      }));
     });
   });
 

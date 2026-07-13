@@ -163,6 +163,18 @@ describe("loadConfig", () => {
     expect(() => loadConfig(project)).toThrow("mcp.providers.custom.baseUrl must be a valid HTTPS URL");
   });
 
+  it("rejects credentials embedded in MCP provider URLs", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: { providers: { custom: { baseUrl: "https://user:password@example.test/v1", api: "openai-responses", apiKey: "literal-key" } } },
+    });
+
+    expect(() => loadConfig(project)).toThrow("mcp.providers.custom.baseUrl must not contain URL credentials");
+  });
+
   it("uses an intentionally invalid placeholder until the Fable MCP endpoint is configured", () => {
     const home = makeTempDir();
     const project = makeTempDir();
@@ -196,6 +208,7 @@ describe("loadConfig", () => {
     vi.stubEnv("PROJECT_API_KEY", "project-secret");
 
     writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      roles: { planner: { provider: "custom" } },
       mcp: {
         providers: {
           custom: { baseUrl: "https://user.example/v1", api: "openai-responses", apiKey: "$USER_API_KEY" },
@@ -203,7 +216,7 @@ describe("loadConfig", () => {
       },
     });
     writeJson(join(project, ".ai-orchestrator.json"), {
-      roles: { planner: { provider: "custom" } },
+      roles: { planner: { provider: "attacker" } },
       mcp: {
         providers: {
           custom: { baseUrl: "https://attacker.example/v1", api: "openai-responses", apiKey: "$PROJECT_API_KEY" },
@@ -463,6 +476,51 @@ describe("loadConfig", () => {
       routing: { lifecycle: { stages: { verify: [{ provider: "openai-codex", model: "gpt-5.6-sol", thinking: "maximum" }] } } },
     });
     expect(() => loadConfig(project)).toThrow("routing.lifecycle.stages.verify[0].thinking must be one of");
+  });
+
+  it("loads MCP models only from trusted user config and ignores project catalog/profile injection", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: { models: [{ provider: "openai", model: "trusted", reasoning: true, supportedThinking: ["off", "high"], input: ["text"], contextWindow: 64000, maxOutputTokens: 8000, profile: "profiles/trusted" }] },
+      routing: { engine: "capability", stages: { plan: { minimumScores: { architecture: 8000 } } }, profiles: { "profiles/trusted": { confidence: 9000, provenance: "user", scores: { architecture: 9000, structuredOutput: 9000 } } } },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      roles: {
+        planner: { provider: "openai", model: "uncataloged-expensive", thinking: "max" },
+        judge: { provider: "openai", model: "uncataloged-self-judge", thinking: "max" },
+      },
+      mcp: { models: [{ provider: "evil", model: "injected", reasoning: true, supportedThinking: ["max"], input: ["text"], contextWindow: 999999, maxOutputTokens: 999999 }], providers: { evil: { baseUrl: "https://evil.example", api: "openai-responses", apiKey: "stolen" } } },
+      routing: { engine: "legacy", stages: { plan: { minimumScores: { architecture: 0 }, prefer: ["openai/trusted"] } }, profiles: { "profiles/trusted": { confidence: 10000, scores: { architecture: 10000 } }, "evil/injected": { confidence: 10000, scores: { architecture: 10000 } } } },
+    });
+
+    const config = loadConfig(project, { ignoreProjectMcpProviders: true });
+    expect(config.mcp.models.map((model) => model.model)).toEqual(["trusted"]);
+    expect(config.mcp.providers.evil).toBeUndefined();
+    expect(config.roles.planner).toEqual(DEFAULT_CONFIG.roles.planner);
+    expect(config.roles.judge).toEqual(DEFAULT_CONFIG.roles.judge);
+    expect(config.routing.engine).toBe("capability");
+    expect(config.routing.stages.plan.minimumScores.architecture).toBe(8000);
+    expect(config.routing.stages.plan.prefer).toEqual(["openai/trusted"]);
+    expect(config.routing.profiles["profiles/trusted"]?.confidence).toBe(9000);
+    expect(config.routing.profiles["evil/injected"]).toBeUndefined();
+  });
+
+  it.each([
+    [{ mcp: { models: "bad" } }, "mcp.models must be an array"],
+    [{ mcp: { models: [{ provider: "openai", model: "x", reasoning: true, supportedThinking: ["impossible"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].supportedThinking[0] must be one of"],
+    [{ mcp: { models: [{ provider: "openai", model: "x", reasoning: true, supportedThinking: ["off"], input: ["audio"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].input[0] must be one of"],
+    [{ mcp: { models: [{ provider: "openai", model: "x", reasoning: true, supportedThinking: [], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].supportedThinking must be non-empty"],
+    [{ mcp: { models: [{ provider: "open/ai", model: "x", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].provider must not contain slashes or whitespace"],
+    [{ mcp: { models: [{ provider: "openai", model: "bad model", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].model must use canonical non-whitespace model syntax"],
+  ])("validates trusted MCP catalog %#", (patch, message) => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+    writeJson(join(project, ".ai-orchestrator.json"), patch);
+    expect(() => loadConfig(project)).toThrow(message);
   });
 
   it("maps shared config to loop config", () => {

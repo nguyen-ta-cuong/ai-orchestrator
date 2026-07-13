@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG, type OrchestratorConfig } from "../src/core/config.js";
-import { completeWithRole } from "../mcp/llm.js";
+import { completeRouted, completeWithRole } from "../mcp/llm.js";
 
 const apiKey = "test-secret-key";
 
@@ -41,7 +41,7 @@ describe("completeWithRole", () => {
     const config = configFor("anthropic-messages");
     delete config.mcp.providers.test.apiKey;
 
-    await expect(completeWithRole({ config, role: "planner", prompt: "plan" })).rejects.toThrow(/Missing API key/);
+    await expect(completeWithRole({ config, role: "planner", prompt: "plan" })).rejects.toThrow(/MCP provider API key is missing/);
   });
 
   it("redacts provider secrets from non-200 error bodies", async () => {
@@ -51,7 +51,7 @@ describe("completeWithRole", () => {
     })));
 
     await expect(completeWithRole({ config: configFor("openai-responses"), role: "planner", prompt: "plan" }))
-      .rejects.toThrow(/Bearer \[redacted\]/);
+      .rejects.toThrow(/LLM request failed \(401\)/);
     await expect(completeWithRole({ config: configFor("openai-responses"), role: "planner", prompt: "plan" }))
       .rejects.not.toThrow(apiKey);
   });
@@ -60,7 +60,7 @@ describe("completeWithRole", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(`not json Bearer ${apiKey}`, { status: 200 })));
 
     await expect(completeWithRole({ config: configFor("openai-responses"), role: "planner", prompt: "plan" }))
-      .rejects.toThrow(/Bearer \[redacted\]/);
+      .rejects.toThrow(/LLM response was not valid JSON/);
     await expect(completeWithRole({ config: configFor("openai-responses"), role: "planner", prompt: "plan" }))
       .rejects.not.toThrow(apiKey);
   });
@@ -99,6 +99,69 @@ describe("completeWithRole", () => {
       prompt: "plan",
       signal: controller.signal,
     })).rejects.toThrow("LLM request aborted by client");
+  });
+
+  it("falls back across eligible provider candidates and redacts secrets from history", async () => {
+    const config = configFor("openai-responses");
+    config.mcp.providers.backup = { baseUrl: "https://backup.example/v1", api: "openai-responses", apiKey: "backup-secret" };
+    const fetchMock = vi.fn(async (url: string | URL | Request) => String(url).includes("provider.example")
+      ? new Response(`failure ${apiKey}`, { status: 503, statusText: "Unavailable" })
+      : Response.json({ output_text: "backup result" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await completeRouted({
+      config,
+      role: "planner",
+      prompt: "plan",
+      candidates: [
+        { provider: "test", model: "primary", thinking: "off" },
+        { provider: "backup", model: "secondary", thinking: "off" },
+      ],
+    });
+
+    expect(result.text).toBe("backup result");
+    expect(result.selectedIndex).toBe(1);
+    expect(result.fallbackHistory).toEqual([{ identity: "test/primary", reason: "LLM request failed (503)" }]);
+    expect(JSON.stringify(result)).not.toContain(apiKey);
+  });
+
+  it("falls back when a candidate fails structured-output validation", async () => {
+    const config = configFor("openai-responses");
+    config.mcp.providers.backup = { baseUrl: "https://backup.example/v1", api: "openai-responses", apiKey: "backup-secret" };
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => Response.json({
+      output_text: String(url).includes("provider.example") ? "not-json" : '{"verdict":"approve","reasons":"ok"}',
+    })));
+
+    const result = await completeRouted({
+      config,
+      role: "judge",
+      prompt: "judge",
+      candidates: [
+        { provider: "test", model: "primary", thinking: "off" },
+        { provider: "backup", model: "secondary", thinking: "off" },
+      ],
+      validateText: (text) => { JSON.parse(text); },
+    });
+
+    expect(result.selectedIndex).toBe(1);
+    expect(result.fallbackHistory).toEqual([{ identity: "test/primary", reason: "candidate output failed required schema validation" }]);
+  });
+
+  it("caps provider output tokens to the trusted catalog entry", async () => {
+    const config = configFor("openai-responses");
+    const fetchMock = vi.fn(async () => Response.json({ output_text: "planned" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await completeRouted({
+      config,
+      role: "planner",
+      prompt: "plan",
+      candidates: [{ provider: "test", model: "small", thinking: "off", maxOutputTokens: 3_000 }],
+    });
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toMatchObject({ max_output_tokens: 3_000 });
+    expect(request.redirect).toBe("error");
   });
 
   it("keeps Anthropic max thinking below max_tokens", async () => {
