@@ -95,20 +95,24 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     ],
     parameters: Type.Object({
       verdict: StringEnum(["approve", "reject"] as const),
-      reasons: Type.String({ description: "Concrete review findings supporting the verdict" }),
-      requiredFixes: Type.Optional(Type.String({ description: "Required changes when rejecting" })),
+      reasons: Type.String({ minLength: 1, description: "Concrete review findings supporting the verdict" }),
+      requiredFixes: Type.Optional(Type.String({ minLength: 1, description: "Required changes when rejecting" })),
     }),
     async execute(_toolCallId, params) {
       if (state.phase !== "judging") {
         throw new Error("judge_verdict is only valid during an ai-orchestrator judging phase");
+      }
+      if (params.reasons.trim().length === 0) throw new Error("judge_verdict reasons must be non-empty");
+      if (params.verdict === "reject" && (!params.requiredFixes || params.requiredFixes.trim().length === 0)) {
+        throw new Error("judge_verdict rejection requires non-empty requiredFixes");
       }
 
       state = {
         ...state,
         pendingVerdict: {
           verdict: params.verdict,
-          reasons: params.reasons,
-          requiredFixes: params.requiredFixes,
+          reasons: params.reasons.trim(),
+          requiredFixes: params.requiredFixes?.trim(),
         },
       };
       persist();
