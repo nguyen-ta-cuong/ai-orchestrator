@@ -188,10 +188,13 @@ describe("lifecycle Pi extension safety", () => {
     const appliedNotice = vi.mocked(harness.ctx.ui.notify).mock.calls.map(([message]) => String(message)).find((message) => message.includes("Applied routing recommendation"));
     const id = /recommendation (\d+-[a-f0-9-]{8})/.exec(appliedNotice ?? "")?.[1];
     expect(id).toBeTruthy();
+    const recordPath = join(store, "recommendations", `${id}.json`);
+    const pendingRecord = JSON.parse(readFileSync(recordPath, "utf8"));
+    writeFileSync(recordPath, `${JSON.stringify({ ...pendingRecord, status: "pending" }, null, 2)}\n`, { mode: 0o600 });
 
     await harness.commands.get("lifecycle-routing-rollback")!(id!, harness.ctx);
     expect(JSON.parse(readFileSync(userConfigPath, "utf8"))).toMatchObject({ routing: { stages: { build: { prefer: [] } } } });
-    expect(JSON.parse(readFileSync(join(store, "recommendations", `${id}.json`), "utf8"))).toMatchObject({ status: "rolled-back" });
+    expect(JSON.parse(readFileSync(recordPath, "utf8"))).toMatchObject({ status: "rolled-back" });
   });
 
   it("rejects missing prerequisite artifacts before changing model or tools", async () => {
