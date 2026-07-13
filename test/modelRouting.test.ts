@@ -175,6 +175,25 @@ describe("capability model routing", () => {
     expect(first.eligible.map((item) => `${item.identity.provider}/${item.identity.model}`)).toEqual(["a/first", "z/second"]);
   });
 
+  it("makes quality and economy modes behaviorally distinct while preserving pin order", () => {
+    const expensive = model({ provider: "p", model: "strong", cost: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0 } });
+    const cheap = model({ provider: "p", model: "cheap", cost: { input: 0.1, output: 0.1, cacheRead: 0, cacheWrite: 0 } });
+    const profiles = {
+      "p/strong": profile({ scores: { coding: 9_500 } }),
+      "p/cheap": profile({ scores: { coding: 5_500 } }),
+    };
+    const quality = structuredClone(DEFAULT_ROUTING_POLICY);
+    quality.mode = "quality";
+    const economy = structuredClone(DEFAULT_ROUTING_POLICY);
+    economy.mode = "economy";
+
+    expect(rankModels(request([expensive, cheap], profiles, { stage: "build", policy: quality })).eligible[0]?.identity.model).toBe("strong");
+    expect(rankModels(request([expensive, cheap], profiles, { stage: "build", policy: economy })).eligible[0]?.identity.model).toBe("cheap");
+
+    economy.stages.build.pins = ["p/strong", "p/cheap"];
+    expect(rankModels(request([expensive, cheap], profiles, { stage: "build", policy: economy })).eligible[0]?.identity.model).toBe("strong");
+  });
+
   it("breaks score ties by prefer order, confidence, cost, then lexical identity", () => {
     const models = [
       model({ provider: "p", model: "preferred", cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 } }),
