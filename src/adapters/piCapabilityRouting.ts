@@ -42,12 +42,14 @@ export interface CreatePiRoutingPlanInput {
   available: readonly PiModelLike[];
   evidence: TaskFeatureEvidence | string;
   priorSelections?: readonly ModelSelectionIdentity[];
+  /** Compute active capability policy for a read-only preview without changing configured engine behavior. */
+  forceCapability?: boolean;
 }
 
 export function createPiRoutingPlan(input: CreatePiRoutingPlanInput): PiRoutingPlan {
   const taskFeatures = extractTaskFeatures(input.evidence);
   const taskFeaturesHash = stableHash(taskFeatures);
-  if (input.config.routing.engine !== "capability") {
+  if (input.config.routing.engine !== "capability" && !input.forceCapability) {
     return {
       engine: input.config.routing.engine,
       policyVersion: `${input.config.routing.version}:${stableHash({ engine: input.config.routing.engine, role: input.config.roles[input.role] })}`,
