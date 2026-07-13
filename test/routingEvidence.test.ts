@@ -84,7 +84,13 @@ describe("routing evidence", () => {
         : { type: "stage-ended", verdict: "approve", finalRunStatus: "done", buildIteration: 1 },
     }));
 
-    expect(recommendRoutingPolicyChanges(samples)[0]).toMatchObject({
+    const initialApprovals = samples.slice(0, 7).map((sample) => ({
+      ...sample,
+      eventId: `${sample.eventId}-initial`,
+      recordedAt: "2026-07-11T00:00:00.000Z",
+      outcome: { type: "stage-ended" as const, verdict: "approve" as const, finalRunStatus: "done" as const, buildIteration: 1 },
+    }));
+    expect(recommendRoutingPolicyChanges([...initialApprovals, ...samples])[0]).toMatchObject({
       recommendedChange: { kind: "prefer-model", provider: "p", model: "reliable" },
       downstreamEvidence: expect.stringContaining("non-reversed, non-overridden"),
     });
