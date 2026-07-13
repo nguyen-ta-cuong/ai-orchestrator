@@ -122,7 +122,7 @@ The run directory is authoritative:
   evidence.jsonl
 ```
 
-Standalone stage commands do not skip or rewind `state.json`. VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses; BUILD edits. A checker cannot approve the exact BUILD identity, and configured family separation can be stricter. Commit/PR actions remain configuration- and explicit-confirmation-gated; even `ship.commit: "auto"` cannot bypass the per-run confirmation. SHIP never pushes, and PR creation requires an already-pushed upstream whose tip matches local `HEAD`.
+Standalone stage commands do not skip or rewind `state.json`. VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses; BUILD edits. Pi BUILD is constrained to active read/search/edit/write tools—arbitrary shell and connector tools are removed—so the independent VERIFY phase runs the exact detected test command. A checker cannot approve the exact BUILD identity, and configured family separation can be stricter. Commit/PR actions remain configuration- and explicit-confirmation-gated; even `ship.commit: "auto"` cannot bypass the per-run confirmation. SHIP never pushes, and PR creation requires an already-pushed upstream whose tip matches local `HEAD`.
 
 ## Cursor installation
 
