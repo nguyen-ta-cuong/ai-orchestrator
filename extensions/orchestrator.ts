@@ -11,7 +11,12 @@ import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
 import { currentRun, readState } from "../src/lifecycle/artifacts.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
-import { appendUserRoutingEvidenceEvent, readRoutingEvidenceEvents, resolveUserEvidenceRoot } from "../src/lifecycle/routingEvidenceStore.js";
+import {
+  appendRoutingBudgetLedgerEvent,
+  appendUserRoutingEvidenceEvent,
+  readRoutingBudgetLedger,
+  resolveUserEvidenceRoot,
+} from "../src/lifecycle/routingEvidenceStore.js";
 
 const STATE_TYPE = "ai-orchestrator";
 const STATUS_KEY = "ai-orchestrator";
@@ -748,8 +753,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   function persistFastStageStarted(selection: NonNullable<RuntimeState["modelSelections"]>[number]): void {
-    if (!runtime?.config.routing.evidence.enabled || !state.runId) return;
-    appendUserRoutingEvidenceEvent(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), {
+    if (!runtime || !state.runId) return;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    appendRoutingBudgetLedgerEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${selection.decisionId}:budget:stage-started`,
+      runId: state.runId,
+      recordedAt: new Date().toISOString(),
+      outcome: "stage-started",
+      ...(selection.estimatedCostUsd === undefined ? {} : { estimatedUsd: selection.estimatedCostUsd }),
+    });
+    if (!runtime.config.routing.evidence.enabled) return;
+    appendUserRoutingEvidenceEvent(userStoreRoot, {
       version: 1,
       eventId: `${selection.decisionId}:stage-started`,
       runId: state.runId,
@@ -771,11 +786,24 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     verdict: "approve" | "reject" | "unknown",
     structuredToolCompliance: boolean | "unknown",
   ): void {
-    if (!runtime?.config.routing.evidence.enabled || !state.runId) return;
+    if (!runtime || !state.runId) return;
     const selection = [...(state.modelSelections ?? [])].reverse().find((item) => item.stage === stage);
     if (!selection) return;
     const usage = state.lastUsage;
-    appendUserRoutingEvidenceEvent(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), {
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    appendRoutingBudgetLedgerEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${selection.decisionId}:budget:stage-ended`,
+      runId: state.runId,
+      recordedAt: new Date().toISOString(),
+      outcome: "stage-ended",
+      ...(usage ? { observedUsd: usage.observedUsd } : {}),
+    });
+    if (!runtime.config.routing.evidence.enabled) {
+      state.lastUsage = undefined;
+      return;
+    }
+    appendUserRoutingEvidenceEvent(userStoreRoot, {
       version: 1,
       eventId: `${selection.decisionId}:stage-ended`,
       runId: state.runId,
@@ -799,18 +827,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   function fastBudgetSnapshot(current: RuntimeState): RoutingBudgetSnapshot {
-    const events = runtime?.config.routing.evidence.enabled
-      ? readRoutingEvidenceEvents(join(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), "events.jsonl")).events
+    const ledger = runtime
+      ? readRoutingBudgetLedger(join(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), "budget.jsonl"))
       : [];
-    const runEvents = events.filter((event) => event.runId === current.runId);
+    const runEvents = ledger.filter((event) => event.runId === current.runId);
     const today = new Date().toISOString().slice(0, 10);
-    const dailyEvents = events.filter((event) => event.recordedAt.startsWith(today));
+    const dailyEvents = ledger.filter((event) => event.recordedAt.startsWith(today));
     const estimatedSelections = (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0);
     return {
-      estimatedRunUsd: runEvents.length > 0 ? evidenceCost(runEvents, "stage-started", "estimatedUsd") : estimatedSelections,
-      observedRunUsd: evidenceCost(runEvents, "stage-ended", "observedUsd"),
-      estimatedDayUsd: evidenceCost(dailyEvents, "stage-started", "estimatedUsd"),
-      observedDayUsd: evidenceCost(dailyEvents, "stage-ended", "observedUsd"),
+      estimatedRunUsd: runEvents.length > 0 ? ledgerCost(runEvents, "stage-started", "estimatedUsd") : estimatedSelections,
+      observedRunUsd: ledgerCost(runEvents, "stage-ended", "observedUsd"),
+      estimatedDayUsd: ledgerCost(dailyEvents, "stage-started", "estimatedUsd"),
+      observedDayUsd: ledgerCost(dailyEvents, "stage-ended", "observedUsd"),
       paidFallbacks: (current.modelSelections ?? []).reduce((sum, selection) => sum + selection.fallbackCount, 0),
       attemptsByStage: Object.fromEntries(
         (current.modelSelections ?? []).map((selection) => [
@@ -821,12 +849,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     };
   }
 
-  function evidenceCost(
-    events: ReturnType<typeof readRoutingEvidenceEvents>["events"],
+  function ledgerCost(
+    events: ReturnType<typeof readRoutingBudgetLedger>,
     outcome: "stage-started" | "stage-ended",
     field: "estimatedUsd" | "observedUsd",
   ): number {
-    return events.reduce((sum, event) => sum + (event.outcome.type === outcome && typeof event.cost[field] === "number" ? event.cost[field] : 0), 0);
+    return events.reduce((sum, event) => sum + (event.outcome === outcome ? event[field] ?? 0 : 0), 0);
   }
 
   async function abortForModelError(ctx: ExtensionContext, reason: string): Promise<void> {
