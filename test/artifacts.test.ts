@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  acquireRunLease,
   appendJournal,
   appendRoutingTrace,
   createRun,
   currentRun,
+  ownsRunLease,
   readState,
   releaseRun,
+  releaseRunLease,
   writeState,
 } from "../src/lifecycle/artifacts.js";
 import { createIdleLifecycleState } from "../src/core/lifecycle.js";
@@ -145,6 +148,21 @@ describe("lifecycle artifacts", () => {
     createRun(cwd, artifactsDir, "first");
 
     expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/already active/);
+  });
+
+  it("prevents concurrent execution and reclaims a dead-process lease", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    acquireRunLease(run.paths, "owner-a");
+    expect(ownsRunLease(run.paths, "owner-a")).toBe(true);
+    expect(() => acquireRunLease(run.paths, "owner-b")).toThrow(/already executing/);
+    expect(releaseRunLease(run.paths, "owner-b")).toBe(false);
+    expect(releaseRunLease(run.paths, "owner-a")).toBe(true);
+
+    writeFileSync(run.paths.executionLease, `${JSON.stringify({ owner: "dead", pid: 99_999_999, createdAt: new Date().toISOString() })}\n`);
+    acquireRunLease(run.paths, "owner-b");
+    expect(ownsRunLease(run.paths, "owner-b")).toBe(true);
+    expect(releaseRunLease(run.paths, "owner-b")).toBe(true);
   });
 
   it("blocks creating a run while another process holds the current-run lock", () => {
