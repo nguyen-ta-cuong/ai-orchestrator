@@ -122,7 +122,7 @@ function rankedCandidate(candidate: RankedModelCandidate, index: number): PiRout
     rank: index + 1,
     score: candidate.score,
     ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
-    reason: `${capability?.detail ?? "capability fit"}; score ${candidate.score}; profile ${candidate.profile.provenance}/${candidate.profile.version}`,
+    reason: `${capability?.detail ?? "capability fit"}; score ${candidate.score}; profile ${candidate.profile.provenance}/${candidate.profile.version}; ${candidate.thinkingReason}`,
   };
 }
 
