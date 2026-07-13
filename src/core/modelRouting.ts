@@ -103,6 +103,7 @@ export interface RoutingPolicy {
   privacy: {
     allowed: readonly Exclude<ModelPrivacy, "unknown">[];
     allowUnknown: boolean;
+    providers: Readonly<Record<string, ModelPrivacy>>;
   };
   deny: {
     providers: readonly string[];
@@ -249,7 +250,7 @@ export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   unknownCostPenaltyBasisPoints: 750,
   confidenceBonusBasisPoints: 500,
   costPenaltyBasisPointsPerUsd: 100,
-  privacy: { allowed: ["local", "private", "public"], allowUnknown: true },
+  privacy: { allowed: ["local", "private", "public"], allowUnknown: true, providers: {} },
   deny: { providers: [], models: [], families: [] },
   separation: {
     checkerMustDifferFromBuilder: true,
@@ -393,7 +394,7 @@ function exclusionFor(
   const identityText = `${model.provider}/${model.model}`;
 
   if (!model.callable) return excluded("not-callable", `${identityText} is not callable on this surface`);
-  const privacy = model.privacy ?? "unknown";
+  const privacy = model.privacy ?? policy.privacy.providers[model.provider] ?? "unknown";
   if ((privacy === "unknown" && !policy.privacy.allowUnknown) ||
     (privacy !== "unknown" && !policy.privacy.allowed.includes(privacy))) {
     return excluded("privacy-not-allowed", `${identityText} privacy class ${privacy} is not allowed by policy`);

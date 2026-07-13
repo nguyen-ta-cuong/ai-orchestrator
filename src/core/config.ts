@@ -410,6 +410,11 @@ function validateCapabilityRouting(routing: Record<string, unknown>): void {
   const privacy = requirePlainObject(routing.privacy, "routing.privacy");
   requireEnumArray(privacy.allowed, "routing.privacy.allowed", ["local", "private", "public"] as const);
   requireBoolean(privacy.allowUnknown, "routing.privacy.allowUnknown");
+  const privacyProviders = requirePlainObject(privacy.providers, "routing.privacy.providers");
+  for (const [provider, value] of Object.entries(privacyProviders)) {
+    requireNonEmptyString(provider, "routing.privacy.providers key");
+    requireStringEnum(value, `routing.privacy.providers.${provider}`, ["local", "private", "public", "unknown"] as const);
+  }
 
   const deny = requirePlainObject(routing.deny, "routing.deny");
   requireStringArray(deny.providers, "routing.deny.providers");
@@ -767,6 +772,7 @@ function protectPrivacy(routing: Record<string, unknown>, userRouting: Capabilit
     ? userRouting.privacy.allowed.filter((value) => projectAllowed.includes(value))
     : projectAllowed ?? [...userRouting.privacy.allowed];
   routing.privacy.allowUnknown = protectedPermission(userRouting.privacy.allowUnknown, routing.privacy.allowUnknown);
+  routing.privacy.providers = cloneConfig(userRouting.privacy.providers);
 }
 
 function protectDenyRules(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {

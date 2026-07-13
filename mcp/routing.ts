@@ -188,6 +188,7 @@ function normalizeCatalog(
       contextWindow: entry.contextWindow,
       maxOutputTokens: Math.min(entry.maxOutputTokens, providerOutputLimit(provider?.api)),
       ...(entry.cost ? { cost: entry.cost } : {}),
+      ...(entry.privacy ? { privacy: entry.privacy } : {}),
     };
   });
 }
