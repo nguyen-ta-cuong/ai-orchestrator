@@ -173,7 +173,7 @@ export function recommendRoutingPolicyChanges(
   }
   const latestByDecision = new Map<string, RoutingEvidenceEvent>();
   for (const event of events) {
-    if (event.outcome.type !== "stage-ended") continue;
+    if (event.outcome.type !== "stage-ended" && event.outcome.type !== "human-override") continue;
     const previous = latestByDecision.get(event.decisionId);
     if (!previous || event.recordedAt >= previous.recordedAt || event.outcome.laterReversal || event.outcome.humanOverride) {
       latestByDecision.set(event.decisionId, event);
