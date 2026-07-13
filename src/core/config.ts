@@ -393,6 +393,11 @@ function validateConfig(value: unknown): OrchestratorConfig {
       throw new Error(`mcp.providers.${providerName}.apiKey must be a string when provided`);
     }
   }
+  for (const [index, model] of (mcp.models as McpModelConfig[]).entries()) {
+    if (!Object.hasOwn(providers, model.provider)) {
+      throw new Error(`mcp.models[${index}].provider must reference mcp.providers.${model.provider}`);
+    }
+  }
 
   return config as unknown as OrchestratorConfig;
 }
