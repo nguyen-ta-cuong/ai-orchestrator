@@ -212,9 +212,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (state.phase === "building") {
       const input = event.input as { path?: unknown };
       const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
-      const artifactsRoot = resolve(activeRuntime.paths.root, "..");
-      if (requestedPath !== artifactsRoot && !requestedPath.startsWith(`${artifactsRoot}/`)) return;
-      return { block: true, reason: "BUILD may edit source files but lifecycle artifacts are orchestrator-owned." };
+      const protectedRoots = [
+        resolve(activeRuntime.paths.root, ".."),
+        resolve(activeRuntime.paths.root, "../.."),
+        resolve(activeRuntime.cwd, ".ai-orchestrator"),
+      ];
+      if (!protectedRoots.some((root) => requestedPath === root || requestedPath.startsWith(`${root}/`))) return;
+      return { block: true, reason: "BUILD may edit source files but orchestrator metadata and lifecycle artifacts are orchestrator-owned." };
     }
     if (state.phase === "defining" || state.phase === "planning") {
       const input = event.input as { path?: unknown };
