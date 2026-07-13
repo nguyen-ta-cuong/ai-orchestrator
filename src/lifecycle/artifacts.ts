@@ -13,6 +13,7 @@ export interface RunPaths {
   journal: string;
   routing: string;
   evidence: string;
+  executionLease: string;
 }
 
 export interface RoutingTraceRecord {
@@ -133,6 +134,38 @@ export function appendRoutingTrace(paths: RunPaths, record: RoutingTraceRecord):
   writeFileSync(paths.routing, `${line}\n`, { flag: "a" });
 }
 
+export function acquireRunLease(paths: RunPaths, owner: string): void {
+  assertRunPathsSafe(paths);
+  const record = { owner, pid: process.pid, createdAt: new Date().toISOString() };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(paths.executionLease, `${JSON.stringify(record)}\n`, { flag: "wx" });
+      return;
+    } catch (error) {
+      if (!isNodeErrorWithCode(error, "EEXIST")) throw error;
+      const existing = readExecutionLease(paths.executionLease);
+      if (existing?.owner === owner) return;
+      if (!existing || isProcessAlive(existing.pid)) {
+        throw new Error(`Lifecycle run is already executing under lease ${existing?.owner ?? "unknown"}`);
+      }
+      rmSync(paths.executionLease, { force: true });
+    }
+  }
+  throw new Error("Lifecycle execution lease could not be acquired");
+}
+
+export function ownsRunLease(paths: RunPaths, owner: string): boolean {
+  assertRunPathsSafe(paths);
+  return readExecutionLease(paths.executionLease)?.owner === owner;
+}
+
+export function releaseRunLease(paths: RunPaths, owner: string): boolean {
+  assertRunPathsSafe(paths);
+  if (readExecutionLease(paths.executionLease)?.owner !== owner) return false;
+  rmSync(paths.executionLease, { force: true });
+  return true;
+}
+
 export function releaseRun(cwd: string, artifactsDir: string, runId: string): boolean {
   assertArtifactRootSafe(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => releaseCurrentPointerIfMatches(cwd, artifactsDir, runId));
@@ -150,6 +183,7 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
     journal: join(root, "journal.md"),
     routing: join(root, "routing.jsonl"),
     evidence: join(root, "evidence.jsonl"),
+    executionLease: join(root, "execution.lock"),
   };
 }
 
@@ -334,6 +368,27 @@ function normalizeArtifactsDir(artifactsDir: string): string {
     throw new Error("artifactsDir basename is reserved for lifecycle run coordination");
   }
   return stack.join("/");
+}
+
+function readExecutionLease(path: string): { owner: string; pid: number } | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as { owner?: unknown; pid?: unknown };
+    return typeof value.owner === "string" && value.owner.length > 0 && Number.isInteger(value.pid) && (value.pid as number) > 0
+      ? { owner: value.owner, pid: value.pid as number }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeErrorWithCode(error, "ESRCH");
+  }
 }
 
 function isNodeErrorWithCode(error: unknown, code: string): boolean {
