@@ -67,6 +67,23 @@ describe("routing evidence", () => {
     expect(recommendations[0]?.rollback).toContain("Remove");
   });
 
+  it("does not reward approvals that are later reversed or overridden", () => {
+    const samples = Array.from({ length: 10 }, (_, index): RoutingEvidenceEvent => ({
+      ...baseEvent,
+      eventId: `adverse-${index}`,
+      decisionId: `adverse-decision-${index}`,
+      selected: { provider: "p", model: index < 7 ? "rubber-stamp" : "reliable" },
+      outcome: index < 7
+        ? { type: "stage-ended", verdict: "approve", finalRunStatus: "done", laterReversal: true, humanOverride: true, buildIteration: 1 }
+        : { type: "stage-ended", verdict: "approve", finalRunStatus: "done", buildIteration: 1 },
+    }));
+
+    expect(recommendRoutingPolicyChanges(samples)[0]).toMatchObject({
+      recommendedChange: { kind: "prefer-model", provider: "p", model: "reliable" },
+      downstreamEvidence: expect.stringContaining("non-reversed, non-overridden"),
+    });
+  });
+
   it("reports shadow policy differences without claiming counterfactual quality", () => {
     const comparison = compareRoutingPolicies({
       stage: "review",
