@@ -37,6 +37,7 @@ import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import {
   appendJournal,
   appendRoutingTrace,
+  assertRunPathsSafe,
   createRun,
   currentRun,
   readState,
@@ -131,6 +132,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const activeRuntime = runtime;
     const state = activeRuntime?.state;
     if (!activeRuntime || !state) return;
+    assertRunPathsSafe(activeRuntime.paths);
     if (event.toolName === "bash") {
       const command = typeof event.input.command === "string" ? event.input.command : "";
       if (state.phase === "building") {
@@ -304,6 +306,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         runtime!.pendingDiagnosis = diagnosis;
         runtime!.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
         writeState(runtime!.paths, runtime!.state);
+        assertRunPathsSafe(runtime!.paths);
         writeFileSync(runtime!.paths.debug, formatDiagnosis(diagnosis));
         appendJournal(runtime!.paths, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
         persistMirror(runtime!.state);
@@ -491,6 +494,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function runCurrentPhase(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    assertRunPathsSafe(runtime.paths);
     runtime.pendingVerdict = undefined;
     runtime.pendingDiagnosis = undefined;
     runtime.remindedPhase = undefined;
@@ -540,6 +544,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         }
         runtime.state.debugDiagnosisVerdictIndex = undefined;
         writeState(runtime.paths, runtime.state);
+        assertRunPathsSafe(runtime.paths);
         writeFileSync(runtime.paths.debug, "");
         if (!(await enterRoutedStage("debug", "debugger", ctx))) return;
         activateReadOnlyTools("debug_diagnosis");
@@ -969,6 +974,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       runtime.pendingDiagnosis = synthesized;
       runtime.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
       writeState(runtime.paths, runtime.state);
+      assertRunPathsSafe(runtime.paths);
       writeFileSync(runtime.paths.debug, formatDiagnosis(synthesized));
       appendJournal(runtime.paths, "Synthesized DEBUG diagnosis after missing structured output");
     }
