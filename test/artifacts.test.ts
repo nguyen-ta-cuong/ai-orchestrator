@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -332,6 +332,19 @@ describe("lifecycle artifacts", () => {
     expect(exclude).toContain("/.orch/runs/");
     expect(exclude).not.toContain("/.orch/current");
     expect(exclude).not.toContain("/.orch/current.lock/");
+  });
+
+  it("coordinates one active run across worktree subdirectories", () => {
+    const root = makeTempDir();
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    const firstCwd = join(root, "packages", "one");
+    const secondCwd = join(root, "packages", "two");
+    mkdirSync(firstCwd, { recursive: true });
+    mkdirSync(secondCwd, { recursive: true });
+    const first = createRun(firstCwd, ".orch/runs", "first");
+
+    expect(currentRun(secondCwd, ".orch/runs")?.paths.root).toBe(first.paths.root);
+    expect(() => createRun(secondCwd, ".orch/runs", "second")).toThrow(/already active/);
   });
 
   it("fails closed when the repository active-run registry is corrupt", () => {
