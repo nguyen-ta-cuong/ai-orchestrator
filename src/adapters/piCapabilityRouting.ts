@@ -4,6 +4,7 @@ import { lifecycleModelChoices } from "../core/lifecycleRouting.js";
 import {
   modelIdentityKey,
   rankModels,
+  resolveModelProfiles,
   type ModelSelectionIdentity,
   type RankedModelCandidate,
   type RoutingDecision,
@@ -60,7 +61,7 @@ export function createPiRoutingPlan(input: CreatePiRoutingPlanInput): PiRoutingP
       policyVersion: `${input.config.routing.version}:${stableHash({ engine: input.config.routing.engine, role: input.config.roles[input.role] })}`,
       taskFeatures,
       taskFeaturesHash,
-      candidates: legacyCandidates(input),
+      candidates: legacyCandidates(input, taskFeatures),
     };
   }
 
@@ -99,9 +100,10 @@ function capabilityPolicy(input: CreatePiRoutingPlanInput): RoutingPolicy {
   return policy;
 }
 
-function legacyCandidates(input: CreatePiRoutingPlanInput): PiRoutingCandidate[] {
-  const available = normalizePiModelCatalog(input.available).map(({ provider, model }) => ({ provider, model }));
-  const candidates = input.stage !== "build" && input.stage !== "fast-judge"
+function legacyCandidates(input: CreatePiRoutingPlanInput, taskFeatures: TaskFeatures): PiRoutingCandidate[] {
+  const catalog = normalizePiModelCatalog(input.available);
+  const available = catalog.map(({ provider, model }) => ({ provider, model }));
+  const rawCandidates = input.stage !== "build" && input.stage !== "fast-judge"
     ? lifecycleModelChoices(
       input.stage,
       input.config,
@@ -113,11 +115,35 @@ function legacyCandidates(input: CreatePiRoutingPlanInput): PiRoutingCandidate[]
       reason: choice.reason,
     }))
     : [{ ...input.config.roles[input.role], rank: 1, reason: `legacy ${input.role} role selection` }];
+  const profiles = resolveModelProfiles(
+    catalog,
+    [{ provenance: "project", profiles: input.config.routing.profiles }],
+    input.config.routing,
+  );
+  const candidates = rawCandidates.map((candidate) => {
+    const identity = modelIdentityKey(candidate);
+    const model = catalog.find((item) => modelIdentityKey(item) === identity);
+    const profile = profiles.get(identity);
+    const estimatedCostUsd = model?.cost
+      ? (taskFeatures.contextTokens * model.cost.input + taskFeatures.expectedOutputTokens * model.cost.output) / 1_000_000
+      : undefined;
+    return {
+      ...candidate,
+      ...(profile?.family ? { family: profile.family } : model?.family ? { family: model.family } : {}),
+      ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }),
+      ...(profile?.version ? { profileVersion: profile.version } : {}),
+    };
+  });
 
   if (!["verify", "debug", "review", "ship", "fast-judge"].includes(input.stage)) return candidates;
   const builder = [...(input.priorSelections ?? [])].reverse().find((selection) => selection.stage === "build");
   if (!builder) return candidates;
-  return candidates.filter((candidate) => modelIdentityKey(candidate) !== modelIdentityKey(builder));
+  const requireDifferentFamily = input.config.routing.separation.requireDifferentProviderFamilyFor.includes(input.stage);
+  return candidates.filter((candidate) => {
+    if (modelIdentityKey(candidate) === modelIdentityKey(builder)) return false;
+    if (!requireDifferentFamily) return true;
+    return Boolean(builder.family && candidate.family && builder.family !== candidate.family);
+  });
 }
 
 function rankedCandidate(candidate: RankedModelCandidate, index: number): PiRoutingCandidate {
