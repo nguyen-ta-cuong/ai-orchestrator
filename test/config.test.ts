@@ -277,6 +277,9 @@ describe("loadConfig", () => {
     expect(config.routing.lifecycle.stages.verify[0].model).toBe("gpt-5.6-sol");
     expect(config.routing.engine).toBe("capability-shadow");
     expect(config.routing.mode).toBe("balanced");
+    expect(config.routing.evidence).toMatchObject({ enabled: true, userStoreDir: "routing-evidence", minRecommendationSamples: 10 });
+    expect(config.routing.budgets.maxEstimatedUsdPerRun).toBe(8);
+    expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(3);
     expect(config.lifecycle.artifactsDir).toBe(".ai-orchestrator/runs");
     expect(config.build.commitPerTask).toBe(false);
     expect(config.ship).toEqual({ commit: "ask", openPr: "ask" });
@@ -292,6 +295,9 @@ describe("loadConfig", () => {
         mode: "quality",
         deny: { models: ["unsafe/model"] },
         limits: { maxEstimatedUsdPerRun: 3, maxAttemptsPerStage: 2 },
+        budgets: { maxEstimatedUsdPerRun: 3, maxEstimatedUsdPerStage: 1, allowUnknownCost: false },
+        circuitBreakers: { maxSelectionFailures: 2 },
+        evidence: { enabled: false, minRecommendationSamples: 20 },
         stages: { review: { minimumScores: { review: 8_000 }, prefer: ["custom/reviewer"] } },
         profiles: {
           "custom/reviewer": {
@@ -308,6 +314,10 @@ describe("loadConfig", () => {
     const config = loadConfig(project);
     expect(config.routing.engine).toBe("legacy");
     expect(config.routing.mode).toBe("quality");
+    expect(config.routing.budgets.maxEstimatedUsdPerStage).toBe(1);
+    expect(config.routing.budgets.allowUnknownCost).toBe(false);
+    expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(2);
+    expect(config.routing.evidence.enabled).toBe(false);
     expect(config.routing.profiles["custom/reviewer"]?.scores.review).toBe(9_000);
     expect(config.routing.lifecycle.stages.review).toEqual(DEFAULT_CONFIG.routing.lifecycle.stages.review);
   });
@@ -321,6 +331,8 @@ describe("loadConfig", () => {
       routing: {
         deny: { providers: ["denied-provider"], models: ["denied/model"] },
         limits: { maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 },
+        budgets: { maxEstimatedUsdPerRun: 2, maxEstimatedUsdPerStage: 1, allowUnknownCost: false, maxPaidFallbacksPerRun: 1 },
+        circuitBreakers: { maxSelectionFailures: 2, requireIndependentChecker: true },
         separation: { checkerMustDifferFromBuilder: true, requireDifferentProviderFamilyFor: ["review"] },
       },
     });
@@ -328,6 +340,8 @@ describe("loadConfig", () => {
       routing: {
         deny: { providers: [], models: [] },
         limits: { maxEstimatedUsdPerRun: 20, maxAttemptsPerStage: 8 },
+        budgets: { maxEstimatedUsdPerRun: 20, maxEstimatedUsdPerStage: 10, allowUnknownCost: true, maxPaidFallbacksPerRun: 9 },
+        circuitBreakers: { maxSelectionFailures: 9, requireIndependentChecker: false },
         separation: { checkerMustDifferFromBuilder: false, requireDifferentProviderFamilyFor: [] },
       },
     });
@@ -336,6 +350,12 @@ describe("loadConfig", () => {
     expect(config.routing.deny.providers).toContain("denied-provider");
     expect(config.routing.deny.models).toContain("denied/model");
     expect(config.routing.limits).toEqual({ maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 });
+    expect(config.routing.budgets.maxEstimatedUsdPerRun).toBe(2);
+    expect(config.routing.budgets.maxEstimatedUsdPerStage).toBe(1);
+    expect(config.routing.budgets.allowUnknownCost).toBe(false);
+    expect(config.routing.budgets.maxPaidFallbacksPerRun).toBe(1);
+    expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(2);
+    expect(config.routing.circuitBreakers.requireIndependentChecker).toBe(true);
     expect(config.routing.separation.checkerMustDifferFromBuilder).toBe(true);
     expect(config.routing.separation.requireDifferentProviderFamilyFor).toContain("review");
   });
@@ -351,6 +371,9 @@ describe("loadConfig", () => {
     [{ routing: { profiles: { "p/m": { confidence: 1, scores: { coding: -1 } } } } }, "routing.profiles.p/m.scores.coding must be an integer between 0 and 10000"],
     [{ routing: { stages: { review: { minimumScores: { review: 10_001 } } } } }, "routing.stages.review.minimumScores.review must be an integer between 0 and 10000"],
     [{ routing: { limits: { maxEstimatedUsdPerRun: -1 } } }, "routing.limits.maxEstimatedUsdPerRun must be a non-negative number"],
+    [{ routing: { budgets: { maxEstimatedUsdPerRun: -1 } } }, "routing.budgets.maxEstimatedUsdPerRun must be a non-negative number"],
+    [{ routing: { evidence: { userStoreDir: "../outside" } } }, "routing.evidence.userStoreDir must be a relative path inside the user ai-orchestrator directory"],
+    [{ routing: { circuitBreakers: { maxSelectionFailures: 0 } } }, "routing.circuitBreakers.maxSelectionFailures must be a positive integer"],
   ])("rejects invalid capability routing config %#", (patch, message) => {
     const home = makeTempDir();
     const project = makeTempDir();

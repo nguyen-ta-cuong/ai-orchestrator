@@ -15,6 +15,7 @@ import {
   type ThinkingLevel,
 } from "../src/core/config.js";
 import { createPiRoutingPlan, type PiRoutingCandidate, type PiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
+import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
 import {
   debugPrompt,
   buildPrompt,
@@ -43,6 +44,7 @@ import {
   writeState,
   type RunPaths,
 } from "../src/lifecycle/artifacts.js";
+import { appendRoutingEvidenceEvent, readRoutingEvidenceEvents } from "../src/lifecycle/routingEvidenceStore.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -477,7 +479,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     runtime.remindedPhase = undefined;
     switch (runtime.state.phase) {
       case "defining":
-        await enterRoutedStage("define", "spec", ctx);
+        if (!(await enterRoutedStage("define", "spec", ctx))) return;
         activateArtifactTools();
         updateUi(ctx);
         sendPrompt(specPrompt(runtime.state.task, rel(runtime.paths.spec), undefined, runtime.specRevisionFeedback));
@@ -486,7 +488,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         await requestArtifactApproval(ctx, "spec");
         break;
       case "planning":
-        await enterRoutedStage("plan", "planner", ctx);
+        if (!(await enterRoutedStage("plan", "planner", ctx))) return;
         activateArtifactTools();
         updateUi(ctx);
         sendPrompt(taskPlanPrompt(readRequired(runtime.paths.spec, "spec"), rel(runtime.paths.plan), runtime.planRevisionFeedback ?? replanFeedback()));
@@ -498,13 +500,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         await enterBuild(ctx);
         break;
       case "verifying":
-        await enterRoutedStage("verify", "verifier", ctx);
+        if (!(await enterRoutedStage("verify", "verifier", ctx))) return;
         activateReadOnlyTools("verify_verdict");
         updateUi(ctx);
         sendPrompt(verifyPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
         break;
       case "reviewing":
-        await enterRoutedStage("review", "reviewer", ctx);
+        if (!(await enterRoutedStage("review", "reviewer", ctx))) return;
         activateReadOnlyTools("review_verdict");
         updateUi(ctx);
         sendPrompt(reviewPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan")));
@@ -522,7 +524,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         runtime.state.debugDiagnosisVerdictIndex = undefined;
         writeState(runtime.paths, runtime.state);
         writeFileSync(runtime.paths.debug, "");
-        await enterRoutedStage("debug", "debugger", ctx);
+        if (!(await enterRoutedStage("debug", "debugger", ctx))) return;
         activateReadOnlyTools("debug_diagnosis");
         updateUi(ctx);
         sendPrompt(debugPrompt(
@@ -534,7 +536,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         break;
       }
       case "shipping":
-        await enterRoutedStage("ship", "shipper", ctx);
+        if (!(await enterRoutedStage("ship", "shipper", ctx))) return;
         activateReadOnlyTools("ship_decision");
         updateUi(ctx);
         sendPrompt(shipPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.state.verdicts));
@@ -560,17 +562,17 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     restoreBuildTools();
-    await enterModelStage("build", "coder", ctx);
+    if (!(await enterModelStage("build", "coder", ctx))) return;
     updateUi(ctx);
     sendPrompt(buildPrompt(readRequired(runtime.paths.plan, "plan"), buildFeedback(), runtime.config.build.commitPerTask));
   }
 
-  async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<void> {
-    await enterModelStage(stage, role, ctx);
+  async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<boolean> {
+    return enterModelStage(stage, role, ctx);
   }
 
-  async function enterModelStage(stage: LifecycleRoutedStage | "build", role: RoleName, ctx: ExtensionContext): Promise<void> {
-    if (!runtime) return;
+  async function enterModelStage(stage: LifecycleRoutedStage | "build", role: RoleName, ctx: ExtensionContext): Promise<boolean> {
+    if (!runtime) return false;
     const available = ctx.modelRegistry.getAvailable();
     const plan = createPiRoutingPlan({
       config: runtime.config,
@@ -596,19 +598,28 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       const model = eligible ? ctx.modelRegistry.find(saved.provider, saved.model) : undefined;
       if (!model || !(await pi.setModel(model))) {
         await modelFailure(ctx, stage, [`saved selection ${saved.provider}/${saved.model} is unavailable or ineligible`]);
-        throw new Error(`saved model for ${stage} is unavailable`);
+        return false;
       }
       pi.setThinkingLevel(saved.thinking);
       runtime.state.modelRestored = false;
       writeState(runtime.paths, runtime.state);
       appendJournal(runtime.paths, `Model ${stage}: reused saved decision ${saved.routing!.decisionId} (${saved.provider}/${saved.model})`);
-      return;
+      return true;
     }
 
     runtime.attemptedModels = [];
     const attempts: { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[] = [];
     for (const candidate of plan.candidates) {
       const label = `${candidate.provider}/${candidate.model}`;
+      if (breakerBlocksCandidate(stage, candidate, attempts)) {
+        attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
+        continue;
+      }
+      const budgetAllowed = await enforceCandidateBudget(stage, candidate, ctx);
+      if (!budgetAllowed) {
+        persistRoutingTrace(stage, plan, attempts);
+        return false;
+      }
       runtime.attemptedModels.push(label);
       const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
       if (!model) {
@@ -621,15 +632,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
         continue;
       }
-      if (!runtime || runtime.state.runId !== expectedRunId || runtime.state.phase !== expectedPhase) return;
+      if (!runtime || runtime.state.runId !== expectedRunId || runtime.state.phase !== expectedPhase) return false;
       attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "selected" });
       pi.setThinkingLevel(candidate.thinking);
       recordModelSelection(stage, candidate, plan, attempts);
-      return;
+      return true;
     }
     persistRoutingTrace(stage, plan, attempts);
     await modelFailure(ctx, stage, runtime.attemptedModels.length > 0 ? runtime.attemptedModels : plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? []);
-    throw new Error(`no eligible locally configured model for ${stage}`);
+    return false;
   }
 
   function recordModelSelection(
@@ -669,6 +680,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     });
     writeState(runtime.paths, runtime.state);
     persistRoutingTrace(stage, plan, attempts, decisionId);
+    persistRoutingEvidence(stage, candidate, plan, decisionId);
     appendJournal(runtime.paths, `Model ${stage}: ${candidate.provider}/${candidate.model} (${candidate.thinking}) — ${reason}; ${separation}; ${plan.engine}`);
     persistMirror(runtime.state);
   }
@@ -688,6 +700,128 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       plan,
       attempts,
     });
+  }
+
+  async function enforceCandidateBudget(
+    stage: LifecycleRoutedStage | "build",
+    candidate: PiRoutingCandidate,
+    ctx: ExtensionContext,
+  ): Promise<boolean> {
+    if (!runtime) return false;
+    const estimate: RoutingCostEstimate = candidate.estimatedCostUsd === undefined
+      ? { status: "unknown", reason: "candidate cost metadata unavailable" }
+      : { status: "known", estimatedUsd: candidate.estimatedCostUsd };
+    const decision = enforceRoutingBudget({
+      stage,
+      estimate,
+      budgets: runtime.config.routing.budgets,
+      snapshot: routingBudgetSnapshot(),
+      unattended: runtime.automatic || !ctx.hasUI,
+    });
+    if (decision.allowed === true) return true;
+    if (decision.allowed === "ask") {
+      const confirmed = ctx.hasUI && await ctx.ui.confirm("Routing budget warning", `${decision.reason}\n\nContinue with ${candidate.provider}/${candidate.model}?`);
+      if (confirmed) return true;
+    }
+    await interruptRun(ctx, `Lifecycle ${stage} paused by routing budget: ${decision.reason}`);
+    return false;
+  }
+
+  function breakerBlocksCandidate(
+    stage: LifecycleRoutedStage | "build",
+    candidate: PiRoutingCandidate,
+    attempts: readonly { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[],
+  ): boolean {
+    if (!runtime) return false;
+    const failedAttempts = attempts.filter((attempt) => attempt.outcome !== "selected").length;
+    if (failedAttempts >= runtime.config.routing.circuitBreakers.maxSelectionFailures) return true;
+    const projectedFallbacks = routingBudgetSnapshot().paidFallbacks + failedAttempts;
+    if (projectedFallbacks > runtime.config.routing.budgets.maxPaidFallbacksPerRun) return true;
+    if (!runtime.config.routing.circuitBreakers.requireIndependentChecker || !isCheckerRoutingStage(stage)) return false;
+    const builder = [...runtime.state.modelSelections].reverse().find((selection) => selection.stage === "build");
+    return Boolean(builder && builder.provider === candidate.provider && builder.model === candidate.model);
+  }
+
+  function routingBudgetSnapshot(): RoutingBudgetSnapshot {
+    if (!runtime) {
+      return { estimatedRunUsd: 0, observedRunUsd: 0, estimatedDayUsd: 0, observedDayUsd: 0, paidFallbacks: 0, attemptsByStage: {} };
+    }
+    const events = readRoutingEvidenceEvents(runtime.paths.evidence).events;
+    const snapshot: RoutingBudgetSnapshot = {
+      estimatedRunUsd: 0,
+      observedRunUsd: 0,
+      estimatedDayUsd: 0,
+      observedDayUsd: 0,
+      paidFallbacks: runtime.state.modelSelections.reduce((sum, selection) => sum + (selection.routing?.fallbackCount ?? 0), 0),
+      attemptsByStage: {},
+    };
+    for (const event of events) {
+      if (typeof event.cost.estimatedUsd === "number") {
+        snapshot.estimatedRunUsd += event.cost.estimatedUsd;
+        snapshot.estimatedDayUsd += event.cost.estimatedUsd;
+      }
+      if (typeof event.cost.observedUsd === "number") {
+        snapshot.observedRunUsd += event.cost.observedUsd;
+        snapshot.observedDayUsd += event.cost.observedUsd;
+      }
+    }
+    for (const selection of runtime.state.modelSelections) {
+      snapshot.attemptsByStage[selection.stage] = (snapshot.attemptsByStage[selection.stage] ?? 0) + 1;
+    }
+    return snapshot;
+  }
+
+  function persistRoutingEvidence(
+    stage: LifecycleRoutedStage | "build",
+    candidate: PiRoutingCandidate,
+    plan: PiRoutingPlan,
+    decisionId: string,
+  ): void {
+    if (!runtime || !runtime.config.routing.evidence.enabled) return;
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      event: {
+        version: 1,
+        eventId: `${decisionId}:stage-started`,
+        runId: runtime.state.runId,
+        decisionId,
+        stage,
+        recordedAt: new Date().toISOString(),
+        policyVersion: plan.policyVersion,
+        profileVersion: plan.policyVersion,
+        task: {
+          workKind: plan.taskFeatures.workKind,
+          risk: plan.taskFeatures.risk,
+          languages: [...plan.taskFeatures.languages],
+          fileCount: plan.taskFeatures.fileCount,
+        },
+        selected: {
+          provider: candidate.provider,
+          model: candidate.model,
+          ...(candidate.family ? { family: candidate.family } : {}),
+        },
+        usage: {
+          inputTokens: "unknown",
+          outputTokens: "unknown",
+          cacheReadTokens: "unknown",
+          cacheWriteTokens: "unknown",
+        },
+        cost: {
+          estimatedUsd: candidate.estimatedCostUsd ?? "unknown",
+          observedUsd: "unknown",
+        },
+        outcome: {
+          type: "stage-started",
+          structuredToolCompliance: "unknown",
+          verdict: "unknown",
+          buildIteration: runtime.state.buildIterations,
+        },
+      },
+    });
+  }
+
+  function isCheckerRoutingStage(stage: LifecycleRoutedStage | "build"): boolean {
+    return stage === "verify" || stage === "debug" || stage === "review" || stage === "ship";
   }
 
   function routingEvidence() {

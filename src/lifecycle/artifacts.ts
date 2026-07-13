@@ -12,6 +12,7 @@ export interface RunPaths {
   state: string;
   journal: string;
   routing: string;
+  evidence: string;
 }
 
 export interface RoutingTraceRecord {
@@ -48,6 +49,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeFileSync(paths.debug, "");
       writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
       writeFileSync(paths.routing, "");
+      writeFileSync(paths.evidence, "");
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
       currentPointerWritten = true;
@@ -132,6 +134,7 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
     state: join(root, "state.json"),
     journal: join(root, "journal.md"),
     routing: join(root, "routing.jsonl"),
+    evidence: join(root, "evidence.jsonl"),
   };
 }
 
