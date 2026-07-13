@@ -452,7 +452,9 @@ function isRoutingSummary(value: unknown): boolean {
   const candidate = value as Record<string, unknown>;
   return typeof candidate.decisionId === "string" && candidate.decisionId.length > 0 &&
     (candidate.engine === "legacy" || candidate.engine === "capability-shadow" || candidate.engine === "capability") &&
-    typeof candidate.policyVersion === "string" && typeof candidate.taskFeaturesHash === "string" &&
+    typeof candidate.policyVersion === "string" &&
+    (candidate.profileVersion === undefined || typeof candidate.profileVersion === "string") &&
+    typeof candidate.taskFeaturesHash === "string" &&
     Number.isInteger(candidate.selectedRank) && (candidate.selectedRank as number) > 0 &&
     (candidate.score === undefined || typeof candidate.score === "number") &&
     (candidate.separation === "not-applicable" || candidate.separation === "different-model" || candidate.separation === "different-family") &&
