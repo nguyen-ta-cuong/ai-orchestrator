@@ -177,6 +177,31 @@ describe("lifecycle Pi extension safety", () => {
     expect(userEvents).toContain('"type":"stage-ended"');
   });
 
+  it("pauses a resumed run when its frozen routing policy changes", async () => {
+    const run = makeRun("building");
+    const configPath = join(run.cwd, ".ai-orchestrator.json");
+    const writeRoutingConfig = (coding: number) => writeFileSync(configPath, JSON.stringify({
+      routing: {
+        engine: "capability",
+        unknownCost: "allow",
+        profiles: { "invented/coder": { confidence: 9000, version: `v-${coding}`, scores: { coding } } },
+      },
+    }));
+    writeRoutingConfig(9500);
+    const models = [{ provider: "invented", id: "coder", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 16000 }];
+    const first = extensionHarness(run.cwd, models);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+
+    writeRoutingConfig(9000);
+    const resumed = extensionHarness(run.cwd, models);
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("routing policy changed");
+    expect(readState(run.paths)?.phase).toBe("building");
+    expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("pauses before model activation when a routing budget would be exceeded", async () => {
     const run = makeRun("building");
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
