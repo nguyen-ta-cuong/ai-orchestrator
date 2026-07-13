@@ -314,7 +314,7 @@ export function rankModels(request: RoutingRequest): RoutingDecision {
     });
   }
 
-  eligible.sort((left, right) => compareCandidates(left, right, request.policy.stages[request.stage].prefer));
+  eligible.sort((left, right) => compareCandidates(left, right, request.policy, request.stage));
   return {
     stage: request.stage,
     policyVersion: request.policy.version,
@@ -440,9 +440,10 @@ function scoreModel(
   const builder = latestBuildSelection(request.priorSelections);
   const family = profile.family ?? model.family;
   const diversity = builder && request.policy.separation.preferDifferentProviderFamily && family && builder.family && family !== builder.family ? 250 : 0;
+  const modeCostMultiplier = request.policy.mode === "quality" ? 0.25 : 1;
   const cost = estimatedCostUsd === undefined
-    ? request.policy.unknownCost === "penalize" ? -request.policy.unknownCostPenaltyBasisPoints : 0
-    : -Math.round(estimatedCostUsd * request.policy.costPenaltyBasisPointsPerUsd);
+    ? request.policy.unknownCost === "penalize" ? -Math.round(request.policy.unknownCostPenaltyBasisPoints * modeCostMultiplier) : 0
+    : -Math.round(estimatedCostUsd * request.policy.costPenaltyBasisPointsPerUsd * modeCostMultiplier);
 
   return [
     { name: "capability-fit", value: capabilityFit, detail: `weighted ${request.stage} capability fit` },
@@ -465,10 +466,26 @@ function estimateCost(model: DiscoveredModel, task: TaskFeatures): number | unde
   return (task.contextTokens * model.cost.input + task.expectedOutputTokens * model.cost.output) / 1_000_000;
 }
 
-function compareCandidates(left: RankedModelCandidate, right: RankedModelCandidate, prefer: readonly string[]): number {
+function compareCandidates(
+  left: RankedModelCandidate,
+  right: RankedModelCandidate,
+  policy: RoutingPolicy,
+  stage: RoutingStage,
+): number {
+  const stagePolicy = policy.stages[stage];
+  if (stagePolicy.pins.length > 0) {
+    const leftPinned = preferIndex(left.identity, stagePolicy.pins);
+    const rightPinned = preferIndex(right.identity, stagePolicy.pins);
+    if (leftPinned !== rightPinned) return leftPinned - rightPinned;
+  }
+  if (policy.mode === "economy") {
+    const leftCost = left.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
+    const rightCost = right.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
+    if (leftCost !== rightCost) return leftCost - rightCost;
+  }
   if (right.score !== left.score) return right.score - left.score;
-  const leftPreferred = preferIndex(left.identity, prefer);
-  const rightPreferred = preferIndex(right.identity, prefer);
+  const leftPreferred = preferIndex(left.identity, stagePolicy.prefer);
+  const rightPreferred = preferIndex(right.identity, stagePolicy.prefer);
   if (leftPreferred !== rightPreferred) return leftPreferred - rightPreferred;
   if (right.profile.confidence !== left.profile.confidence) return right.profile.confidence - left.profile.confidence;
   const leftCost = left.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
