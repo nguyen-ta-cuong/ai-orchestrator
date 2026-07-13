@@ -165,6 +165,12 @@ export function recommendRoutingPolicyChanges(
   options: { minimumSamples?: number } = {},
 ): RoutingPolicyRecommendation[] {
   const minimumSamples = options.minimumSamples ?? 10;
+  const finalStatusByRun = new Map<string, RoutingEvidenceFinalStatus>();
+  for (const event of events) {
+    if (event.outcome.type === "final-status" && event.outcome.finalRunStatus) {
+      finalStatusByRun.set(event.runId, event.outcome.finalRunStatus);
+    }
+  }
   const latestByDecision = new Map<string, RoutingEvidenceEvent>();
   for (const event of events) {
     if (event.outcome.type !== "stage-ended") continue;
@@ -192,7 +198,7 @@ export function recommendRoutingPolicyChanges(
       stats.count += 1;
       if (event.outcome.laterReversal) stats.reversals += 1;
       if (event.outcome.humanOverride) stats.overrides += 1;
-      const initiallySuccessful = event.outcome.verdict === "approve" || event.outcome.finalRunStatus === "done";
+      const initiallySuccessful = event.outcome.verdict === "approve" || event.outcome.finalRunStatus === "done" || finalStatusByRun.get(event.runId) === "done";
       if (initiallySuccessful && !event.outcome.laterReversal && !event.outcome.humanOverride) stats.successes += 1;
       if (typeof event.cost.observedUsd === "number") stats.cost += event.cost.observedUsd;
       modelStats.set(identity, stats);
