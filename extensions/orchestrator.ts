@@ -25,6 +25,7 @@ const WIDGET_KEY = "ai-orchestrator";
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
 const JUDGE_TOOLS = [...READ_ONLY_TOOLS, "judge_verdict"];
 const MUTATION_TOOLS = new Set(["edit", "write"]);
+const BUILD_TOOL_ALLOWLIST = new Set(["read", "grep", "find", "ls", "edit", "write"]);
 const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
 const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
 
@@ -1025,7 +1026,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   function activateBuildTools(): void {
-    pi.setActiveTools(state.toolsBeforeRun ?? pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict"));
+    const original = state.toolsBeforeRun ?? pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict");
+    pi.setActiveTools(original.filter((toolName) => BUILD_TOOL_ALLOWLIST.has(toolName)));
   }
 
   function restoreRunTools(source: RuntimeState): void {
