@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, realpathSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, parse, relative, resolve } from "node:path";
 import { validateRoutingEvidenceEvent, type RoutingEvidenceEvent } from "../core/routingEvidence.js";
 import type { RunPaths } from "./artifacts.js";
 
@@ -65,10 +65,11 @@ export function resolveUserEvidenceRoot(home = homedir(), configured = "routing-
     throw new Error("routing evidence user store must be inside the user ai-orchestrator directory");
   }
   const base = join(home, ".ai-orchestrator");
-  const root = join(base, ...normalizeRelativePath(configured).split("/"));
   mkdirSync(base, { recursive: true });
+  const realBase = realpathSync(base);
+  const root = join(realBase, ...normalizeRelativePath(configured).split("/"));
+  assertNoSymlinkComponents(root);
   if (existsSync(root)) {
-    const realBase = realpathSync(base);
     const realRoot = realpathSync(root);
     const inside = relative(realBase, realRoot);
     if (inside.length === 0 || inside.startsWith("..") || isAbsolute(inside)) {
@@ -83,12 +84,38 @@ function appendJsonLine(path: string, value: RoutingEvidenceEvent): void {
   if (Buffer.byteLength(line, "utf8") > MAX_EVIDENCE_LINE_BYTES) {
     throw new Error(`routing evidence event exceeds ${MAX_EVIDENCE_LINE_BYTES} bytes`);
   }
+  assertNoSymlinkComponents(path);
   mkdirSync(join(path, ".."), { recursive: true });
+  assertNoSymlinkComponents(path);
   if (existsSync(path)) {
     const existing = statSync(path);
     if (!existing.isFile()) throw new Error(`routing evidence path is not a file: ${path}`);
+    const duplicate = readFileSync(path, "utf8").split(/\r?\n/).some((existingLine) => {
+      if (!existingLine) return false;
+      try {
+        return (JSON.parse(existingLine) as { eventId?: unknown }).eventId === value.eventId;
+      } catch {
+        return false;
+      }
+    });
+    if (duplicate) return;
   }
   writeFileSync(path, `${line}\n`, { flag: "a" });
+}
+
+function assertNoSymlinkComponents(target: string): void {
+  const absolute = resolve(target);
+  const root = parse(absolute).root;
+  let current = root;
+  for (const part of absolute.slice(root.length).split(/[\\/]+/).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error(`routing evidence path must not contain symlinks: ${current}`);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
 }
 
 function normalizeRelativePath(value: string): string {
