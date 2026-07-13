@@ -255,17 +255,29 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
 
     if (loaded.state.modelRestored === false) {
-      const restored = await restoreOriginalModel(ctx, loaded.state);
-      writeState(loaded.paths, loaded.state);
-      if (!restored) {
+      const sessionLeaseOwner = randomUUID();
+      try {
+        acquireRunLease(loaded.paths, sessionLeaseOwner);
+      } catch {
         clearUi(ctx);
-        notify(ctx, `Lifecycle run ${loaded.state.runId} still needs original-model restoration. Fix model availability and use /lifecycle resume or /lifecycle-stop.`, "warning");
+        notify(ctx, `Lifecycle run ${loaded.state.runId} is executing in another Pi process; this session will not restore or mutate it.`, "warning");
         return;
       }
-      if (!isActivePhase(loaded.state.phase)) {
-        releaseRun(ctx.cwd, loadPiConfig(ctx.cwd).lifecycle.artifactsDir, loaded.state.runId);
-        clearUi(ctx);
-        return;
+      try {
+        const restored = await restoreOriginalModel(ctx, loaded.state);
+        writeState(loaded.paths, loaded.state);
+        if (!restored) {
+          clearUi(ctx);
+          notify(ctx, `Lifecycle run ${loaded.state.runId} still needs original-model restoration. Fix model availability and use /lifecycle resume or /lifecycle-stop.`, "warning");
+          return;
+        }
+        if (!isActivePhase(loaded.state.phase)) {
+          releaseRun(ctx.cwd, loadPiConfig(ctx.cwd).lifecycle.artifactsDir, loaded.state.runId);
+          clearUi(ctx);
+          return;
+        }
+      } finally {
+        releaseRunLease(loaded.paths, sessionLeaseOwner);
       }
     }
     clearUi(ctx);
