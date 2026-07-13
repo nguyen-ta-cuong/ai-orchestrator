@@ -36,6 +36,19 @@ describe("MCP capability routing", () => {
     });
   });
 
+  it("enforces deny, privacy, and cost policy on exact shadow routes", () => {
+    const config = routedConfig();
+    config.routing.engine = "capability-shadow";
+    config.roles.planner = { provider: "p1", model: "maker", thinking: "high" };
+    config.routing.deny.models = ["p1/maker"];
+    expect(() => resolveMcpRoute({ config, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") })).toThrow(/denied by hard routing policy/);
+
+    config.routing.deny.models = [];
+    config.mcp.models[0]!.cost = { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 };
+    config.routing.budgets.maxEstimatedUsdPerStage = 0.001;
+    expect(() => resolveMcpRoute({ config, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") })).toThrow(/estimated cost/);
+  });
+
   it("applies trusted MCP catalog privacy as a hard eligibility gate", () => {
     const config = routedConfig();
     config.mcp.models[0]!.privacy = "public";
