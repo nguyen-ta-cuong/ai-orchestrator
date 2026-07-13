@@ -242,6 +242,23 @@ describe("lifecycle Pi extension safety", () => {
     expect(readState(run.paths)?.modelSelections.at(-1)?.routing?.failureCategories).not.toContain("policy-migrated");
   });
 
+  it.each([
+    [{ rejectionFingerprints: ["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"] }, { repeatedRejectionFingerprintLimit: 2 }, "identical checker rejections"],
+    [{ buildEvidenceFingerprints: ["bbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbb"] }, { maxBuildPassesWithoutImprovement: 1 }, "unchanged evidence"],
+  ] as const)("pauses BUILD when a convergence circuit breaker trips %#", async (statePatch, breakerPatch, reason) => {
+    const run = makeRun("building");
+    const state = readState(run.paths)!;
+    Object.assign(state, statePatch);
+    writeState(run.paths, state);
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ routing: { circuitBreakers: breakerPatch } }));
+    const harness = extensionHarness(run.cwd);
+
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(readFileSync(run.paths.journal, "utf8")).toContain(reason);
+    expect(harness.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("pauses before model activation when a routing budget would be exceeded", async () => {
     const run = makeRun("building");
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
