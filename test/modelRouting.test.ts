@@ -191,6 +191,19 @@ describe("capability model routing", () => {
     expect(rankModels(request([architect, debuggerModel], profiles, { stage: "build", policy, task: bugTask })).eligible[0]?.identity.model).toBe("debugger");
   });
 
+  it("supports family pins and preferences", () => {
+    const familyA = model({ provider: "p", model: "a", family: "family-a" });
+    const familyB = model({ provider: "p", model: "b", family: "family-b" });
+    const profiles = { "p/a": profile(), "p/b": profile() };
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.stages.review.pins = ["family:family-b"];
+    expect(rankModels(request([familyA, familyB], profiles, { policy })).eligible.map((candidate) => candidate.identity.model)).toEqual(["b"]);
+
+    policy.stages.review.pins = [];
+    policy.stages.review.prefer = ["family:family-b"];
+    expect(rankModels(request([familyA, familyB], profiles, { policy })).eligible[0]?.identity.model).toBe("b");
+  });
+
   it("makes quality and economy modes behaviorally distinct while preserving pin order", () => {
     const expensive = model({ provider: "p", model: "strong", cost: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0 } });
     const cheap = model({ provider: "p", model: "cheap", cost: { input: 0.1, output: 0.1, cacheRead: 0, cacheWrite: 0 } });
