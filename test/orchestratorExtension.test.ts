@@ -22,6 +22,7 @@ describe("fast Pi capability routing", () => {
         unknownCost: "allow",
         profiles: {
           "invented/planner": { family: "architect", confidence: 9000, version: "test", scores: { architecture: 9500, coding: 6000, verification: 6000, review: 6000 } },
+          "invented/planner-backup": { family: "architect-backup", confidence: 9000, version: "test", scores: { architecture: 8500, coding: 6000, verification: 6000, review: 6000 } },
           "invented/coder": { family: "maker", confidence: 9000, version: "test", scores: { architecture: 6000, coding: 9500, verification: 6000, review: 6000 } },
           "invented/checker": { family: "checker", confidence: 9000, version: "test", scores: { architecture: 6000, coding: 6000, verification: 9500, review: 9500 } },
         },
@@ -49,7 +50,7 @@ describe("fast Pi capability routing", () => {
       exec: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })),
     };
     orchestratorExtension(pi as unknown as ExtensionAPI);
-    const models = ["planner", "coder", "checker"].map((id) => ({
+    const models = ["planner", "planner-backup", "coder", "checker"].map((id) => ({
       provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
     }));
     const ctx = {
@@ -71,6 +72,10 @@ describe("fast Pi capability routing", () => {
     await expect(events.get("tool_call")!({ toolName: "edit", input: {} }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "rm -rf src" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
+    await events.get("agent_end")!({ messages: [{ role: "assistant", stopReason: "error" }] }, ctx as unknown as ExtensionContext);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
+    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "planner-backup"]);
+
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
@@ -84,12 +89,13 @@ describe("fast Pi capability routing", () => {
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git diff --staged" } }, ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git reset --hard" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
-    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "coder", "checker"]);
+    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "planner-backup", "coder", "checker"]);
     const latest = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; modelSelections: Array<{ stage: string; model: string }> };
     expect(latest.phase).toBe("judging");
     expect(latest.modelSelections.map(({ stage, model }) => [stage, model])).toEqual([
-      ["plan", "planner"], ["build", "coder"], ["fast-judge", "checker"],
+      ["plan", "planner"], ["plan", "planner-backup"], ["build", "coder"], ["fast-judge", "checker"],
     ]);
+    expect((latest.modelSelections[0] as { failureCategories?: string[] }).failureCategories).toContain("provider-error");
     expect(activeTools).toContain("judge_verdict");
 
     setModel.mockImplementation(async (model: unknown) => (model as { id: string }).id !== "model");
