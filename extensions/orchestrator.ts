@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -59,6 +60,8 @@ interface RuntimeState extends OrchestratorState {
     profileVersion: string;
     task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
   }>;
+  rejectionFingerprints?: string[];
+  buildEvidenceFingerprints?: string[];
   lastUsage?: {
     inputTokens: number;
     outputTokens: number;
@@ -348,6 +351,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         ? { provider: String(ctx.model.provider), id: String(ctx.model.id), thinking: currentThinking }
         : undefined,
       toolsBeforeRun: pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict"),
+      rejectionFingerprints: [],
+      buildEvidenceFingerprints: [],
     };
     persist();
 
@@ -382,6 +387,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       judgeReminderSent: false,
       plannerReminderSent: false,
       latestJudgeFeedback: wasReplanning ? undefined : state.latestJudgeFeedback,
+      rejectionFingerprints: wasReplanning ? [] : state.rejectionFingerprints,
+      buildEvidenceFingerprints: wasReplanning ? [] : state.buildEvidenceFingerprints,
     };
     persist();
     updateUi(ctx);
@@ -449,6 +456,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
   async function enterCoding(ctx: ExtensionContext): Promise<void> {
     if (state.phase !== "coding") return;
+    const breaker = fastConvergenceBreakerReason();
+    if (breaker) {
+      await stopRun(ctx, `ai-orchestrator stopped by convergence circuit breaker: ${breaker}`);
+      return;
+    }
 
     activateBuildTools();
     const ok = await switchToRole("coder", ctx);
@@ -459,6 +471,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function handleCodeProduced(ctx: ExtensionContext): Promise<void> {
+    await recordFastBuildFingerprint(ctx);
+    if (state.phase !== "coding") return;
     persistFastStageOutcome("build", "unknown", "unknown");
     state = nextPhase(state, { type: "code_produced" }, loopConfig()) as RuntimeState;
     state.judgeReminderSent = false;
@@ -502,6 +516,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       throw new Error("judge phase ended without a verdict");
     }
 
+    if (verdict.verdict === "reject") {
+      state.rejectionFingerprints = [...(state.rejectionFingerprints ?? []), fastConvergenceFingerprint(`${verdict.reasons}\n${verdict.requiredFixes ?? ""}`)];
+      persist();
+    }
     persistFastStageOutcome("fast-judge", verdict.verdict, true);
     const stateForTransition: OrchestratorState = { ...state };
     state = nextPhase(
@@ -767,6 +785,44 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       pi.sendUserMessage(judgePrompt(state.task, state.plan ?? "", command), { deliverAs: "followUp" });
     }
     return true;
+  }
+
+  async function recordFastBuildFingerprint(ctx: ExtensionContext): Promise<void> {
+    const runId = state.runId;
+    const phase = state.phase;
+    const [diff, untracked] = await Promise.all([
+      pi.exec("git", ["diff", "--no-ext-diff", "--binary", "HEAD"], { timeout: 20_000, signal: ctx.signal }),
+      pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    if (state.runId !== runId || state.phase !== phase) return;
+    const evidence = `${diff.code}:${diff.stdout}\n${diff.stderr}\n${untracked.code}:${untracked.stdout}\n${untracked.stderr}`;
+    state.buildEvidenceFingerprints = [...(state.buildEvidenceFingerprints ?? []), fastConvergenceFingerprint(evidence)];
+    persist();
+  }
+
+  function fastConvergenceBreakerReason(): string | undefined {
+    if (!runtime) return undefined;
+    const rejectionCount = fastTrailingEqualCount(state.rejectionFingerprints ?? []);
+    if (rejectionCount >= runtime.config.routing.circuitBreakers.repeatedRejectionFingerprintLimit) {
+      return `${rejectionCount} identical judge rejections reached the configured limit; revise the plan with new evidence.`;
+    }
+    const unchangedBuilds = Math.max(0, fastTrailingEqualCount(state.buildEvidenceFingerprints ?? []) - 1);
+    if (unchangedBuilds >= runtime.config.routing.circuitBreakers.maxBuildPassesWithoutImprovement) {
+      return `${unchangedBuilds} consecutive coding passes produced unchanged evidence; inspect the diff and re-plan.`;
+    }
+    return undefined;
+  }
+
+  function fastTrailingEqualCount(values: readonly string[]): number {
+    const latest = values.at(-1);
+    if (!latest) return 0;
+    let count = 0;
+    for (let index = values.length - 1; index >= 0 && values[index] === latest; index -= 1) count += 1;
+    return count;
+  }
+
+  function fastConvergenceFingerprint(value: string): string {
+    return createHash("sha256").update(value.trim().replace(/\s+/g, " ").toLowerCase()).digest("hex").slice(0, 16);
   }
 
   async function fastRoutingEvidence(ctx: ExtensionContext): Promise<{
