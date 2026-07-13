@@ -41,7 +41,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       if (isActivePhase(activeState.phase)) {
         throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
       }
-      rmSync(currentRunPath(cwd, activeRegistry?.artifactsDir ?? artifactsDir), { force: true });
+      rmSync(currentRunPath(activeRegistry?.runCwd ?? cwd, activeRegistry?.artifactsDir ?? artifactsDir), { force: true });
       rmSync(registryPath, { force: true });
     } else if (existsSync(currentPath) || existsSync(registryPath)) {
       throw new Error("Lifecycle current pointer is invalid; explicit recovery is required");
@@ -63,7 +63,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
       mkdirSync(join(registryPath, ".."), { recursive: true });
       assertNoSymlinkComponents(registryPath);
-      writeFileSync(registryPath, `${JSON.stringify({ runId, artifactsDir: normalizeArtifactsDir(artifactsDir) })}\n`, { flag: "wx" });
+      writeFileSync(registryPath, `${JSON.stringify({ runId, artifactsDir: normalizeArtifactsDir(artifactsDir), runCwd: realpathSync(cwd) })}\n`, { flag: "wx" });
       registryWritten = true;
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
       currentPointerWritten = true;
@@ -84,8 +84,8 @@ export function currentRun(cwd: string, artifactsDir: string): { runId: string; 
     throw new Error("Lifecycle repository active-run registry is corrupt; explicit recovery is required");
   }
   if (registry) {
-    assertArtifactRootSafe(cwd, registry.artifactsDir);
-    return { runId: registry.runId, paths: pathsForRun(cwd, registry.artifactsDir, registry.runId) };
+    assertArtifactRootSafe(registry.runCwd, registry.artifactsDir);
+    return { runId: registry.runId, paths: pathsForRun(registry.runCwd, registry.artifactsDir, registry.runId) };
   }
   const currentPath = currentRunPath(cwd, artifactsDir);
   assertNoSymlinkComponents(currentPath);
@@ -211,21 +211,29 @@ function currentRunPath(cwd: string, artifactsDir: string): string {
 }
 
 function currentRunLockPath(cwd: string, _artifactsDir: string): string {
-  return join(realpathSync(cwd), ".ai-orchestrator", "current.lock");
+  return join(coordinationRoot(cwd), ".ai-orchestrator", "current.lock");
 }
 
 function repositoryActiveRunPath(cwd: string): string {
-  return join(realpathSync(cwd), ".ai-orchestrator", "active-run.json");
+  return join(coordinationRoot(cwd), ".ai-orchestrator", "active-run.json");
 }
 
-function readActiveRunRegistry(cwd: string): { runId: string; artifactsDir: string } | undefined {
+function coordinationRoot(cwd: string): string {
+  return resolveGitContext(cwd)?.worktreeRoot ?? realpathSync(cwd);
+}
+
+function readActiveRunRegistry(cwd: string): { runId: string; artifactsDir: string; runCwd: string } | undefined {
   const path = repositoryActiveRunPath(cwd);
   assertNoSymlinkComponents(path);
   if (!existsSync(path)) return undefined;
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { runId?: unknown; artifactsDir?: unknown };
+    const value = JSON.parse(readFileSync(path, "utf8")) as { runId?: unknown; artifactsDir?: unknown; runCwd?: unknown };
     if (typeof value.runId !== "string" || !isRunId(value.runId) || typeof value.artifactsDir !== "string") return undefined;
-    return { runId: value.runId, artifactsDir: normalizeArtifactsDir(value.artifactsDir) };
+    const root = coordinationRoot(cwd);
+    const runCwd = typeof value.runCwd === "string" ? realpathSync(value.runCwd) : root;
+    const contained = relative(root, runCwd);
+    if (contained.startsWith("..") || isAbsolute(contained)) return undefined;
+    return { runId: value.runId, artifactsDir: normalizeArtifactsDir(value.artifactsDir), runCwd };
   } catch {
     return undefined;
   }
@@ -234,7 +242,7 @@ function readActiveRunRegistry(cwd: string): { runId: string; artifactsDir: stri
 function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId: string): boolean {
   const registry = readActiveRunRegistry(cwd);
   if (registry && registry.runId !== runId) return false;
-  const currentPath = currentRunPath(cwd, registry?.artifactsDir ?? artifactsDir);
+  const currentPath = currentRunPath(registry?.runCwd ?? cwd, registry?.artifactsDir ?? artifactsDir);
   assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath) || readFileSync(currentPath, "utf8").trim() !== runId) {
     return false;
@@ -266,7 +274,7 @@ function gitExcludePatterns(cwd: string, worktreeRoot: string, artifactsDir: str
   const realWorktreeRoot = realpathSync(worktreeRoot);
   const artifactRoot = join(realCwd, ...normalized.split("/"));
   const relativeArtifactRoot = relative(realWorktreeRoot, artifactRoot);
-  const coordinatorRoot = relative(realWorktreeRoot, join(realCwd, ".ai-orchestrator"));
+  const coordinatorRoot = relative(realWorktreeRoot, join(coordinationRoot(cwd), ".ai-orchestrator"));
   const coordinatorPatterns = coordinatorRoot.length > 0 && !coordinatorRoot.startsWith("..") && !isAbsolute(coordinatorRoot)
     ? ["active-run.json", "current.lock"].map((name) => `/${gitIgnorePath([...coordinatorRoot.split(/[\\/]+/), name])}`)
     : [];
@@ -299,7 +307,7 @@ function resolveGitContext(cwd: string): { excludePath: string; worktreeRoot: st
     if (gitPath.length > 0 && worktreeRoot.length > 0) {
       return {
         excludePath: isAbsolute(gitPath) ? gitPath : join(cwd, gitPath),
-        worktreeRoot,
+        worktreeRoot: realpathSync(worktreeRoot),
       };
     }
   } catch {
@@ -307,7 +315,7 @@ function resolveGitContext(cwd: string): { excludePath: string; worktreeRoot: st
   }
 
   const gitDir = resolveGitDir(cwd);
-  return gitDir ? { excludePath: join(gitDir, "info", "exclude"), worktreeRoot: cwd } : undefined;
+  return gitDir ? { excludePath: join(gitDir, "info", "exclude"), worktreeRoot: realpathSync(cwd) } : undefined;
 }
 
 function resolveGitDir(cwd: string): string | undefined {
