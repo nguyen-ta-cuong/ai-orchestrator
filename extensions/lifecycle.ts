@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -149,6 +150,22 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         ? `Routing recommendations (report only; no policy was changed):\n\n${JSON.stringify(recommendations, null, 2)}`
         : `No routing recommendation met the ${config.routing.evidence.minRecommendationSamples}-sample threshold across ${read.events.length} valid events.`;
       pi.sendMessage({ customType: ENTRY_TYPE, content, display: true, details: { recommendations, warnings: read.warnings } }, { triggerTurn: false });
+    },
+  });
+
+  pi.registerCommand("lifecycle-routing-apply", {
+    description: "Explicitly apply one report recommendation to trusted user preferences",
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle();
+      await applyRoutingRecommendation(args, ctx);
+    },
+  });
+
+  pi.registerCommand("lifecycle-routing-rollback", {
+    description: "Rollback a previously applied routing recommendation by id",
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle();
+      await rollbackRoutingRecommendation(args, ctx);
     },
   });
 
@@ -431,6 +448,104 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         await handler(args, ctx);
       },
     });
+  }
+
+  async function applyRoutingRecommendation(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const index = Number.parseInt(args.trim(), 10) - 1;
+    if (!Number.isInteger(index) || index < 0) {
+      notify(ctx, "Usage: /lifecycle-routing-apply <1-based recommendation number>", "error");
+      return;
+    }
+    const config = loadPiConfig(ctx.cwd);
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir);
+    const events = readRoutingEvidenceEvents(join(userStoreRoot, "events.jsonl")).events;
+    const recommendations = recommendRoutingPolicyChanges(events, { minimumSamples: config.routing.evidence.minRecommendationSamples });
+    const recommendation = recommendations[index];
+    if (!recommendation || recommendation.recommendedChange.kind !== "prefer-model") {
+      notify(ctx, "That bounded prefer-model recommendation is no longer available; run /lifecycle-routing-report again.", "error");
+      return;
+    }
+    if (!ctx.hasUI || !(await ctx.ui.confirm(
+      "Apply routing recommendation to trusted user config?",
+      `${recommendation.expectedTradeoff}\n\nThis writes only routing.stages.${recommendation.stage}.prefer in ~/.ai-orchestrator/config.json and creates a rollback record.`,
+    ))) return;
+
+    const configPath = join(homedir(), ".ai-orchestrator", "config.json");
+    const raw = readUserConfigObject(configPath);
+    const routing = objectChild(raw, "routing");
+    const stages = objectChild(routing, "stages");
+    const stage = objectChild(stages, recommendation.stage);
+    const previousPrefer = Array.isArray(stage.prefer) ? stage.prefer.filter((value): value is string => typeof value === "string") : [];
+    const identity = `${recommendation.recommendedChange.provider}/${recommendation.recommendedChange.model}`;
+    const appliedPrefer = [identity, ...previousPrefer.filter((value) => value !== identity)];
+    stage.prefer = appliedPrefer;
+    const previousVersion = typeof routing.version === "string" ? routing.version : undefined;
+    const id = `${Date.now()}-${randomUUID().slice(0, 8)}`;
+    routing.version = `recommendation-${id}`;
+    writeUserJson(configPath, raw);
+    writeUserJson(join(userStoreRoot, "recommendations", `${id}.json`), {
+      version: 1, id, status: "applied", appliedAt: new Date().toISOString(), stage: recommendation.stage,
+      identity, previousPrefer, appliedPrefer, previousVersion, appliedVersion: routing.version,
+    });
+    notify(ctx, `Applied routing recommendation ${id}. Roll back with /lifecycle-routing-rollback ${id}.`, "info");
+  }
+
+  async function rollbackRoutingRecommendation(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const id = args.trim();
+    if (!/^\d+-[a-f0-9-]{8}$/i.test(id)) {
+      notify(ctx, "Usage: /lifecycle-routing-rollback <recommendation-id>", "error");
+      return;
+    }
+    const config = loadPiConfig(ctx.cwd);
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir);
+    const recordPath = join(userStoreRoot, "recommendations", `${id}.json`);
+    const record = readUserConfigObject(recordPath) as Record<string, unknown>;
+    if (record.status !== "applied" || typeof record.stage !== "string" || !Array.isArray(record.previousPrefer) || !Array.isArray(record.appliedPrefer)) {
+      notify(ctx, `Recommendation ${id} is unavailable or already rolled back.`, "error");
+      return;
+    }
+    if (!ctx.hasUI || !(await ctx.ui.confirm("Rollback routing recommendation?", `Restore the previous trusted user preference list for ${record.stage}?`))) return;
+    const configPath = join(homedir(), ".ai-orchestrator", "config.json");
+    const raw = readUserConfigObject(configPath);
+    const routing = objectChild(raw, "routing");
+    const stages = objectChild(routing, "stages");
+    const stage = objectChild(stages, record.stage);
+    if (JSON.stringify(stage.prefer ?? []) !== JSON.stringify(record.appliedPrefer)) {
+      notify(ctx, "Current user preferences changed after application; refusing an unsafe automatic rollback.", "error");
+      return;
+    }
+    stage.prefer = record.previousPrefer;
+    if (typeof record.previousVersion === "string") routing.version = record.previousVersion;
+    else delete routing.version;
+    writeUserJson(configPath, raw);
+    writeUserJson(recordPath, { ...record, status: "rolled-back", rolledBackAt: new Date().toISOString() });
+    notify(ctx, `Rolled back routing recommendation ${id}.`, "info");
+  }
+
+  function readUserConfigObject(path: string): Record<string, unknown> {
+    if (!existsSync(path)) return {};
+    if (lstatSync(path).isSymbolicLink()) throw new Error(`Refusing symlinked user policy file: ${path}`);
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`User policy file must contain a JSON object: ${path}`);
+    return parsed as Record<string, unknown>;
+  }
+
+  function objectChild(parent: Record<string, unknown>, key: string): Record<string, unknown> {
+    const current = parent[key];
+    if (current && typeof current === "object" && !Array.isArray(current)) return current as Record<string, unknown>;
+    const created: Record<string, unknown> = {};
+    parent[key] = created;
+    return created;
+  }
+
+  function writeUserJson(path: string, value: Record<string, unknown>): void {
+    const directory = join(path, "..");
+    mkdirSync(directory, { recursive: true });
+    if (lstatSync(directory).isSymbolicLink()) throw new Error(`Refusing symlinked user policy directory: ${directory}`);
+    if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw new Error(`Refusing symlinked user policy file: ${path}`);
+    const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+    renameSync(temporary, path);
   }
 
   async function startPipeline(args: string, ctx: ExtensionCommandContext): Promise<void> {
