@@ -59,6 +59,7 @@ interface RuntimeState extends OrchestratorState {
     decisionId: string;
     profileVersion: string;
     task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
+    selectedAt: string;
   }>;
   rejectionFingerprints?: string[];
   buildEvidenceFingerprints?: string[];
@@ -741,6 +742,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
           languages: [...plan.taskFeatures.languages],
           fileCount: plan.taskFeatures.fileCount,
         },
+        selectedAt: new Date().toISOString(),
       };
       state = { ...state, modelSelections: [...(state.modelSelections ?? []), selection] };
       persist();
@@ -872,6 +874,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       profileVersion: selection.profileVersion,
       task: selection.task,
       selected: { provider: selection.provider, model: selection.model, ...(selection.family ? { family: selection.family } : {}) },
+      durationMs: "unknown",
+      fallbackCount: selection.fallbackCount,
       usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
       cost: { estimatedUsd: selection.estimatedCostUsd ?? "unknown", observedUsd: "unknown" },
       outcome: { type: "stage-started", structuredToolCompliance: "unknown", verdict: "unknown", buildIteration: state.coderIterations },
@@ -911,6 +915,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       profileVersion: selection.profileVersion,
       task: selection.task,
       selected: { provider: selection.provider, model: selection.model, ...(selection.family ? { family: selection.family } : {}) },
+      durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+      fallbackCount: selection.fallbackCount,
+      ...(verdict === "reject" ? { rejectionCategory: `${stage}-reject` } : {}),
       usage: {
         inputTokens: usage?.inputTokens ?? "unknown",
         outputTokens: usage?.outputTokens ?? "unknown",
