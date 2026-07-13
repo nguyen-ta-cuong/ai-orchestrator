@@ -444,13 +444,13 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     typeof candidate.phase === "string" &&
     LIFECYCLE_PHASES.has(candidate.phase as LifecyclePhase) &&
     typeof candidate.task === "string" &&
-    typeof candidate.buildIterations === "number" &&
-    typeof candidate.consecutiveRejections === "number" &&
+    typeof candidate.buildIterations === "number" && Number.isSafeInteger(candidate.buildIterations) && candidate.buildIterations >= 0 &&
+    typeof candidate.consecutiveRejections === "number" && Number.isSafeInteger(candidate.consecutiveRejections) && candidate.consecutiveRejections >= 0 &&
     Array.isArray(candidate.verdicts) &&
     candidate.verdicts.every(isLifecycleVerdict) &&
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
-    (candidate.routingPolicyVersion === undefined || typeof candidate.routingPolicyVersion === "string") &&
+    (candidate.routingPolicyVersion === undefined || (typeof candidate.routingPolicyVersion === "string" && candidate.routingPolicyVersion.length > 0)) &&
     (candidate.debugPath === undefined || typeof candidate.debugPath === "string") &&
     (candidate.debugDiagnosisVerdictIndex === undefined ||
       (Number.isInteger(candidate.debugDiagnosisVerdictIndex) && candidate.debugDiagnosisVerdictIndex >= 0)) &&
