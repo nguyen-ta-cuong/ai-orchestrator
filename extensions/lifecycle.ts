@@ -362,8 +362,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }),
       async execute(_id, params) {
         requireToolPhase("verifying", "verify_verdict");
-        runtime!.pendingVerdict = { kind: "verify", ...params };
-        persistMirror(runtime!.state);
+        persistPendingCheckerVerdict("verifying", { kind: "verify", ...params });
         return { content: [{ type: "text", text: `Recorded VERIFY verdict: ${params.verdict}` }], details: params, terminate: true };
       },
     });
@@ -381,8 +380,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }),
       async execute(_id, params) {
         requireToolPhase("reviewing", "review_verdict");
-        runtime!.pendingVerdict = { kind: "review", ...params };
-        persistMirror(runtime!.state);
+        persistPendingCheckerVerdict("reviewing", { kind: "review", ...params });
         return { content: [{ type: "text", text: `Recorded REVIEW verdict: ${params.verdict}` }], details: params, terminate: true };
       },
     });
@@ -428,16 +426,31 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }),
       async execute(_id, params) {
         requireToolPhase("shipping", "ship_decision");
-        runtime!.pendingVerdict = {
+        persistPendingCheckerVerdict("shipping", {
           kind: "ship",
           verdict: params.decision === "go" ? "approve" : "reject",
           reasons: params.report,
           requiredFixes: params.blockers,
-        };
-        persistMirror(runtime!.state);
+        });
         return { content: [{ type: "text", text: `Recorded SHIP decision: ${params.decision}` }], details: params, terminate: true };
       },
     });
+  }
+
+  function persistPendingCheckerVerdict(
+    phase: "verifying" | "reviewing" | "shipping",
+    verdict: PendingVerdict,
+  ): void {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    const reasons = verdict.reasons.trim();
+    const requiredFixes = verdict.requiredFixes?.trim();
+    if (!reasons) throw new Error("checker verdict reasons must be non-empty");
+    if (verdict.verdict === "reject" && !requiredFixes) throw new Error("checker rejection requires non-empty requiredFixes");
+    runtime.pendingVerdict = { ...verdict, reasons, ...(requiredFixes ? { requiredFixes } : {}) };
+    runtime.state.pendingCheckerVerdict = { phase, ...runtime.pendingVerdict };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `${verdict.kind.toUpperCase()} structured verdict checkpointed`);
+    persistMirror(runtime.state);
   }
 
   function registerStageCommand(
@@ -792,7 +805,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function runCurrentPhase(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     assertRunPathsSafe(runtime.paths);
-    runtime.pendingVerdict = undefined;
+    const persistedVerdict = runtime.state.pendingCheckerVerdict;
+    runtime.pendingVerdict = persistedVerdict?.phase === runtime.state.phase
+      ? { kind: persistedVerdict.kind, verdict: persistedVerdict.verdict, reasons: persistedVerdict.reasons, requiredFixes: persistedVerdict.requiredFixes }
+      : undefined;
     runtime.pendingDiagnosis = undefined;
     runtime.remindedPhase = undefined;
     switch (runtime.state.phase) {
@@ -820,6 +836,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         await enterBuild(ctx);
         break;
       case "verifying": {
+        if (runtime.pendingVerdict?.kind === "verify") {
+          await checkerStageEnded(ctx, "verify");
+          break;
+        }
         const spec = readRequired(runtime.paths.spec, "spec");
         const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("verify", "verifier", ctx))) return;
@@ -829,6 +849,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         break;
       }
       case "reviewing": {
+        if (runtime.pendingVerdict?.kind === "review") {
+          await checkerStageEnded(ctx, "review");
+          break;
+        }
         const spec = readRequired(runtime.paths.spec, "spec");
         const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("review", "reviewer", ctx))) return;
@@ -865,6 +889,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         break;
       }
       case "shipping": {
+        if (runtime.pendingVerdict?.kind === "ship") {
+          await checkerStageEnded(ctx, "ship");
+          break;
+        }
         const spec = readRequired(runtime.paths.spec, "spec");
         const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("ship", "shipper", ctx))) return;
@@ -1496,6 +1524,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }, `${stage.toUpperCase()} ${verdict.verdict}: ${truncate(verdict.reasons, 160)}`, ctx);
 
     if (!runtime) return;
+    runtime.state.pendingCheckerVerdict = undefined;
+    writeState(runtime.paths, runtime.state);
     if (runtime.state.phase === "awaiting_ship_approval") {
       await requestShipApproval(ctx);
     } else if (runtime.state.phase === "finalizing") {
