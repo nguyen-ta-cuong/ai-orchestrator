@@ -432,6 +432,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   }
 
   async function startPipeline(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before starting lifecycle.", "error");
       return;
@@ -466,6 +470,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   }
 
   async function startSpec(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before starting lifecycle.", "error");
       return;
@@ -545,6 +553,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   }
 
   async function resumeRun(ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before resuming lifecycle.", "error");
       return;
@@ -591,6 +603,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     expected: LifecyclePhase | readonly LifecyclePhase[],
     ctx: ExtensionCommandContext,
   ): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before running a lifecycle stage.", "error");
       return;
