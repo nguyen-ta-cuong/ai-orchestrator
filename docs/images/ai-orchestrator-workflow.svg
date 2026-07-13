@@ -34,7 +34,7 @@
       .stage-copy { fill: #aab9ca; font: 400 15px Inter, ui-sans-serif, system-ui, sans-serif; }
       .label { fill: #9fb0c3; font: 600 15px Inter, ui-sans-serif, system-ui, sans-serif; }
       .feature-title { fill: #f8fafc; font: 700 16px Inter, ui-sans-serif, system-ui, sans-serif; }
-      .feature-scope { fill: #7dd3fc; font: 700 13px Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: 1px; }
+      .feature-scope { fill: #7dd3fc; font: 700 15px Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: 1px; }
       .feature-copy { fill: #aab9ca; font: 400 16px Inter, ui-sans-serif, system-ui, sans-serif; }
       .footer { fill: #cbd5e1; font: 600 16px Inter, ui-sans-serif, system-ui, sans-serif; }
       .panel { fill: #0d1c2e; stroke: #29435f; stroke-width: 1.5; }
