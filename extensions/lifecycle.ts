@@ -1357,14 +1357,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const runId = runtime.state.runId;
     if (runtime.state.finalization?.commitSha) return "committed";
     if (runtime.config.ship.commit === "never") return "skipped";
-    const shouldCommit = ctx.hasUI && await ctx.ui.confirm(
-      "Commit changes",
-      runtime.config.ship.commit === "auto"
-        ? "Commit policy is auto, but this action still requires explicit confirmation. Commit now?"
-        : "Commit the lifecycle changes now?",
-    );
-    if (!ownsRun(runId, "finalizing")) return "failed";
-    if (!shouldCommit) return "skipped";
+    const checkpointed = Boolean(runtime.state.finalization?.commitBaseSha && runtime.state.finalization.commitMessage);
+    if (checkpointed) {
+      const recovered = await reconcilePendingCommit(ctx);
+      if (recovered !== "pending") return recovered;
+    }
     if (!runtime.state.baselinePaths || !runtime.state.baselineStagedPaths) {
       notify(ctx, "Cannot safely attribute files for this older run; commit skipped.", "error");
       return "failed";
@@ -1385,6 +1382,29 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, "No lifecycle-attributable source files were available to commit.", "info");
       return "skipped";
     }
+    if (!checkpointed) {
+      const shouldCommit = ctx.hasUI && await ctx.ui.confirm(
+        "Commit lifecycle changes",
+        `${runtime.config.ship.commit === "auto" ? "Commit policy is auto, but explicit confirmation is still required.\n\n" : ""}Files:\n${files.map((file) => `- ${file}`).join("\n")}\n\nCommit now?`,
+      );
+      if (!ownsRun(runId, "finalizing")) return "failed";
+      if (!shouldCommit) return "skipped";
+      const revalidated = await changedFiles(ctx);
+      if (!sameStringSet(files, revalidated)) {
+        notify(ctx, "Working-tree manifest changed after confirmation; commit was not attempted.", "error");
+        return "failed";
+      }
+      const base = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+      if (base.code !== 0 || !base.stdout.trim()) {
+        notify(ctx, `Could not checkpoint pre-commit HEAD: ${base.stderr || base.stdout}`, "error");
+        return "failed";
+      }
+      const message = `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
+      runtime.state.finalization = { ...runtime.state.finalization, commitBaseSha: base.stdout.trim(), commitMessage: message };
+      writeState(runtime.paths, runtime.state);
+      appendJournal(runtime.paths, `Commit intent checkpointed at ${base.stdout.trim()} for: ${files.join(", ")}`);
+      persistMirror(runtime.state);
+    }
     for (const file of files) {
       const result = await pi.exec("git", ["add", "--", file], { timeout: 10_000, signal: ctx.signal });
       if (result.code !== 0) {
@@ -1392,7 +1412,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         return "failed";
       }
     }
-    const message = `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
+    const message = runtime.state.finalization?.commitMessage ?? `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
     const commit = await pi.exec("git", ["commit", "-m", message], { timeout: 30_000, signal: ctx.signal });
     if (commit.code !== 0) {
       notify(ctx, `git commit failed: ${commit.stderr || commit.stdout}`, "error");
@@ -1410,22 +1430,66 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     return "committed";
   }
 
+  async function reconcilePendingCommit(ctx: ExtensionContext): Promise<"committed" | "pending" | "failed"> {
+    if (!runtime?.state.finalization?.commitBaseSha || !runtime.state.finalization.commitMessage) return "pending";
+    const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    if (head.code !== 0 || !head.stdout.trim()) return "failed";
+    const currentHead = head.stdout.trim();
+    if (currentHead === runtime.state.finalization.commitBaseSha) return "pending";
+    const [parent, subject] = await Promise.all([
+      pi.exec("git", ["rev-parse", "HEAD^"], { timeout: 10_000, signal: ctx.signal }),
+      pi.exec("git", ["log", "-1", "--format=%s"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    if (parent.code !== 0 || subject.code !== 0 ||
+      parent.stdout.trim() !== runtime.state.finalization.commitBaseSha ||
+      subject.stdout.trim() !== runtime.state.finalization.commitMessage) {
+      notify(ctx, "HEAD changed after the saved commit checkpoint but does not match the lifecycle commit; explicit recovery is required.", "error");
+      return "failed";
+    }
+    runtime.state.finalization = { ...runtime.state.finalization, commitSha: currentHead };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Recovered committed SHA ${currentHead} from saved finalization intent`);
+    persistMirror(runtime.state);
+    return "committed";
+  }
+
+  function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+    return left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index]);
+  }
+
   async function maybeOpenPr(ctx: ExtensionContext): Promise<"opened" | "skipped" | "failed"> {
     if (!runtime) return "failed";
     const runId = runtime.state.runId;
     if (runtime.state.finalization?.prUrl) return "opened";
     if (runtime.config.ship.openPr === "never") return "skipped";
-    const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
-    if (!ownsRun(runId, "finalizing")) return "failed";
-    if (!confirmed) return "skipped";
+    const checkpointedHead = runtime.state.finalization?.prHead;
+    if (checkpointedHead) {
+      const existing = await pi.exec("gh", ["pr", "view", checkpointedHead, "--json", "url", "--jq", ".url"], { timeout: 30_000, signal: ctx.signal });
+      if (existing.code === 0 && existing.stdout.trim()) {
+        runtime.state.finalization = { ...runtime.state.finalization, prUrl: existing.stdout.trim() };
+        writeState(runtime.paths, runtime.state);
+        appendJournal(runtime.paths, `Recovered pull request: ${existing.stdout.trim()}`);
+        persistMirror(runtime.state);
+        return "opened";
+      }
+    } else {
+      const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
+      if (!ownsRun(runId, "finalizing")) return "failed";
+      if (!confirmed) return "skipped";
+    }
     const branch = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, signal: ctx.signal });
     const localHead = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
     const upstreamHead = await pi.exec("git", ["rev-parse", "@{upstream}"], { timeout: 10_000, signal: ctx.signal });
     if (branch.code !== 0 || !branch.stdout.trim() || branch.stdout.trim() === "HEAD" ||
+      (checkpointedHead !== undefined && branch.stdout.trim() !== checkpointedHead) ||
       localHead.code !== 0 || upstreamHead.code !== 0 || localHead.stdout.trim() !== upstreamHead.stdout.trim()) {
       notify(ctx, "Refusing to open a PR until the current branch is explicitly pushed and its upstream matches HEAD.", "error");
       return "failed";
     }
+    runtime.state.finalization = { ...runtime.state.finalization, prHead: branch.stdout.trim() };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Pull-request intent checkpointed for ${branch.stdout.trim()}`);
+    persistMirror(runtime.state);
     const result = await pi.exec("gh", ["pr", "create", "--fill", "--head", branch.stdout.trim()], { timeout: 60_000, signal: ctx.signal });
     if (result.code !== 0) {
       notify(ctx, `gh pr create failed: ${result.stderr || result.stdout}`, "error");
