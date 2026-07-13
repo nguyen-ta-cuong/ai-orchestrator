@@ -4,6 +4,7 @@ export type RoutingStage = "define" | "plan" | "build" | "verify" | "debug" | "r
 export type TaskRisk = "low" | "medium" | "high";
 export type ProfileProvenance = "user" | "project" | "builtin" | "observed" | "inferred";
 export type RoutingMode = "quality" | "balanced" | "economy" | "pinned" | "custom";
+export type ModelPrivacy = "local" | "private" | "public" | "unknown";
 
 export interface ModelCost {
   input: number;
@@ -25,6 +26,7 @@ export interface DiscoveredModel {
   contextWindow: number;
   maxOutputTokens: number;
   cost?: ModelCost;
+  privacy?: ModelPrivacy;
 }
 
 export interface ModelCapabilityScores {
@@ -98,6 +100,10 @@ export interface RoutingPolicy {
   unknownCostPenaltyBasisPoints: number;
   confidenceBonusBasisPoints: number;
   costPenaltyBasisPointsPerUsd: number;
+  privacy: {
+    allowed: readonly Exclude<ModelPrivacy, "unknown">[];
+    allowUnknown: boolean;
+  };
   deny: {
     providers: readonly string[];
     models: readonly string[];
@@ -163,6 +169,7 @@ export type ExclusionCode =
   | "reasoning-required"
   | "cost-unknown"
   | "cost-limit-exceeded"
+  | "privacy-not-allowed"
   | "same-builder-model"
   | "same-builder-family";
 
@@ -242,6 +249,7 @@ export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   unknownCostPenaltyBasisPoints: 750,
   confidenceBonusBasisPoints: 500,
   costPenaltyBasisPointsPerUsd: 100,
+  privacy: { allowed: ["local", "private", "public"], allowUnknown: true },
   deny: { providers: [], models: [], families: [] },
   separation: {
     checkerMustDifferFromBuilder: true,
@@ -385,6 +393,11 @@ function exclusionFor(
   const identityText = `${model.provider}/${model.model}`;
 
   if (!model.callable) return excluded("not-callable", `${identityText} is not callable on this surface`);
+  const privacy = model.privacy ?? "unknown";
+  if ((privacy === "unknown" && !policy.privacy.allowUnknown) ||
+    (privacy !== "unknown" && !policy.privacy.allowed.includes(privacy))) {
+    return excluded("privacy-not-allowed", `${identityText} privacy class ${privacy} is not allowed by policy`);
+  }
   if (policy.deny.providers.includes(model.provider)) return excluded("denied-provider", `provider ${model.provider} is denied by policy`);
   if (policy.deny.models.includes(identityText)) return excluded("denied-model", `${identityText} is denied by policy`);
   const family = profile?.family ?? model.family;
