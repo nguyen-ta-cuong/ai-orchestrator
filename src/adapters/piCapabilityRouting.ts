@@ -22,6 +22,7 @@ export interface PiRoutingCandidate {
   rank: number;
   score?: number;
   estimatedCostUsd?: number;
+  profileVersion?: string;
   reason: string;
 }
 
@@ -125,6 +126,7 @@ function rankedCandidate(candidate: RankedModelCandidate, index: number): PiRout
     rank: index + 1,
     score: candidate.score,
     ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
+    profileVersion: candidate.profile.version,
     reason: `${capability?.detail ?? "capability fit"}; score ${candidate.score}; profile ${candidate.profile.provenance}/${candidate.profile.version}; ${candidate.thinkingReason}`,
   };
 }
