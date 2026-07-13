@@ -162,6 +162,36 @@ describe("lifecycle Pi extension safety", () => {
     expect(existsSync(join(cwd, ".ai-orchestrator.json"))).toBe(false);
   });
 
+  it("applies and rolls back a confirmed versioned routing recommendation", async () => {
+    const { cwd } = makeRun("planning");
+    const store = join(cwd, "home", ".ai-orchestrator", "routing-evidence");
+    mkdirSync(store, { recursive: true });
+    const events = Array.from({ length: 10 }, (_, index) => ({
+      version: 1, eventId: `recommend-${index}`, runId: `run-${index}`, decisionId: `decision-${index}`,
+      stage: "build", recordedAt: new Date().toISOString(), policyVersion: "policy-v1", profileVersion: "profiles-v1",
+      task: { workKind: "feature", risk: "medium", languages: ["typescript"], fileCount: 1 },
+      selected: { provider: "p", model: index < 7 ? "strong" : "weak" },
+      usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      cost: { estimatedUsd: 0.01, observedUsd: 0.01 },
+      outcome: { type: "stage-ended", verdict: index < 7 ? "approve" : "reject", finalRunStatus: index < 7 ? "done" : "failed", buildIteration: 1 },
+    }));
+    writeFileSync(join(store, "events.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    const harness = extensionHarness(cwd);
+
+    await harness.commands.get("lifecycle-routing-apply")!("1", harness.ctx);
+    const userConfigPath = join(cwd, "home", ".ai-orchestrator", "config.json");
+    expect(JSON.parse(readFileSync(userConfigPath, "utf8"))).toMatchObject({
+      routing: { stages: { build: { prefer: ["p/strong"] } }, version: expect.stringContaining("recommendation-") },
+    });
+    const appliedNotice = vi.mocked(harness.ctx.ui.notify).mock.calls.map(([message]) => String(message)).find((message) => message.includes("Applied routing recommendation"));
+    const id = /recommendation (\d+-[a-f0-9-]{8})/.exec(appliedNotice ?? "")?.[1];
+    expect(id).toBeTruthy();
+
+    await harness.commands.get("lifecycle-routing-rollback")!(id!, harness.ctx);
+    expect(JSON.parse(readFileSync(userConfigPath, "utf8"))).toMatchObject({ routing: { stages: { build: { prefer: [] } } } });
+    expect(JSON.parse(readFileSync(join(store, "recommendations", `${id}.json`), "utf8"))).toMatchObject({ status: "rolled-back" });
+  });
+
   it("rejects missing prerequisite artifacts before changing model or tools", async () => {
     const run = makeRun("planning");
     writeFileSync(run.paths.spec, "");
