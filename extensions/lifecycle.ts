@@ -600,16 +600,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
     const state = readState(created.paths);
     if (!state) throw new Error("new lifecycle state could not be read");
-    state.originalModel = currentModelState(ctx);
-    writeState(created.paths, state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
+    runtime.state.originalModel = currentModelState(ctx);
+    writeState(created.paths, runtime.state);
     const baseline = await workingTreeStatus(ctx);
     if (!ownsRun(state.runId, "defining")) return;
     runtime.state.baselinePaths = baseline?.paths;
     runtime.state.baselineStagedPaths = baseline?.stagedPaths;
     writeState(created.paths, runtime.state);
     appendJournal(created.paths, "Lifecycle pipeline started");
-    persistMirror(state);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
@@ -639,16 +639,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
     const state = readState(created.paths);
     if (!state) throw new Error("new lifecycle state could not be read");
-    state.originalModel = currentModelState(ctx);
-    writeState(created.paths, state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
+    runtime.state.originalModel = currentModelState(ctx);
+    writeState(created.paths, runtime.state);
     const baseline = await workingTreeStatus(ctx);
     if (!ownsRun(state.runId, "defining")) return;
     runtime.state.baselinePaths = baseline?.paths;
     runtime.state.baselineStagedPaths = baseline?.stagedPaths;
     writeState(created.paths, runtime.state);
     appendJournal(created.paths, "Standalone DEFINE started");
-    persistMirror(state);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
@@ -732,13 +732,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
     const config = resolved.config;
-    if (!loaded.state.originalModel) {
-      loaded.state.originalModel = currentModelState(ctx);
-      writeState(loaded.paths, loaded.state);
-    }
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
-    appendJournal(loaded.paths, `Resumed at ${loaded.state.phase}`);
-    persistMirror(loaded.state);
+    if (!runtime.state.originalModel) {
+      runtime.state.originalModel = currentModelState(ctx);
+      writeState(runtime.paths, runtime.state);
+    }
+    appendJournal(runtime.paths, `Resumed at ${runtime.state.phase}`);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
@@ -767,11 +767,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     const resolved = loadPiResolvedConfig(ctx.cwd);
     const config = resolved.config;
-    if (!loaded.state.originalModel) loaded.state.originalModel = currentModelState(ctx);
-    writeState(loaded.paths, loaded.state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, false, stage, currentModelState(ctx));
-    appendJournal(loaded.paths, `Standalone ${stage.toUpperCase()} started`);
-    persistMirror(loaded.state);
+    if (!runtime.state.originalModel) {
+      runtime.state.originalModel = currentModelState(ctx);
+      writeState(runtime.paths, runtime.state);
+    }
+    appendJournal(runtime.paths, `Standalone ${stage.toUpperCase()} started`);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
@@ -787,12 +789,18 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   ): Runtime {
     const leaseOwner = randomUUID();
     acquireRunLease(paths, leaseOwner);
+    const active = currentRun(cwd, config.lifecycle.artifactsDir);
+    const freshState = readState(paths);
+    if (active?.runId !== state.runId || active.paths.root !== paths.root || !freshState || freshState.runId !== state.runId) {
+      releaseRunLease(paths, leaseOwner);
+      throw new Error("Lifecycle state changed before execution lease acquisition; retry from the active run");
+    }
     return {
       config,
       provenance,
       cwd,
       paths,
-      state,
+      state: freshState,
       automatic,
       standalone,
       toolsBeforeRun: pi.getActiveTools().filter((name) => !VERDICT_TOOLS.has(name)),
@@ -1900,7 +1908,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function transition(event: LifecycleEvent, journal: string, ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const runId = runtime.state.runId;
     const before = runtime.state.phase;
+    if (!ownsRun(runId, before)) throw new Error(`Lifecycle ownership changed before ${before} transition`);
     const next = nextStage(runtime.state, event, loopConfigFrom(runtime.config));
     if (next.phase === before && JSON.stringify(next) === JSON.stringify(runtime.state)) return;
     runtime.state = next;
