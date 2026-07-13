@@ -52,6 +52,8 @@ const WIDGET_KEY = ENTRY_TYPE;
 const VERDICT_TOOLS = new Set(["verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
+const PUBLICATION_COMMAND = /(?:^|[\s;&|])(?:git\s+(?:add|commit|push|tag)|gh\s+pr\s+create|(?:npm|pnpm|yarn)\s+publish)(?:\s|$)/i;
+const TESTABLE_READ_ONLY_PHASES = new Set<LifecyclePhase>(["verifying", "reviewing", "debugging", "shipping"]);
 
 type StandaloneStage = "spec" | "plan" | "build" | "test" | "debug" | "review" | "ship";
 interface PendingDiagnosis {
@@ -129,17 +131,32 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const activeRuntime = runtime;
     const state = activeRuntime?.state;
     if (!activeRuntime || !state) return;
-    if (event.toolName === "bash" && state.phase !== "building") {
+    if (event.toolName === "bash") {
       const command = typeof event.input.command === "string" ? event.input.command : "";
-      const testCommand = activeRuntime.config.judge.runTests ? detectTestCommand(activeRuntime.cwd) : undefined;
+      if (state.phase === "building") {
+        const artifactsRoot = resolve(activeRuntime.paths.root, "..");
+        if (PUBLICATION_COMMAND.test(command) || command.includes(activeRuntime.config.lifecycle.artifactsDir) || command.includes(artifactsRoot)) {
+          return { block: true, reason: "BUILD may edit source but cannot modify lifecycle artifacts or stage, commit, tag, push, open a PR, or publish." };
+        }
+        return;
+      }
+      const testCommand = activeRuntime.config.judge.runTests && TESTABLE_READ_ONLY_PHASES.has(state.phase)
+        ? detectTestCommand(activeRuntime.cwd)
+        : undefined;
       if (!isReadOnlyLifecycleCommand(command, testCommand)) {
-        return { block: true, reason: `${stageLabel(state.phase)} allows only reviewed read-only inspection commands and the exact detected test command.` };
+        return { block: true, reason: `${stageLabel(state.phase)} allows only reviewed read-only inspection commands${testCommand ? " and the exact detected test command" : ""}.` };
       }
       return;
     }
     if (!MUTATION_TOOLS.has(event.toolName)) return;
 
-    if (state.phase === "building") return;
+    if (state.phase === "building") {
+      const input = event.input as { path?: unknown };
+      const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
+      const artifactsRoot = resolve(activeRuntime.paths.root, "..");
+      if (requestedPath !== artifactsRoot && !requestedPath.startsWith(`${artifactsRoot}/`)) return;
+      return { block: true, reason: "BUILD may edit source files but lifecycle artifacts are orchestrator-owned." };
+    }
     if (state.phase === "defining" || state.phase === "planning") {
       const input = event.input as { path?: unknown };
       const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
