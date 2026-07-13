@@ -109,6 +109,17 @@ describe("Pi capability routing plan", () => {
     expect(judge.candidates).toEqual([]);
   });
 
+  it("enforces privacy before exact shadow model activation", () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.routing.engine = "capability-shadow";
+    config.routing.privacy = { allowed: ["private"], allowUnknown: false, providers: { "openai-codex": "public" } };
+    const plan = createPiRoutingPlan({
+      config, provenance: builtin, stage: "build", role: "coder",
+      available: [available("openai-codex", "gpt-5.5")], evidence: "task",
+    });
+    expect(plan.candidates).toEqual([]);
+  });
+
   it("keeps legacy and shadow engines on exact legacy selection without allowing self-review", () => {
     for (const engine of ["legacy", "capability-shadow"] as const) {
       const config = structuredClone(DEFAULT_CONFIG);
