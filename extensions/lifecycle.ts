@@ -126,7 +126,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   registerStageCommand("test", "Run VERIFY for the current lifecycle", async (_args, ctx) => startStandalone("test", "verifying", ctx));
   registerStageCommand("debug", "Run read-only DEBUG for the current lifecycle", async (_args, ctx) => startStandalone("debug", "debugging", ctx));
   registerStageCommand("review", "Run REVIEW for the current lifecycle", async (_args, ctx) => startStandalone("review", "reviewing", ctx));
-  registerStageCommand("ship", "Run SHIP for the current lifecycle", async (_args, ctx) => startStandalone("ship", "shipping", ctx));
+  registerStageCommand("ship", "Run or resume SHIP finalization for the current lifecycle", async (_args, ctx) =>
+    startStandalone("ship", ["shipping", "awaiting_ship_approval", "finalizing"], ctx));
 
   pi.on("tool_call", async (event) => {
     const activeRuntime = runtime;
@@ -444,7 +445,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     await runCurrentPhase(ctx);
   }
 
-  async function startStandalone(stage: StandaloneStage, expected: LifecyclePhase, ctx: ExtensionCommandContext): Promise<void> {
+  async function startStandalone(
+    stage: StandaloneStage,
+    expected: LifecyclePhase | readonly LifecyclePhase[],
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before running a lifecycle stage.", "error");
       return;
@@ -454,7 +459,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, `No lifecycle run exists. Start with /spec <idea> or /lifecycle <task>.`, "error");
       return;
     }
-    if (loaded.state.phase !== expected) {
+    const expectedPhases = Array.isArray(expected) ? expected : [expected];
+    if (!expectedPhases.includes(loaded.state.phase)) {
       notify(ctx, `Run ${loaded.state.runId} is at ${loaded.state.phase}; next command is ${nextCommand(loaded.state.phase)}.`, "error");
       return;
     }
