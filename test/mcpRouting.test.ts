@@ -36,6 +36,19 @@ describe("MCP capability routing", () => {
     });
   });
 
+  it("applies trusted MCP catalog privacy as a hard eligibility gate", () => {
+    const config = routedConfig();
+    config.mcp.models[0]!.privacy = "public";
+    config.mcp.models[1]!.privacy = "private";
+    config.routing.privacy = { allowed: ["private"], allowUnknown: false, providers: {} };
+
+    const route = resolveMcpRoute({ config, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") });
+    expect(route.candidates.map((candidate) => candidate.model)).toEqual(["checker"]);
+    expect(route.excluded).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identity: expect.objectContaining({ model: "maker" }), code: "privacy-not-allowed" }),
+    ]));
+  });
+
   it("enforces MCP stage budget and fallback-attempt ceilings", () => {
     const config = routedConfig();
     config.mcp.models = config.mcp.models.map((model) => ({
