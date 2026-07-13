@@ -6,29 +6,63 @@ import { z } from "zod/v3";
 import { loadConfig, loopConfigFrom } from "../src/core/config.js";
 import { nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
 import { plannerPrompt, replanPrompt } from "../src/core/prompts.js";
-import { completeWithRole } from "./llm.js";
+import { completeRouted } from "./llm.js";
+import { mergeTaskFeatures, metadataFor, resolveMcpRoute } from "./routing.js";
+
+const MCP_TEXT_MAX = 2_000_000;
+const MCP_REPORT_TEXT_MAX = 50_000;
+const MCP_PROMPT_MAX = 8_000_000;
+const boundedText = z.string().max(MCP_TEXT_MAX);
+const boundedNonEmptyText = boundedText.trim().min(1);
+const boundedReportText = z.string().max(MCP_REPORT_TEXT_MAX);
+const boundedNonEmptyReportText = boundedReportText.trim().min(1);
 
 const judgeReportInputSchema = z.object({
   verdict: z.enum(["approve", "reject"]),
-  reasons: z.string().min(1),
-  requiredFixes: z.string().optional(),
+  reasons: boundedNonEmptyReportText,
+  requiredFixes: boundedReportText.optional(),
+});
+
+const taskFeaturesSchema = z.object({
+  contextTokens: z.number().int().min(1).max(10_000_000),
+  expectedOutputTokens: z.number().int().min(1).max(1_000_000),
+  requiredInput: z.array(z.enum(["text", "image"])).max(2),
+  risk: z.enum(["low", "medium", "high"]),
+  workKind: z.enum(["feature", "bug-fix", "refactor", "migration", "test-only", "documentation", "configuration", "release", "unknown"]),
+  fileCount: z.number().int().min(0).max(1_000_000),
+  languages: z.array(z.string().trim().min(1).max(200)).max(256),
+  riskSignals: z.array(z.string().trim().min(1).max(500)).max(256),
+  failureSignals: z.array(z.string().trim().min(1).max(500)).max(256),
+});
+
+const routingMetadataSchema = z.object({
+  selectedIdentity: z.object({ provider: z.string(), model: z.string(), family: z.string().optional() }),
+  thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+  policyVersion: z.string(),
+  score: z.object({ total: z.number(), breakdown: z.array(z.object({ name: z.string(), value: z.number(), detail: z.string() })) }).nullable(),
+  fallbackHistory: z.array(z.object({ identity: z.string(), reason: z.string() })),
+  separation: z.object({ required: z.boolean(), satisfied: z.boolean(), builderIdentity: z.string().optional(), reason: z.string() }),
+  legacyFallback: z.boolean(),
 });
 
 const planInputSchema = {
-  task: z.string().min(1).describe("Implementation task to plan."),
-  repoContext: z.string().optional().describe("Repository context gathered by the client."),
-  previousPlan: z.string().trim().min(1).optional().describe("Previous plan when re-planning after judge rejections."),
-  judgeReports: z.union([z.string().trim().min(1), z.array(judgeReportInputSchema)]).optional().describe("Accumulated judge feedback to address during re-planning, either as text or structured reports."),
-  diffSummary: z.string().trim().min(1).optional().describe("Summary or full text of the failed diff when re-planning."),
+  task: boundedNonEmptyText.describe("Implementation task to plan."),
+  repoContext: boundedText.optional().describe("Repository context gathered by the client."),
+  previousPlan: boundedNonEmptyText.optional().describe("Previous plan when re-planning after judge rejections."),
+  judgeReports: z.union([boundedNonEmptyText, z.array(judgeReportInputSchema).max(20)]).optional().describe("Accumulated judge feedback to address during re-planning, either as text or structured reports."),
+  diffSummary: boundedNonEmptyText.optional().describe("Summary or full text of the failed diff when re-planning."),
+  taskFeatures: taskFeaturesSchema.optional().describe("Optional structured routing features; conservative features are derived when omitted."),
 };
 
 const judgeInputSchema = {
-  task: z.string().min(1).describe("Original user task being implemented."),
-  plan: z.string().min(1).describe("User-approved implementation plan currently being judged."),
-  diff: z.string().min(1).describe("Client-collected git diff and staged diff. The MCP server does not read the filesystem."),
-  testOutput: z.string().optional().describe("Client-collected relevant test command output, if tests were run."),
+  task: boundedNonEmptyText.describe("Original user task being implemented."),
+  plan: boundedNonEmptyText.describe("User-approved implementation plan currently being judged."),
+  diff: boundedNonEmptyText.describe("Client-collected git diff and staged diff. The MCP server does not read the filesystem."),
+  testOutput: boundedText.optional().describe("Client-collected relevant test command output, if tests were run."),
   iteration: z.number().int().min(1).describe("Total coding pass number being judged now. First judge call uses 1; use nextIteration returned by the prior judge call thereafter."),
   consecutiveRejections: z.number().int().min(0).describe("Consecutive rejection count before this verdict. First judge call uses 0; use nextConsecutiveRejections returned by the prior judge call thereafter."),
+  coderIdentity: z.string().trim().regex(/^[^/\s]+\/\S+$/).max(500).optional().describe("Optional provider/model identity of the coder, required by strict autonomous separation."),
+  taskFeatures: taskFeaturesSchema.optional(),
 };
 
 const judgeOutputSchema = {
@@ -38,11 +72,12 @@ const judgeOutputSchema = {
   nextAction: z.enum(["retry_coding", "replan", "done", "stop_failed"]).describe("Next loop action computed by the core state machine."),
   nextIteration: z.number().int().min(1).describe("Iteration value the client must use on the next judge call, if any."),
   nextConsecutiveRejections: z.number().int().min(0).describe("Consecutive rejection value the client must use on the next judge call, if any."),
+  routing: routingMetadataSchema,
 };
 
 type NextAction = "retry_coding" | "replan" | "done" | "stop_failed";
 
-const nonEmptyString = z.string().trim().min(1);
+const nonEmptyString = boundedNonEmptyText;
 const judgeJsonBaseSchema = z.object({
   verdict: z.enum(["approve", "reject"]),
   reasons: nonEmptyString,
@@ -82,8 +117,9 @@ export function createServer(cwd = process.cwd()): McpServer {
       title: "Create orchestrator implementation plan",
       description: "Call the configured planner model to produce an implementation plan or revised plan.",
       inputSchema: planInputSchema,
+      outputSchema: { plan: z.string().min(1), routing: routingMetadataSchema },
     },
-    async ({ task, repoContext, previousPlan, judgeReports, diffSummary }, extra) => {
+    async ({ task, repoContext, previousPlan, judgeReports, diffSummary, taskFeatures }, extra) => {
       const config = loadMcpConfig(cwd);
       if (!previousPlan && (judgeReports !== undefined || diffSummary !== undefined)) {
         throw new Error("previousPlan is required when supplying judgeReports or diffSummary for re-planning");
@@ -91,12 +127,17 @@ export function createServer(cwd = process.cwd()): McpServer {
       const prompt = previousPlan
         ? replanPrompt(task, previousPlan, diffSummary ?? "Diff summary not supplied by client.", judgeReports ?? "No judge reports supplied.")
         : plannerPrompt(task, repoContext);
-      const plan = await completeWithRole({ config, role: "planner", prompt, signal: extra.signal });
+      assertPromptSize(prompt);
+      const route = resolveMcpRoute({ config, stage: "plan", role: "planner", task: mergeTaskFeatures(prompt, taskFeatures) });
+      const completion = await completeRouted({ config, role: "planner", prompt, signal: extra.signal, candidates: route.candidates });
+      const routing = metadataFor(route, completion.selectedIndex, completion.fallbackHistory);
       const reminder = `Present this plan to the user for approval before implementing (loop policy: max ${config.loop.maxCoderIterations} coder iterations, escalate to re-plan after ${config.loop.plannerEscalationAfterRejections} consecutive rejections).`;
       return {
+        structuredContent: { plan: completion.text, routing },
         content: [
-          { type: "text", text: plan },
+          { type: "text", text: completion.text },
           { type: "text", text: reminder },
+          { type: "text", text: JSON.stringify({ routing }, null, 2) },
         ],
       };
     },
@@ -110,12 +151,21 @@ export function createServer(cwd = process.cwd()): McpServer {
       inputSchema: judgeInputSchema,
       outputSchema: judgeOutputSchema,
     },
-    async ({ task, plan, diff, testOutput, iteration, consecutiveRejections }, extra) => {
+    async ({ task, plan, diff, testOutput, iteration, consecutiveRejections, coderIdentity, taskFeatures }, extra) => {
       const config = loadMcpConfig(cwd);
       validateJudgeCounters({ iteration, consecutiveRejections, config });
       const prompt = judgeMcpPrompt(task, plan, diff, testOutput);
-      const raw = await completeWithRole({ config, role: "judge", prompt, signal: extra.signal });
-      const verdict = parseJudgeJson(raw);
+      assertPromptSize(prompt);
+      const route = resolveMcpRoute({ config, stage: "fast-judge", role: "judge", task: mergeTaskFeatures(prompt, taskFeatures), coderIdentity });
+      const completion = await completeRouted({
+        config,
+        role: "judge",
+        prompt,
+        signal: extra.signal,
+        candidates: route.candidates,
+        validateText: (text) => { parseJudgeJson(text); },
+      });
+      const verdict = parseJudgeJson(completion.text);
       const decision = computeJudgeDecision({
         task,
         plan,
@@ -124,7 +174,7 @@ export function createServer(cwd = process.cwd()): McpServer {
         verdict,
         config,
       });
-      const result = { ...verdict, ...decision };
+      const result = { ...verdict, ...decision, routing: metadataFor(route, completion.selectedIndex, completion.fallbackHistory) };
       return {
         structuredContent: result,
         content: [
@@ -134,6 +184,57 @@ export function createServer(cwd = process.cwd()): McpServer {
           },
         ],
       };
+    },
+  );
+
+  server.registerTool(
+    "orchestrator_models",
+    {
+      title: "Preview trusted MCP model routing",
+      description: "Rank the trusted user MCP catalog without invoking any model or exposing provider secrets.",
+      inputSchema: {
+        stage: z.enum(["plan", "fast-judge"]),
+        task: boundedNonEmptyText,
+        taskFeatures: taskFeaturesSchema.optional(),
+        coderIdentity: z.string().trim().regex(/^[^/\s]+\/\S+$/).max(500).optional(),
+      },
+      outputSchema: {
+        stage: z.enum(["plan", "fast-judge"]),
+        policyVersion: z.string(),
+        legacyFallback: z.boolean(),
+        separation: routingMetadataSchema.shape.separation,
+        eligible: z.array(z.object({ identity: z.string(), thinking: routingMetadataSchema.shape.thinking, score: z.number().nullable(), scoreBreakdown: z.array(z.object({ name: z.string(), value: z.number(), detail: z.string() })) })),
+        excluded: z.array(z.object({ identity: z.string(), code: z.string(), detail: z.string() })),
+      },
+    },
+    async ({ stage, task, taskFeatures, coderIdentity }) => {
+      const config = loadMcpConfig(cwd);
+      const route = resolveMcpRoute({
+        config,
+        stage,
+        role: stage === "plan" ? "planner" : "judge",
+        task: mergeTaskFeatures(task, taskFeatures),
+        coderIdentity,
+        preview: true,
+      });
+      const preview = {
+        stage,
+        policyVersion: route.policyVersion,
+        legacyFallback: route.legacyFallback,
+        separation: route.separation,
+        eligible: route.candidates.map((candidate, index) => ({
+          identity: `${candidate.provider}/${candidate.model}`,
+          thinking: candidate.thinking,
+          score: route.ranked[index]?.score ?? null,
+          scoreBreakdown: route.ranked[index]?.scoreBreakdown ?? [],
+        })),
+        excluded: route.excluded.map((candidate) => ({
+          identity: `${candidate.identity.provider}/${candidate.identity.model}`,
+          code: candidate.code,
+          detail: candidate.detail,
+        })),
+      };
+      return { structuredContent: preview, content: [{ type: "text", text: JSON.stringify(preview, null, 2) }] };
     },
   );
 
@@ -147,6 +248,12 @@ export async function main(): Promise<void> {
     console.error("[ai-orchestrator-mcp] transport error", error);
   };
   await server.connect(transport);
+}
+
+function assertPromptSize(prompt: string): void {
+  if (prompt.length > MCP_PROMPT_MAX) {
+    throw new Error(`MCP prompt exceeds the ${MCP_PROMPT_MAX}-character safety limit`);
+  }
 }
 
 function loadMcpConfig(cwd: string): ReturnType<typeof loadConfig> {

@@ -1,32 +1,46 @@
 # AI Orchestrator
 
-AI Orchestrator helps a coding task move through deliberate, separate roles instead of asking one agent to plan, implement, and approve its own work. It supports a lightweight **Plan → Code → Judge** loop for Pi and Cursor, plus a durable Pi-only lifecycle for larger work.
+AI Orchestrator separates planning, implementation, and checking instead of asking one model to approve its own work. It provides:
 
-The package gives you three ways to use the workflow:
+- **Pi fast path:** `/orchestrate` runs an approval-gated Plan → Code → Judge loop.
+- **Pi lifecycle:** `/lifecycle` runs a durable DEFINE → PLAN → BUILD → VERIFY → DEBUG → REVIEW → SHIP workflow.
+- **Cursor with MCP:** the MCP server plans, previews trusted planner/checker routes, and judges evidence supplied by Cursor.
+- **Cursor without MCP:** installed Markdown instructions preserve the same gates with manual model handoffs.
 
-- **Pi extension:** `/orchestrate` plans, waits for approval, implements, and asks an independent judge for a structured verdict while switching the active Pi model for each role.
-- **Pi lifecycle:** `/lifecycle` persists specification, plan, diagnosis, state, and journal files on disk, adds independent verification, DEBUG, review, and shipping stages, and can resume after a Pi restart.
-- **Cursor:** an MCP server gives Cursor planning and judging tools; an instructions-only install is available when MCP servers are not allowed.
+The working tree is never reverted automatically. SHIP never pushes. Built-in model names are defaults or preferences, not universal requirements.
 
-The working tree is never reverted automatically. By default, plans require approval, the fast loop stops after three coder passes, and two consecutive rejections trigger re-planning.
+## Architecture and surface parity
+
+All surfaces use the same pure routing concepts: stage requirements, task features, capability profiles, pins/preferences, deny rules, cost-aware ranking, policy versions, and maker/checker separation. The fast planner maps to `plan`; the fast judge maps to `fast-judge`, a combined verification/review policy. Existing loop state machines remain authoritative for counters and escalation.
+
+The adapters intentionally differ where their hosts differ:
+
+| Surface | Model source and activation | Files and evidence | Intentional limitation |
+| --- | --- | --- | --- |
+| Pi fast path | Discovers callable models from Pi's local registry and can switch Pi automatically | Keeps session-visible routing state | No durable lifecycle run directory |
+| Pi lifecycle | Discovers callable models from Pi and can switch every stage, including BUILD | Persists state, routing traces, and minimized evidence under the run directory | Pi ignores `mcp.providers` and `mcp.models` |
+| MCP | Calls planner/judge candidates from the trusted user `mcp.models` catalog through trusted user providers | Does not read project files or write run artifacts; returns routing metadata to the client | Cannot discover Pi or Cursor models and does not route Cursor's coder |
+| Cursor instructions | The user selects the Cursor model manually and records its identity | Cursor gathers repository context, diffs, tests, and optional run notes | Markdown cannot switch models or prove host availability |
+
+For MCP, Cursor supplies the task, repository context, diff, tests, loop counters, and coder identity. The server treats supplied text as untrusted data and does not inspect the repository.
 
 ## Requirements
 
 - Node.js 20 or newer.
-- For Pi workflows: [Pi](https://github.com/badlogic/pi-mono) installed with the models you intend to use authenticated locally.
-- For Cursor with MCP: API credentials for the planner and judge providers.
-- Git is recommended: the judge reviews Git diffs and the lifecycle records durable run artifacts per worktree.
+- Pi workflows: Pi with the intended models authenticated in its local registry.
+- MCP workflows: trusted user provider credentials and, for capability routing, a trusted user model catalog and capability profiles.
+- Git is recommended because checkers review diffs and lifecycle runs record per-worktree evidence.
 
 ## Choose a workflow
 
-| Where you work | Install | Start with | Best for |
-| --- | --- | --- | --- |
-| Pi | `pi install …` | `/orchestrate <task>` | A fast, approval-gated implementation loop |
-| Pi | `pi install …` | `/lifecycle <task>` | Larger work that benefits from durable stages and resume |
-| Cursor with MCP | `ai-orchestrator install-cursor` | Ask Cursor to use `orchestrator_plan` | Separate planner/judge model calls from Cursor's coder |
-| Cursor without MCP | `ai-orchestrator install-cursor --no-mcp` | Follow the installed skill | Organizations that prohibit MCP servers |
+| Environment | Install | Start with |
+| --- | --- | --- |
+| Pi fast path | `pi install npm:ai-orchestrator` | `/orchestrate <task>` |
+| Pi lifecycle | `pi install npm:ai-orchestrator` | `/lifecycle <task>` |
+| Cursor with MCP | `npx ai-orchestrator install-cursor` | Ask Cursor to use the AI Orchestrator workflow |
+| Cursor without MCP | `npx ai-orchestrator install-cursor --no-mcp` | Follow the installed `orchestrate` skill |
 
-## Install for Pi
+## Pi workflows
 
 Install the published package:
 
@@ -34,92 +48,71 @@ Install the published package:
 pi install npm:ai-orchestrator
 ```
 
-For a local checkout, give Pi the absolute package path instead:
+For a local checkout, use its absolute path:
 
 ```sh
 pi install /absolute/path/to/ai-orchestrator
 ```
 
-Pi discovers `extensions/` and `skills/` from the package. Start or restart Pi in the repository you want to change, then use one of the commands below.
+Pi discovers the packaged `extensions/` and `skills/` directories.
 
-### Fast Plan → Code → Judge loop
+### Fast Plan → Code → Judge
 
 ```text
 /orchestrate add a --version flag to the CLI
+/orchestrate --yolo add a --version flag to the CLI
+/orchestrate-stop
 ```
 
-The extension switches among the configured planner, coder, and judge models. It presents a plan for approval, lets the coder edit and test, then requires the judge to return an `approve` or `reject` verdict. A rejection sends concrete fixes back to the coder; after two consecutive rejections it requests a revised plan. It stops after three total coder passes and leaves the tree untouched for you to inspect.
-
-Useful commands:
-
-```text
-/orchestrate <task>          Start an approval-gated run
-/orchestrate --yolo <task>   Skip the plan-approval gate for this run
-/orchestrate-stop            Cancel the run and restore your prior Pi model
-```
-
-`--yolo` skips only the approval gate. It does not bypass testing, the judge, or the iteration cap.
+The extension plans, waits for approval unless `--yolo` was supplied, lets the selected coder edit and test, and requires an independent structured judge verdict. By default, two consecutive rejections trigger re-planning and three total coder passes stop the run. `--yolo` skips plan approval only; it does not bypass testing, checking, iteration caps, or publication gates.
 
 ### Durable lifecycle
-
-Use the lifecycle when you want an explicit specification, a reviewable plan, independent checking, and recovery after interruption:
-
-```text
-/lifecycle add a --version flag to the CLI
-```
-
-The normal path is:
 
 ```text
 DEFINE → approve → PLAN → approve → BUILD → VERIFY → REVIEW → SHIP
                                            ↘ reject → DEBUG → BUILD / PLAN / failed
 ```
 
-Each lifecycle run records durable evidence under `.ai-orchestrator/runs/<run-id>/`:
+Commands:
 
 ```text
-spec.md       approved problem definition and acceptance criteria
-plan.md       approved implementation plan
-debug.md      read-only diagnosis after a failed verification or review
-state.json    current phase, counters, model selections, and recovery state
-journal.md    transitions, verdicts, and routing decisions
-routing.jsonl full routing decisions and fallback attempts
-evidence.jsonl privacy-minimized usage, cost, and outcome events
-```
-
-These commands let you control or continue a lifecycle run:
-
-```text
-/lifecycle [--yolo] <task>   Create and automatically drive a full run
-/lifecycle resume            Continue the active run from its saved phase
-/lifecycle-stop              Stop, restore model/tools, and preserve artifacts
-/lifecycle-models [stage]    Preview legacy and capability routing without invoking a model
+/lifecycle [--yolo] <task>   Create and drive a full run
+/lifecycle resume            Resume the active run from disk
+/lifecycle-stop              Cancel while preserving its run directory
+/lifecycle-models [stage]    Preview Pi legacy and capability routing
 /spec [--yolo] <idea>        Run DEFINE only
-/plan                        Run the currently pending PLAN stage
-/build                       Run the currently pending BUILD stage
-/test                        Run the currently pending VERIFY stage
-/debug                       Run the currently pending DEBUG stage
-/review                      Run the currently pending REVIEW stage
-/ship                        Run the currently pending SHIP stage
+/plan                        Run PLAN at the saved phase
+/build                       Run BUILD at the saved phase
+/test                        Run VERIFY at the saved phase
+/debug                       Run DEBUG at the saved phase
+/review                      Run REVIEW at the saved phase
+/ship                        Run SHIP at the saved phase
 ```
 
-Standalone stage commands refuse to skip or rewind the saved phase. An interrupted active run can be continued with `/lifecycle resume`. `/lifecycle-stop` deliberately cancels the run and releases its active pointer; it preserves the run directory for inspection, but that stopped run cannot be resumed.
+The run directory is authoritative:
 
-For lifecycle runs, routing depends on `routing.engine`. In legacy and shadow modes, the old configured route remains active. In capability mode, every lifecycle stage including BUILD chooses from the callable local registry using stage policy, task features, model profiles, budgets, and maker/checker separation. The chosen model, fallbacks, and budget/evidence records are written to the run directory.
+```text
+.ai-orchestrator/runs/<run-id>/
+  spec.md
+  plan.md
+  debug.md
+  state.json
+  journal.md
+  routing.jsonl
+  evidence.jsonl
+```
 
-VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses the root cause and recommends a smallest safe fix; it does not edit code or consume a BUILD iteration. SHIP never pushes. A commit or pull request requires both the appropriate configuration and explicit interactive confirmation unless configured otherwise.
+Standalone stage commands do not skip or rewind `state.json`. VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses; BUILD edits. A checker cannot approve the exact BUILD identity, and configured family separation can be stricter. Commit/PR actions remain configuration- and confirmation-gated; SHIP never pushes.
 
-## Install for Cursor
+## Cursor installation
 
-The installer copies the Cursor rule and shared `orchestrate` skill into the current project. By default it also writes a local MCP configuration when one does not already exist.
-
-From a published package, run this in the Cursor project:
+From the published package, run in the Cursor project:
 
 ```sh
 npx ai-orchestrator install-cursor
 ```
 
-From a source checkout, build the MCP server first, then run the installer from the target project:
+From a source checkout, build first:
 
 ```sh
 cd /absolute/path/to/ai-orchestrator
@@ -130,197 +123,110 @@ cd /path/to/your-project
 node /absolute/path/to/ai-orchestrator/bin/ai-orchestrator.js install-cursor
 ```
 
-The default install creates or updates these files only when it is safe to do so:
+A clean default install creates:
 
 ```text
 .cursor/rules/ai-orchestrator.mdc
 .cursor/skills/orchestrate/SKILL.md
-.cursor/mcp.json                     only when it does not already exist
+.cursor/mcp.json                     only if absent
 ```
 
-Existing customized rule, skill, and MCP files are never overwritten. If `.cursor/mcp.json` already exists, the installer prints a snippet for you to merge. Its generated local MCP entry uses an absolute path, so do not commit that generated entry for teammates. The portable, version-pinned example is [cursor/mcp.json](cursor/mcp.json).
+The installer is idempotent for identical files and never overwrites customized rule, skill, or MCP files. If `.cursor/mcp.json` exists, it prints a snippet to merge manually. A local install uses machine-specific absolute paths; do not commit that entry for teammates. [`cursor/mcp.json`](cursor/mcp.json) is the portable version-pinned `npx` example.
 
-Use `--global` to install the rule and skill under `~/.cursor/` instead of the current project:
+Use `--global` for `~/.cursor/`, or `--no-mcp` to install only the rule and skill:
 
 ```sh
 npx ai-orchestrator install-cursor --global
+npx ai-orchestrator install-cursor --no-mcp
 ```
 
-### Use Cursor with MCP
+### Cursor with MCP
 
-After installing, restart or reload Cursor and make sure the `ai-orchestrator` MCP server is enabled. Select your coder model in Cursor (for example, GPT-5.5 with high reasoning); Cursor cannot switch its own model automatically.
+Restart or reload Cursor after installation and enable the `ai-orchestrator` MCP server. The installed workflow uses:
 
-For a non-trivial task, ask Cursor to follow the installed AI Orchestrator workflow. It will:
+1. `orchestrator_models` for a read-only preview of the trusted **server-side** `plan` route.
+2. `orchestrator_plan`, followed by recording its actual routing metadata and explicit plan approval.
+3. A manually selected coding-capable Cursor model; record its exact host `provider/model` as `coderIdentity`.
+4. Client-collected `git diff`, `git diff --staged`, and relevant test output.
+5. `orchestrator_models` for `fast-judge` with `coderIdentity` to confirm an eligible server-side checker.
+6. `orchestrator_judge` with the returned plan, evidence, counters, and `coderIdentity`, followed by recording its selected checker and fallback history.
+7. The server-returned `nextAction`, `nextIteration`, and `nextConsecutiveRejections` without client-side counter invention.
 
-1. Call `orchestrator_plan` and show you the proposed plan.
-2. Wait for your explicit approval before editing.
-3. Implement and test using Cursor's active coder model.
-4. Collect `git diff`, `git diff --staged`, and relevant test output.
-5. Call `orchestrator_judge` with that evidence.
-6. Follow the returned next action: retry coding, request a revised plan, finish, or stop with the remaining fixes.
+The MCP server routes its own planner/judge API calls; those catalog identities may not exist in Cursor's picker. It cannot change Cursor's selected host model, which remains the coder unless the user switches it. Record the host coder identity and server-returned routing metadata in project-defined notes or artifacts so separation is auditable.
 
-The MCP server deliberately does **not** read or modify your project files. Cursor supplies the task, approved plan, diff, test output, and loop counters. The server owns the counter calculation and returns `nextIteration` and `nextConsecutiveRejections`; Cursor must use those returned values rather than inventing its own loop state.
-
-### Use Cursor without MCP
-
-If your organization does not permit MCP servers, install only the rule and skill:
+### Cursor without MCP
 
 ```sh
 npx ai-orchestrator install-cursor --no-mcp
 ```
 
-The instructions-only workflow still requires plan approval, implementation, tests, and a judge-style review. It asks you to switch models at phase boundaries when possible, but continues with the current model if you decline. Because no external judge tool is available, this path has weaker model separation than Pi or Cursor with MCP.
+The installed skill requires a manually approved plan, a recorded coding-capable maker, tests, a recorded independent checker, and the configured loop caps. Re-plan after two consecutive rejections and stop after three coding passes unless stricter project policy applies. If strict independent checking cannot be satisfied, fail closed; never describe same-model review as independent. No-MCP mode has no server-side routing, completion fallback, metadata, or counter calculation.
 
-## Configuration
+## Configuration and trust boundaries
 
-Configuration is merged in this order:
+Configuration precedence is:
 
 1. Built-in defaults.
 2. User config: `~/.ai-orchestrator/config.json`.
 3. Project config: `<project>/.ai-orchestrator.json`.
 
-Project configuration is appropriate for model roles, loop limits, and lifecycle behavior. It can safely travel with a repository if that suits your team. MCP provider definitions are different: when the MCP server runs, it intentionally ignores project-level `mcp.providers` so a cloned repository cannot redirect your credentials to an untrusted endpoint. Put MCP endpoints and keys in the user config instead.
+Pi uses its own model registry and credentials and ignores `mcp.*`. MCP loads project configuration with a stricter trust boundary:
 
-### Common project configuration
+- `mcp.providers` and `mcp.models` are ignored from project config. A repository cannot add endpoints, keys, or catalog entries.
+- Only trusted user configuration can select `routing.engine`, define profiles, or change scoring, unknown-cost, and evidence policy for MCP.
+- Project routing may set stage `prefer`/`pins`, add deny rules, require stronger separation, and lower limits/budgets/circuit-breaker thresholds. It cannot weaken user ceilings or expand the trusted catalog.
+- Project `roles.planner` and `roles.judge` are ignored by the MCP loader because repository input may not select models that receive user credentials. Built-in or trusted user roles remain compatible exact routes in `legacy` and `capability-shadow`.
+- Prototype-pollution keys are dropped, lifecycle artifact paths must stay inside the project, user evidence paths must stay inside `~/.ai-orchestrator`, and provider URLs must use HTTPS.
+- An MCP API key may be a literal or an exact `$ENV_VAR` reference. `${VAR}` and other shell syntax are rejected; no shell expansion occurs.
 
-Create `.ai-orchestrator.json` in the repository to override roles or loop behavior. This example uses a single locally configured Pi provider for the fast loop:
+### Trusted user MCP providers and model catalog
 
-```json
-{
-  "roles": {
-    "planner": { "provider": "anthropic", "model": "claude-fable-5", "thinking": "xhigh" },
-    "coder": { "provider": "openai-codex", "model": "gpt-5.5", "thinking": "xhigh" },
-    "judge": { "provider": "anthropic", "model": "claude-fable-5", "thinking": "xhigh" }
-  },
-  "loop": {
-    "maxCoderIterations": 3,
-    "plannerEscalationAfterRejections": 2
-  },
-  "approval": { "requirePlanApproval": true }
-}
-```
-
-Pi resolves the `provider` and `model` values through its local model registry. Configure authentication and provider endpoints in Pi itself; Pi ignores `mcp.providers`.
-
-Thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Every configured role needs `provider`, `model`, and `thinking`.
-
-### Lifecycle configuration
-
-The lifecycle defaults to `.ai-orchestrator/runs`, asks before committing or opening a PR, and does not commit after every task. Override these settings in project config when needed:
+`mcp.models` is an array in trusted user config. It is empty by default. Every entry has a unique `provider/model` identity and references a provider in `mcp.providers`.
 
 ```json
 {
-  "lifecycle": { "artifactsDir": ".ai-orchestrator/runs" },
-  "build": { "commitPerTask": false },
-  "ship": { "commit": "ask", "openPr": "ask" },
-  "routing": {
-    "lifecycle": {
-      "enabled": true,
-      "stages": {
-        "define": [
-          { "provider": "anthropic", "model": "claude-fable-5", "thinking": "xhigh" }
-        ],
-        "plan": [
-          { "provider": "anthropic", "model": "claude-fable-5", "thinking": "xhigh" }
-        ],
-        "verify": [
-          { "provider": "openai-codex", "model": "gpt-5.6-sol", "thinking": "xhigh" }
-        ],
-        "review": [
-          { "provider": "openai-codex", "model": "gpt-5.6-sol", "thinking": "xhigh" }
-        ],
-        "debug": [
-          { "provider": "openai-codex", "model": "gpt-5.6-sol", "thinking": "xhigh" }
-        ],
-        "ship": [
-          { "provider": "anthropic", "model": "claude-fable-5", "thinking": "xhigh" }
-        ]
-      }
-    }
-  }
-}
-```
-
-Each legacy routing stage must have at least one candidate. These lists drive `legacy` and `capability-shadow`; arrays replace the default list for that stage rather than merging by position. Set `routing.lifecycle.enabled` to `false` to use only the corresponding fixed lifecycle role (`spec`, `planner`, `verifier`, `reviewer`, `debugger`, or `shipper`).
-
-`ship.commit` can be `ask`, `never`, or `auto`; `ship.openPr` can be `ask` or `never`. Even `auto` never pushes, and interactive approval is still required before opening a PR.
-
-### Capability routing
-
-Capability routing is shared by the durable lifecycle and the fast Plan → Code → Judge loop. Set `routing.engine` to `"capability"` to make it active for every role, including BUILD. The conservative fresh default remains `"capability-shadow"`, which keeps legacy selection active while exposing the read-only ranking preview. Set `"legacy"` for the one-setting rollback.
-
-In capability mode, a `roles.*` provider or model written in user or project config is an exact pin. An untouched built-in role (including `openai-codex/gpt-5.5` for BUILD) is only a tie-breaking preference. Checkers cannot select the exact latest BUILD identity; strict family separation can additionally be required per stage. Each lifecycle run stores a compact selection summary in `state.json`, an explanation in `journal.md`, the full append-only decision and fallback trace in `routing.jsonl`, and privacy-minimized cost/outcome events in `evidence.jsonl`.
-
-Run the read-only preview with any lifecycle stage or `fast-judge`:
-
-```text
-/lifecycle-models review
-```
-
-The report shows the locally available legacy choice, ordered capability candidates, selected thinking level, score components, and typed exclusions. It ends with `Shadow only; no model invoked or selected.` The command waits for the current agent to become idle, reads `ctx.modelRegistry.getAvailable()`, and does not switch models, call an LLM, start a run, or write lifecycle artifacts.
-
-Profiles contain subjective, user-overridable policy claims. All capability scores and confidence values are integer basis points from `0` through `10000`; for example, `8000` represents 80%. Objective facts such as callability, text/image input, reasoning support, context, output limit, and cost come from Pi metadata instead.
-
-```json
-{
-  "routing": {
-    "engine": "capability",
-    "mode": "balanced",
-    "allowInferredProfiles": false,
-    "unknownCost": "penalize",
-    "deny": {
-      "providers": [],
-      "models": ["untrusted/opaque-model"],
-      "families": []
-    },
-    "limits": {
-      "maxEstimatedUsdPerRun": 8,
-      "maxAttemptsPerStage": 3
-    },
-    "budgets": {
-      "maxEstimatedUsdPerStage": 3,
-      "maxEstimatedUsdPerRun": 8,
-      "maxObservedUsdPerRun": 8,
-      "maxEstimatedUsdPerDay": 24,
-      "maxObservedUsdPerDay": 24,
-      "maxPaidFallbacksPerRun": 2,
-      "allowUnknownCost": true
-    },
-    "circuitBreakers": {
-      "maxSelectionFailures": 3,
-      "repeatedRejectionFingerprintLimit": 2,
-      "maxBuildPassesWithoutImprovement": 3,
-      "requireIndependentChecker": true
-    },
-    "evidence": {
-      "enabled": true,
-      "userStoreDir": "routing-evidence",
-      "shadowComparisons": true,
-      "minRecommendationSamples": 10
-    },
-    "separation": {
-      "checkerMustDifferFromBuilder": true,
-      "preferDifferentProviderFamily": true,
-      "requireDifferentProviderFamilyFor": ["review", "ship"]
-    },
-    "stages": {
-      "review": {
-        "prefer": ["my-provider/my-reviewer"],
-        "minimumScores": { "review": 8000, "architecture": 7000 }
+  "mcp": {
+    "providers": {
+      "acme": {
+        "baseUrl": "https://api.acme.example/v1",
+        "api": "openai-responses",
+        "apiKey": "$ACME_API_KEY"
       }
     },
+    "models": [
+      {
+        "provider": "acme",
+        "model": "planner-v1",
+        "family": "acme-reasoning",
+        "reasoning": true,
+        "supportedThinking": ["off", "low", "medium", "high"],
+        "input": ["text"],
+        "contextWindow": 128000,
+        "maxOutputTokens": 8192,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cacheRead": 0.3,
+          "cacheWrite": 3.75
+        },
+        "profile": "team/planner-v1"
+      }
+    ]
+  },
+  "routing": {
+    "engine": "capability-shadow",
     "profiles": {
-      "my-provider/my-reviewer": {
-        "family": "independent-review-family",
+      "team/planner-v1": {
+        "family": "acme-reasoning",
         "confidence": 9000,
-        "provenance": "project",
+        "provenance": "user",
         "version": "team-eval-v1",
         "scores": {
-          "architecture": 8000,
-          "verification": 8500,
-          "review": 9000,
+          "architecture": 9000,
+          "verification": 7000,
+          "review": 7000,
           "structuredOutput": 9000,
-          "longContext": 8000
+          "longContext": 8500
         }
       }
     }
@@ -328,52 +234,116 @@ Profiles contain subjective, user-overridable policy claims. All capability scor
 }
 ```
 
-Modes are `quality`, `balanced`, `economy`, `pinned`, and `custom`. Hard constraints always run before scoring. Unknown profiles are excluded unless `allowInferredProfiles` is enabled; inferred profiles start with zero confidence and do not satisfy normal stage floors. Unknown cost follows `unknownCost: "exclude" | "penalize" | "allow"` during ranking and `budgets.allowUnknownCost` during pre-stage budget enforcement; it is never treated as free. User-level deny lists, cost/attempt ceilings, budget ceilings, circuit-breaker strictness, and separation requirements cannot be weakened by project configuration; a project may only add denials or tighten those limits. To reproduce the old behavior exactly, use `"engine": "legacy"`; to keep capability ranking observational, use `"capability-shadow"`.
+Catalog fields are:
 
-Routing evidence intentionally excludes prompts, source, diffs, artifact text, credentials, endpoint headers, and repository remotes. The local analyzer in `src/core/routingEvidence.ts` aggregates comparable completed stage samples and can produce report-only recommendations after the configured minimum sample count. Recommendations include the sample count, uncertainty, downstream evidence, trade-off, and rollback text; they do not edit active project policy automatically.
+| Field | Meaning |
+| --- | --- |
+| `provider`, `model` | Required unique identity; provider must have a trusted MCP provider configuration |
+| `family` | Optional separation family; a referenced profile's family takes precedence during ranking |
+| `reasoning` | Whether the model satisfies reasoning requirements |
+| `supportedThinking` | Supported values from `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `input` | Supported `text`/`image` inputs |
+| `contextWindow`, `maxOutputTokens` | Positive token limits used as hard eligibility checks |
+| `cost` | Optional input/output/cache prices in USD per million tokens; all four values are required when present. Current MCP ranking estimates from input/output; cache prices are validated but not used by its stateless estimate |
+| `profile` | Optional key in `routing.profiles`; defaults to the entry's `provider/model` identity |
 
-### MCP provider configuration
+Profile confidence and capability scores are integer basis points from `0` to `10000`. Missing profiles are excluded unless inferred profiles are enabled and stage floors permit them. For MCP, a referenced trusted profile is treated as user provenance. A catalog declaration is a trust assertion: verify capability, limits, family, and pricing against the provider before enabling active routing.
 
-Put provider credentials in `~/.ai-orchestrator/config.json`, not the repository. The server supports `anthropic-messages`, `openai-responses`, and `openai-completions` request formats.
+### Routing engines and previews
 
-```json
-{
-  "mcp": {
-    "providers": {
-      "anthropic": {
-        "baseUrl": "https://api.anthropic.com/v1",
-        "api": "anthropic-messages",
-        "apiKey": "$ANTHROPIC_API_KEY"
-      },
-      "openai": {
-        "baseUrl": "https://api.openai.com/v1",
-        "api": "openai-responses",
-        "apiKey": "$OPENAI_API_KEY"
-      }
-    }
-  }
-}
+The fresh default is `routing.engine: "capability-shadow"`.
+
+| Engine | Active Pi/MCP calls | Preview behavior |
+| --- | --- | --- |
+| `legacy` | Exact configured legacy roles/routes | Capability preview remains available |
+| `capability-shadow` | Exact configured legacy roles/routes | Capability candidates are ranked observationally |
+| `capability` | Capability ranking is active | Shows the same candidate policy used by active calls |
+
+For MCP, active capability routing requires a non-empty trusted `mcp.models` catalog. If the catalog is empty, even `capability` falls back to the exact planner/judge role and reports `legacyFallback: true`. In active MCP capability mode, identity pins are `routing.stages.plan.pins` and `routing.stages.fast-judge.pins`; `roles.*` are legacy fallbacks, not implicit catalog pins. Pi additionally interprets explicitly configured role identities through its local-registry pin policy.
+
+`orchestrator_models` accepts `stage: "plan" | "fast-judge"`, a task, optional validated task features, and optional `coderIdentity`. It invokes no model and returns no endpoint, header, credential, or key state. It returns:
+
+- ordered eligible identities, thinking levels, scores, and named score breakdowns;
+- typed exclusions and explanations;
+- policy version, separation status, and `legacyFallback`.
+
+When a catalog exists, preview ranks it even while `legacy` or `capability-shadow` keeps exact role selection active. With no catalog, preview reports the exact role with a null score and `legacyFallback: true`.
+
+### Routed plan/judge metadata and separation
+
+`orchestrator_plan` and `orchestrator_judge` return routing metadata:
+
+```text
+selectedIdentity { provider, model, family? }
+thinking
+policyVersion
+score { total, breakdown } | null
+fallbackHistory [{ identity, reason }]
+separation { required, satisfied, builderIdentity?, reason }
+legacyFallback
 ```
 
-`baseUrl` must be HTTPS. An `apiKey` may be a literal secret or an exact `$ENV_VAR` reference; shell syntax such as `${KEY}` is rejected. Set the named environment variable in the environment that starts Cursor. The default Fable provider URL is intentionally invalid until you supply the endpoint for your Fable service.
+The judge also returns a structured verdict, required fixes when rejecting, `nextAction`, and the exact counters for the next call.
 
-## Defaults and safety behavior
+`coderIdentity` must use canonical `provider/model` syntax without whitespace. In active capability mode, `orchestrator_judge` requires it whenever independent-checker, exact-model, or `fast-judge` family separation policy is enabled. Strict mode always excludes the exact coder. If that identity exists in the trusted MCP catalog, its configured/profile family is used for family separation; otherwise strict family separation fails closed rather than inferring family from a name. Legacy and shadow calls preserve compatibility and do not activate this catalog check, so clients must still record an independent handoff. The identity is a client declaration; the server reports the comparison but cannot attest Cursor's actual host selection.
 
-| Setting | Default |
+### Provider compatibility and completion fallback
+
+The MCP runtime supports:
+
+- `anthropic-messages` via `/messages`;
+- `openai-responses` via `/responses`;
+- `openai-completions` via `/chat/completions`.
+
+For active completion, a catalog candidate is callable only when its provider exists, has a resolved API key, and uses one of those API types. Preview checks trusted provider/API configuration without exposing whether a key resolved. `fast-judge` additionally requires a referenced profile with `structuredOutput >= 4500`. Effective output capacity is clamped to the provider adapter limit before ranking, and the request is clamped again to the routed task envelope and catalog limit. The server requests text and validates judge output as a standalone JSON object; it does not rely on a provider-native response-schema API. Redirects, truncated/empty/failed/timed-out responses, unsupported APIs, and HTTP errors are failures. Returned failure categories omit response bodies, URLs, credentials, and remote status text.
+
+Active capability calls try ranked eligible candidates in order within cumulative estimated-cost and attempt caps. A completion or required-output-schema failure is recorded in `fallbackHistory`, then the next eligible candidate is tried. Client abort stops fallback. If all candidates fail, the request fails with sanitized per-candidate categories. A malformed judge response therefore falls back to another eligible checker; it fails the request only when no candidate produces a valid verdict.
+
+## Cost ceilings and evidence retention
+
+Unknown price follows the explicit `routing.unknownCost` policy (`exclude`, `penalize`, or `allow`) rather than being silently assumed known. During MCP ranking, catalog costs and task token estimates affect score; the lowest of `routing.limits.maxEstimatedUsdPerRun`, `routing.budgets.maxEstimatedUsdPerStage`, and `routing.budgets.maxEstimatedUsdPerRun` is the per-request candidate ceiling. `budgets.allowUnknownCost: false` excludes unknown-price candidates. Active MCP fallback attempts are bounded by the strictest configured attempt, selection-failure, and paid-fallback cap.
+
+Pi workflows additionally enforce stateful `routing.budgets` before activation. Lifecycle evidence is retained in the run directory until the user removes it: `routing.jsonl` contains routing decisions/fallbacks and `evidence.jsonl` contains minimized task category, selected identity, usage/cost values or `unknown`, and outcome fields. Evidence excludes prompts, source, diffs, artifact text, credentials, headers, and repository remotes. Report-only analyzers do not rewrite policy.
+
+MCP is deliberately stateless across tool calls. It enforces per-request estimated-cost and fallback-attempt ceilings but cannot reconcile observed usage or enforce cumulative run/day budgets across independent requests. It does not write `routing.jsonl`/`evidence.jsonl`; its durable evidence boundary is the structured metadata returned to the client. Cursor should retain that metadata and manual identities in project-defined notes when audit history is required.
+
+## Legacy migration and rollback
+
+Existing role/provider configuration remains valid in `legacy` and `capability-shadow`; there is no automatic config rewrite or migration command. Migration is explicit and reviewable:
+
+1. Keep the existing `roles.planner` and `roles.judge` values as the legacy route.
+2. Add each intended MCP planner/checker to trusted user `mcp.models` and add its referenced trusted user profile.
+3. Add identity-equivalent `routing.stages.plan.pins` and `routing.stages.fast-judge.pins` when exact active identities are required. Stage thinking policy, not legacy role thinking, controls capability-routed thinking.
+4. Leave `routing.engine` on `capability-shadow` and validate both `orchestrator_models` stages, exclusions, cost details, and separation with the real coder identity.
+5. Change the trusted user setting to `"engine": "capability"` only after the preview is acceptable.
+6. Roll back with one setting: `"engine": "legacy"`. The preserved `roles.*` identities become active again.
+
+The application never rewrites or backs up config automatically. Edit and version trusted configuration through your normal review process.
+
+## Built-in defaults and preferences
+
+These are starting defaults, not model requirements:
+
+| Setting | Built-in default/preference |
 | --- | --- |
-| Planner / judge | `anthropic/claude-fable-5` at `xhigh` |
-| Coder / lifecycle BUILD preference | `openai-codex/gpt-5.5` at `xhigh` |
-| Fast-loop coder passes | 3 |
+| Routing engine | `capability-shadow` |
+| Fast planner/judge roles | `anthropic/claude-fable-5`, `xhigh` |
+| Fast coder / lifecycle BUILD preference | `openai-codex/gpt-5.5`, `xhigh` |
+| Legacy lifecycle route preferences | Fable first for DEFINE/PLAN/SHIP; GPT-5.6 Sol first for VERIFY/REVIEW/DEBUG |
+| Fast coder passes | 3 |
 | Rejections before re-plan | 2 consecutive |
 | Plan approval | Required |
-| Lifecycle commit | Ask |
-| Lifecycle PR | Ask; never push |
+| Lifecycle commit / PR | Ask; never push |
 
-Legacy/shadow lifecycle selection prefers Fable for DEFINE, PLAN, and SHIP, and GPT-5.6 Sol for VERIFY, REVIEW, and DEBUG. Capability mode instead ranks the callable Pi registry against per-stage profiles, task evidence, policy limits, and maker/checker separation, then records typed fallback reasons.
+Change roles, legacy candidate lists, catalog entries, profiles, and policy to match models actually available and trusted in your environment. The built-in `fable` MCP endpoint is intentionally an invalid placeholder until a user supplies that optional provider's real endpoint.
 
-## Development and validation
+## Clean install, package contents, and validation
 
-Clone the repository and install dependencies:
+The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, and `src/`. npm also includes package metadata and this README. Plans and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
+
+The MCP binary uses the runtime dependencies `@modelcontextprotocol/sdk` and `zod`; it does not require optional Pi peer packages. Pi peers remain optional so a clean MCP/Cursor install does not need Pi.
+
+Validate a source checkout with:
 
 ```sh
 npm install
@@ -383,33 +353,49 @@ npm run build
 npm pack --dry-run
 ```
 
-`npm run build` clears generated `dist/` output before compiling, so repeated builds do not package deleted modules. A source checkout must be built before running `bin/ai-orchestrator-mcp.js` directly.
+A source checkout must be built before running `bin/ai-orchestrator-mcp.js` directly.
 
 ## Troubleshooting
 
 ### Pi says a model is unavailable
 
-The model must exist and be authenticated in Pi's local registry. Check Pi's model list and either configure the requested provider/model there or change the project role/routing configuration to a model you can use. The lifecycle records fallback attempts in its journal.
+Pi routes only among models returned by its authenticated local registry. Configure the provider/model in Pi, change the exact role/legacy route, or add a suitable profile for an available model. Use `/lifecycle-models <stage>` to inspect exclusions without invoking a model.
 
-### Cursor cannot connect to the MCP server
+### `orchestrator_models` shows only a legacy fallback
 
-For a source checkout, run `npm run build` before installing or launching the server. Restart Cursor after changing `.cursor/mcp.json`. If you installed into a project with an existing MCP file, merge the installer’s printed snippet rather than expecting it to overwrite the file.
+The trusted user `mcp.models` catalog is empty or was placed in project config, which MCP ignores. Put the catalog and profiles in `~/.ai-orchestrator/config.json`. A non-empty catalog preview ranks capability candidates even under `legacy` or `capability-shadow`.
 
-### The MCP server reports a missing API key or invalid provider
+### No eligible trusted MCP model
 
-Set the named environment variable and put the provider endpoint in `~/.ai-orchestrator/config.json`. Do not place secrets or `mcp.providers` in the repository config: MCP intentionally ignores project-level providers as a credential-protection boundary.
+Inspect `excluded` for the exact reason. Common causes are a missing/unresolved API key, unsupported provider API, absent profile, low profile confidence/capability score, denied identity/family, insufficient input/context/output support, unknown/excessive cost, a pin mismatch, `structuredOutput < 4500` for `fast-judge`, or maker/checker separation.
 
-### Cursor does not have orchestrator tools
+### MCP reports a missing key or invalid provider
 
-Verify the MCP server is enabled in Cursor. If MCP is unavailable by policy, run `ai-orchestrator install-cursor --no-mcp` and follow the installed manual workflow instead.
+Use a supported API type, an HTTPS base URL, and an exact `$ENV_VAR` or literal key in trusted user config. Set the environment variable in the process that launches Cursor. Project `mcp.providers` and `mcp.models` are intentionally ignored.
 
-### A run stopped or Pi was restarted
+### All eligible MCP candidates failed
 
-Use `/orchestrate-stop` to cancel a fast loop. For an interrupted lifecycle run that remains active, use `/lifecycle resume` to continue from disk. Use `/lifecycle-stop` to cancel a lifecycle run and preserve its artifacts for inspection; stopping releases the active run pointer, so that run cannot be resumed.
+Read the sanitized `fallbackHistory`/error categories. Check endpoint paths, credentials, model names, provider availability, timeouts, token truncation, and judge schema compliance. An aborted request does not continue to another provider. Invalid judge output falls back to another eligible checker before the request fails.
 
-## Package contents
+### Strict judge separation requires `coderIdentity`
 
-The published package includes the Pi extensions and skills, Cursor rule and MCP snippet, installer and MCP binaries, TypeScript source, and compiled MCP runtime. It intentionally excludes plans and tests.
+Pass the exact Cursor coder identity as `provider/model` to both the `fast-judge` preview and judge call. If no independent candidate remains, select a different checker/coder or explicitly change trusted user policy; do not self-approve.
+
+### Capability-shadow did not change the active model
+
+That is intentional. `capability-shadow` ranks only in previews while active calls keep exact legacy selection. Set `routing.engine` in trusted user config to `capability` to activate MCP catalog routing, or use `legacy` for rollback.
+
+### Cursor cannot connect or has no orchestrator tools
+
+For a source checkout, run `npm run build`; then restart Cursor and verify the MCP entry is enabled. If `.cursor/mcp.json` already existed, merge the printed snippet manually. If MCP is prohibited, reinstall with `--no-mcp` and follow the manual workflow.
+
+### Cursor did not switch models
+
+Neither MCP nor Markdown can switch Cursor's host model. With MCP, select and record the Cursor coder; the server independently routes its own planner/judge calls and returns their actual identities. Without MCP, perform the planner/maker/checker host handoffs manually.
+
+### A Pi run was interrupted
+
+Use `/lifecycle resume` for an active lifecycle run. `/lifecycle-stop` preserves artifacts but releases the active pointer, so that stopped run cannot resume. `/orchestrate-stop` cancels the fast loop and restores the prior Pi model.
 
 ## License
 

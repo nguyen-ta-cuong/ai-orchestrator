@@ -32,9 +32,9 @@ Read stage inputs from these files rather than relying on conversation memory. R
 
 ## Models and maker/checker separation
 
-BUILD uses the configured GPT-5.5 implementer. DEFINE, PLAN, VERIFY, REVIEW, DEBUG, and SHIP choose a stage-appropriate Fable or GPT-5.6 candidate from models already configured and authenticated in the local Pi registry. Respect configured ordering and fallback; never invent a model id.
+Every stage uses the configured routing engine. In capability mode, Pi ranks callable local models against stage requirements, profiles, cost ceilings, task evidence, and separation policy. Explicit user/project role identities are pins; built-in identities are preferences. Legacy and capability-shadow modes retain exact legacy selection. `/lifecycle-models [stage]` previews ranking without invoking or selecting a model.
 
-The maker does not grade its own work. Architects and checkers do not implement source changes. DEBUG diagnoses checker rejection but does not apply the fix. GPT-5.5 consumes the diagnosis in the next BUILD pass.
+BUILD uses an explicit configured pin or a capability-selected implementer. A model that edits code never grades its own work. VERIFY, REVIEW, DEBUG, and SHIP use eligible independent checkers and remain read-only. DEBUG diagnoses rejection but does not apply the fix; the selected BUILD implementer consumes `debug.md` on the next pass. Fail closed when strict exact or family separation cannot be proven.
 
 ## Stage rules
 
@@ -60,7 +60,7 @@ Do not edit files. Review correctness, readability, architecture fit, security, 
 
 ### DEBUG
 
-DEBUG runs after VERIFY or REVIEW rejection. Do not edit files. Reproduce or inspect the failure with permitted read-only commands, distinguish evidence from hypothesis, identify root cause and confidence, recommend the smallest safe fix, name likely files, and give exact validation commands. End with exactly one `debug_diagnosis` call. The extension writes `debug.md`; GPT-5.5 applies the fix later.
+DEBUG runs after VERIFY or REVIEW rejection. Do not edit files. Reproduce or inspect the failure with permitted read-only commands, distinguish evidence from hypothesis, identify root cause and confidence, recommend the smallest safe fix, name likely files, and give exact validation commands. End with exactly one `debug_diagnosis` call. The extension writes `debug.md`; the next configured or capability-selected BUILD implementer applies the fix.
 
 ### SHIP
 
@@ -84,12 +84,13 @@ For parallel features, create separate branch worktrees yourself; do not make mu
 
 When lifecycle commands or verdict tools are unavailable, reproduce the workflow manually:
 
-1. Create the run directory and maintain `state.json` and `journal.md` after every phase.
-2. Ask the user to use a top-tier available Fable or GPT-5.6 model for DEFINE/PLAN/checking and GPT-5.5 for BUILD. Continue with the current model only if the user explicitly accepts weaker separation.
+1. Create the run directory and maintain `state.json`, `journal.md`, and model-selection evidence after every phase.
+2. Use available routing preview/recommendations when present. Ask the user to switch manually to the highest-ranked eligible model for each phase and record the exact identity. A named model is only an example or configured preference.
 3. Stop for spec and plan approval unless yolo was explicitly requested.
-4. Run BUILD, then independently VERIFY and REVIEW the diff.
-5. On rejection, switch to an independent read-only debugger, write `debug.md`, then return to GPT-5.5 BUILD.
-6. Apply the same iteration and escalation caps.
-7. Present SHIP GO/NO-GO and rollback plan. Never commit, push, or open a PR without explicit consent.
+4. Select a coding-capable maker for BUILD, then switch to a different eligible model or independent agent for read-only VERIFY and REVIEW.
+5. On rejection, switch to an independent read-only debugger, write `debug.md`, then return to an eligible BUILD implementer.
+6. If strict exact or family separation cannot be satisfied, fail closed and ask for an eligible checker or explicit policy change; never claim independent approval from the maker.
+7. Apply the configured iteration and escalation caps.
+8. Present SHIP GO/NO-GO and rollback plan. Never commit, push, or open a PR without explicit consent.
 
-If separate models or sub-agents are unavailable, disclose that maker/checker separation is degraded and require stronger human verification rather than claiming independent approval.
+If policy permits degraded separation, disclose it prominently and require stronger human verification. Record the user decision rather than silently continuing.

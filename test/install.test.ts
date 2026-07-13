@@ -88,7 +88,12 @@ describe("ai-orchestrator install-cursor", () => {
     const stdout = runInstaller(cwd, "--no-mcp");
 
     expect(existsSync(join(cwd, ".cursor", "rules", "ai-orchestrator.mdc"))).toBe(true);
-    expect(existsSync(join(cwd, ".cursor", "skills", "orchestrate", "SKILL.md"))).toBe(true);
+    const installedRule = readFileSync(join(cwd, ".cursor", "rules", "ai-orchestrator.mdc"), "utf8");
+    const installedSkill = readFileSync(join(cwd, ".cursor", "skills", "orchestrate", "SKILL.md"), "utf8");
+    expect(installedRule).toContain("independent checker");
+    expect(installedRule).toContain("fail closed");
+    expect(installedSkill).toContain("Without orchestrator tools");
+    expect(installedSkill).toContain("maker cannot approve itself");
     expect(existsSync(join(cwd, ".cursor", "mcp.json"))).toBe(false);
     expect(stdout).toContain("Skipped MCP config because --no-mcp was supplied");
   });
@@ -119,6 +124,13 @@ describe("ai-orchestrator install-cursor", () => {
     expect(readFileSync(skillPath, "utf8")).toBe("custom skill\n");
     expect(stdout).toContain("Skipped existing customized Cursor rule");
     expect(stdout).toContain("Skipped existing customized Cursor skill");
+  });
+
+  it("packages MCP source while excluding local plans and tests", () => {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { files: string[] };
+    expect(packageJson.files).toContain("mcp");
+    expect(packageJson.files).not.toContain("plans");
+    expect(packageJson.files).not.toContain("test");
   });
 
   it("keeps the static npx snippet pinned to the package version", () => {

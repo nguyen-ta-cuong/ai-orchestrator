@@ -23,10 +23,27 @@ export interface RoleConfig {
   thinking: ThinkingLevel;
 }
 
+export type McpProviderApi = "anthropic-messages" | "openai-responses" | "openai-completions";
+
 export interface ProviderConfig {
   baseUrl: string;
-  api: "anthropic-messages" | "openai-responses" | "openai-completions" | string;
+  api: McpProviderApi | string;
   apiKey?: string;
+}
+
+/** A user-trusted, MCP-callable catalog entry. Repository config may not add or alter entries. */
+export interface McpModelConfig {
+  provider: string;
+  model: string;
+  family?: string;
+  reasoning: boolean;
+  supportedThinking: ThinkingLevel[];
+  input: ("text" | "image")[];
+  contextWindow: number;
+  maxOutputTokens: number;
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  /** Key in routing.profiles. Defaults to provider/model. */
+  profile?: string;
 }
 
 export type RoleName = "planner" | "coder" | "judge" | "spec" | "verifier" | "reviewer" | "debugger" | "shipper";
@@ -82,6 +99,7 @@ export interface OrchestratorConfig {
   };
   mcp: {
     providers: Record<string, ProviderConfig>;
+    models: McpModelConfig[];
   };
 }
 
@@ -103,7 +121,7 @@ type ConfigPatch = Partial<{
     stages?: Partial<Record<RoutingStage, Partial<StageRoutingPolicy>>>;
   };
   ship: Partial<OrchestratorConfig["ship"]>;
-  mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>> }>;
+  mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>>; models: McpModelConfig[] }>;
 }>;
 
 export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
@@ -179,6 +197,7 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     openPr: "ask",
   },
   mcp: {
+    models: [],
     providers: {
       anthropic: {
         baseUrl: "https://api.anthropic.com/v1",
@@ -238,6 +257,10 @@ export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions
   const userMerged = deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders));
   validateConfig(cloneConfig(userMerged));
   const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
+  if (options.ignoreProjectMcpProviders) {
+    constrainProjectMcpRoles(projectPatch);
+    if (projectPatch.routing) constrainProjectMcpRoutingPatch(projectPatch.routing);
+  }
   const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing));
 
   return {
@@ -329,6 +352,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
   const ship = requirePlainObject(config.ship, "ship");
   const mcp = requirePlainObject(config.mcp, "mcp");
   const providers = requirePlainObject(mcp.providers, "mcp.providers");
+  if (!Array.isArray(mcp.models)) throw new Error("mcp.models must be an array");
 
   for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "debugger", "shipper"] as const) {
     validateRoleConfig(roles[roleName], `roles.${roleName}`);
@@ -352,6 +376,10 @@ function validateConfig(value: unknown): OrchestratorConfig {
   requireBoolean(build.commitPerTask, "build.commitPerTask");
   requireStringEnum(ship.commit, "ship.commit", ["ask", "never", "auto"] as const);
   requireStringEnum(ship.openPr, "ship.openPr", ["ask", "never"] as const);
+
+  for (const [index, value] of mcp.models.entries()) validateMcpModel(value, `mcp.models[${index}]`);
+  const identities = (mcp.models as McpModelConfig[]).map((model) => `${model.provider}/${model.model}`);
+  if (new Set(identities).size !== identities.length) throw new Error("mcp.models must not contain duplicate provider/model identities");
 
   for (const [providerName, providerValue] of Object.entries(providers)) {
     const provider = requirePlainObject(providerValue, `mcp.providers.${providerName}`);
@@ -463,6 +491,31 @@ function requirePlainObject(value: unknown, path: string): Record<string, unknow
   return value;
 }
 
+function validateMcpModel(value: unknown, path: string): void {
+  const model = requirePlainObject(value, path);
+  requireNonEmptyString(model.provider, `${path}.provider`);
+  requireNonEmptyString(model.model, `${path}.model`);
+  if ((model.provider as string).includes("/") || /\s/.test(model.provider as string)) {
+    throw new Error(`${path}.provider must not contain slashes or whitespace`);
+  }
+  if (/\s/.test(model.model as string) || (model.model as string).startsWith("/")) {
+    throw new Error(`${path}.model must use canonical non-whitespace model syntax`);
+  }
+  if (model.family !== undefined) requireNonEmptyString(model.family, `${path}.family`);
+  requireBoolean(model.reasoning, `${path}.reasoning`);
+  requireEnumArray(model.supportedThinking, `${path}.supportedThinking`, THINKING_LEVELS);
+  if ((model.supportedThinking as unknown[]).length === 0) throw new Error(`${path}.supportedThinking must be non-empty`);
+  requireEnumArray(model.input, `${path}.input`, ["text", "image"] as const);
+  if ((model.input as unknown[]).length === 0) throw new Error(`${path}.input must be non-empty`);
+  requirePositiveInteger(model.contextWindow, `${path}.contextWindow`);
+  requirePositiveInteger(model.maxOutputTokens, `${path}.maxOutputTokens`);
+  if (model.profile !== undefined) requireNonEmptyString(model.profile, `${path}.profile`);
+  if (model.cost !== undefined) {
+    const cost = requirePlainObject(model.cost, `${path}.cost`);
+    for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) requireNonNegativeNumber(cost[key], `${path}.cost.${key}`);
+  }
+}
+
 function validateRoleConfig(value: unknown, path: string): void {
   const role = requirePlainObject(value, path);
   requireNonEmptyString(role.provider, `${path}.provider`);
@@ -488,6 +541,9 @@ function requireHttpsUrl(value: unknown, path: string): void {
   }
   if (url.protocol !== "https:") {
     throw new Error(`${path} must use https:`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`${path} must not contain URL credentials`);
   }
 }
 
@@ -572,11 +628,36 @@ function requireUserStoreRelativePath(value: unknown, path: string): void {
 }
 
 function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): ConfigPatch {
-  if (!ignoreMcpProviders || patch.mcp === undefined) {
-    return patch;
-  }
+  if (!ignoreMcpProviders || patch.mcp === undefined) return patch;
   const { mcp: _ignoredMcp, ...rest } = patch;
   return rest;
+}
+
+function constrainProjectMcpRoles(patch: ConfigPatch): void {
+  // Repository config is not trusted to select models that receive user
+  // credentials. MCP planner/judge exact routes therefore come only from
+  // built-in or user configuration; project policy may rank trusted catalog
+  // entries through the constrained routing patch below.
+  if (!patch.roles) return;
+  delete patch.roles.planner;
+  delete patch.roles.judge;
+}
+
+function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routing"]>): void {
+  // On MCP the repository may rank/pin within the trusted user catalog and tighten
+  // deny/separation/ceilings. It cannot select the engine, invent profiles, relax
+  // capability requirements, or alter scoring/cost treatment.
+  const allowed = new Set(["stages", "deny", "separation", "limits", "budgets", "circuitBreakers"]);
+  for (const key of Object.keys(routing)) {
+    if (!allowed.has(key)) delete (routing as Record<string, unknown>)[key];
+  }
+  if (routing.stages && isPlainObject(routing.stages)) {
+    for (const [stage, value] of Object.entries(routing.stages)) {
+      if (!isPlainObject(value)) continue;
+      const preference = { ...(value.prefer === undefined ? {} : { prefer: value.prefer }), ...(value.pins === undefined ? {} : { pins: value.pins }) };
+      (routing.stages as Record<string, unknown>)[stage] = preference;
+    }
+  }
 }
 
 function constrainProjectRoutingPatch(patch: ConfigPatch, userRouting: CapabilityRoutingConfig): ConfigPatch {

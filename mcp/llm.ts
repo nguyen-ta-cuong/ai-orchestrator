@@ -1,4 +1,5 @@
-import type { OrchestratorConfig, RoleConfig, ThinkingLevel } from "../src/core/config.js";
+import type { OrchestratorConfig, ThinkingLevel } from "../src/core/config.js";
+import type { McpCompletionCandidate } from "./routing.js";
 
 export type ModelRole = "planner" | "judge";
 
@@ -9,13 +10,51 @@ export interface CompletionRequest {
   signal?: AbortSignal;
 }
 
+export interface RoutedCompletionRequest extends CompletionRequest {
+  candidates: readonly McpCompletionCandidate[];
+  /** Reject candidate output before accepting it, allowing an eligible fallback. */
+  validateText?: (text: string) => void;
+}
+
+export interface RoutedCompletionResult {
+  text: string;
+  selectedIndex: number;
+  fallbackHistory: Array<{ identity: string; reason: string }>;
+}
+
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
 const ANTHROPIC_DEFAULT_MAX_TOKENS = 8192;
 const ANTHROPIC_MAX_THINKING_MAX_TOKENS = 16384;
 let fakeLlmWarningPrinted = false;
 
 export async function completeWithRole({ config, role, prompt, signal }: CompletionRequest): Promise<string> {
-  const roleConfig = config.roles[role];
+  return (await completeRouted({ config, role, prompt, signal, candidates: [config.roles[role]] })).text;
+}
+
+export async function completeRouted({ config, role, prompt, signal, candidates, validateText }: RoutedCompletionRequest): Promise<RoutedCompletionResult> {
+  const fallbackHistory: RoutedCompletionResult["fallbackHistory"] = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const roleConfig = candidates[index]!;
+    try {
+      const text = await completeCandidate(config, role, roleConfig, prompt, signal);
+      if (validateText) {
+        try {
+          validateText(text);
+        } catch {
+          throw new Error("Candidate output failed required schema validation");
+        }
+      }
+      return { text, selectedIndex: index, fallbackHistory };
+    } catch (error) {
+      const reason = sanitizeError(error, Object.values(config.mcp.providers).flatMap((provider) => provider.apiKey ? [provider.apiKey] : []));
+      fallbackHistory.push({ identity: `${roleConfig.provider}/${roleConfig.model}`, reason });
+      if (signal?.aborted || index === candidates.length - 1) throw new Error(`All eligible MCP completion candidates failed: ${fallbackHistory.map((item) => `${item.identity}: ${item.reason}`).join("; ")}`);
+    }
+  }
+  throw new Error("No MCP completion candidates were supplied");
+}
+
+async function completeCandidate(config: OrchestratorConfig, role: ModelRole, roleConfig: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
   const provider = config.mcp.providers[roleConfig.provider];
   if (!provider) {
     throw new Error(`No MCP provider configured for role ${role} provider ${roleConfig.provider}`);
@@ -52,6 +91,24 @@ export async function completeWithRole({ config, role, prompt, signal }: Complet
   return text;
 }
 
+function sanitizeError(error: unknown, secrets: string[]): string {
+  const message = redactSecrets(error instanceof Error ? error.message : String(error), secrets);
+  const httpStatus = /^LLM request failed \((\d+)/.exec(message)?.[1];
+  if (httpStatus) return `LLM request failed (${httpStatus})`;
+  if (message.startsWith("LLM response was not valid JSON")) return "LLM response was not valid JSON";
+  if (message.startsWith("OpenAI response failed")) return "OpenAI response failed";
+  if (message.startsWith("OpenAI response was incomplete")) return "OpenAI response was incomplete";
+  if (message.startsWith("Candidate output failed")) return "candidate output failed required schema validation";
+  if (message.includes("timed out")) return "LLM request timed out";
+  if (message.includes("aborted by client")) return "LLM request aborted by client";
+  if (message.includes("truncated") || message.includes("token limit")) return "LLM response was truncated";
+  if (message.startsWith("No MCP provider configured")) return "MCP provider is not configured";
+  if (message.startsWith("Missing API key")) return "MCP provider API key is missing";
+  if (message.startsWith("Unsupported MCP provider API")) return "MCP provider API is unsupported";
+  if (message.includes("returned an empty completion")) return "LLM provider returned an empty completion";
+  return "MCP candidate failed";
+}
+
 function fakeCompletion(role: ModelRole): string {
   if (role === "planner") {
     return [
@@ -68,16 +125,16 @@ function fakeCompletion(role: ModelRole): string {
   });
 }
 
-async function anthropicMessages(baseUrl: string, apiKey: string, role: RoleConfig, prompt: string, signal?: AbortSignal): Promise<string> {
+async function anthropicMessages(baseUrl: string, apiKey: string, role: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
   const json = await postJson(endpoint(baseUrl, "/messages"), {
     "content-type": "application/json",
     "x-api-key": apiKey,
     "anthropic-version": "2023-06-01",
   }, {
     model: role.model,
-    max_tokens: anthropicMaxTokens(role.thinking),
+    max_tokens: completionTokenLimit(role, anthropicMaxTokens(role.thinking)),
     messages: [{ role: "user", content: prompt }],
-    ...anthropicThinking(role.thinking),
+    ...anthropicThinking(role.thinking, completionTokenLimit(role, anthropicMaxTokens(role.thinking))),
   }, signal, [apiKey]);
   const response = json as { content?: Array<{ type?: string; text?: string }>; stop_reason?: string };
   if (response.stop_reason === "max_tokens") {
@@ -86,14 +143,14 @@ async function anthropicMessages(baseUrl: string, apiKey: string, role: RoleConf
   return (response.content ?? []).map((part) => (part.type === "text" ? part.text ?? "" : "")).join("\n").trim();
 }
 
-async function openaiResponses(baseUrl: string, apiKey: string, role: RoleConfig, prompt: string, signal?: AbortSignal): Promise<string> {
+async function openaiResponses(baseUrl: string, apiKey: string, role: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
   const json = await postJson(endpoint(baseUrl, "/responses"), {
     "authorization": `Bearer ${apiKey}`,
     "content-type": "application/json",
   }, {
     model: role.model,
     input: prompt,
-    max_output_tokens: 8192,
+    max_output_tokens: completionTokenLimit(role, 8192),
     ...openaiResponsesReasoning(role.thinking),
   }, signal, [apiKey]);
   const response = json as {
@@ -119,7 +176,7 @@ async function openaiResponses(baseUrl: string, apiKey: string, role: RoleConfig
     .trim();
 }
 
-async function openaiCompletions(baseUrl: string, apiKey: string, role: RoleConfig, prompt: string, signal?: AbortSignal): Promise<string> {
+async function openaiCompletions(baseUrl: string, apiKey: string, role: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
   const reasoning = openaiCompletionsReasoning(role.thinking);
   const json = await postJson(endpoint(baseUrl, "/chat/completions"), {
     "authorization": `Bearer ${apiKey}`,
@@ -127,7 +184,9 @@ async function openaiCompletions(baseUrl: string, apiKey: string, role: RoleConf
   }, {
     model: role.model,
     messages: [{ role: "user", content: prompt }],
-    ...(reasoning.reasoning_effort ? { max_completion_tokens: 8192, ...reasoning } : { max_tokens: 4096, temperature: 0 }),
+    ...(reasoning.reasoning_effort
+      ? { max_completion_tokens: completionTokenLimit(role, 8192), ...reasoning }
+      : { max_tokens: completionTokenLimit(role, 4096), temperature: 0 }),
   }, signal, [apiKey]);
   const choice = (json as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> }).choices?.[0];
   if (choice?.finish_reason === "length") {
@@ -145,7 +204,7 @@ async function postJson(
 ): Promise<unknown> {
   const timeout = withTimeout(signal, DEFAULT_LLM_TIMEOUT_MS);
   try {
-    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: timeout.signal });
+    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: timeout.signal, redirect: "error" });
     const text = await response.text();
     if (!response.ok) {
       throw new Error(
@@ -231,7 +290,7 @@ function openaiEffort(thinking: ThinkingLevel): "minimal" | "low" | "medium" | "
   return thinking === "minimal" ? "minimal" : thinking === "low" ? "low" : thinking === "medium" ? "medium" : "high";
 }
 
-function anthropicThinking(thinking: ThinkingLevel): Record<string, unknown> {
+function anthropicThinking(thinking: ThinkingLevel, maxTokens: number): Record<string, unknown> {
   if (thinking === "off" || thinking === "minimal" || thinking === "low") {
     return {};
   }
@@ -244,7 +303,11 @@ function anthropicThinking(thinking: ThinkingLevel): Record<string, unknown> {
     xhigh: 4096,
     max: 8192,
   };
-  return { thinking: { type: "enabled", budget_tokens: budgetByLevel[thinking] } };
+  return { thinking: { type: "enabled", budget_tokens: Math.min(budgetByLevel[thinking], Math.max(1, maxTokens - 1)) } };
+}
+
+function completionTokenLimit(role: McpCompletionCandidate, apiLimit: number): number {
+  return Math.max(1, Math.min(role.maxOutputTokens ?? apiLimit, role.requestedOutputTokens ?? apiLimit, apiLimit));
 }
 
 function anthropicMaxTokens(thinking: ThinkingLevel): number {
