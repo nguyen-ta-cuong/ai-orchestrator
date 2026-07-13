@@ -511,7 +511,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const validStage = typeof record.stage === "string" && ["define", "plan", "build", "verify", "debug", "review", "ship", "fast-judge"].includes(record.stage);
     const validPrevious = Array.isArray(record.previousPrefer) && record.previousPrefer.every((value) => typeof value === "string");
     const validApplied = Array.isArray(record.appliedPrefer) && record.appliedPrefer.every((value) => typeof value === "string");
-    if (record.status !== "applied" || !validStage || !validPrevious || !validApplied || typeof record.appliedVersion !== "string") {
+    if ((record.status !== "applied" && record.status !== "pending") || !validStage || !validPrevious || !validApplied || typeof record.appliedVersion !== "string") {
       notify(ctx, `Recommendation ${id} is unavailable or already rolled back.`, "error");
       return;
     }
