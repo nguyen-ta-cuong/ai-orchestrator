@@ -9,12 +9,15 @@ import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/co
 import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
 import { currentRun, readState } from "../src/lifecycle/artifacts.js";
+import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 
 const STATE_TYPE = "ai-orchestrator";
 const STATUS_KEY = "ai-orchestrator";
 const WIDGET_KEY = "ai-orchestrator";
-const JUDGE_TOOLS = ["read", "grep", "find", "ls", "bash", "judge_verdict"];
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
+const JUDGE_TOOLS = [...READ_ONLY_TOOLS, "judge_verdict"];
 const MUTATION_TOOLS = new Set(["edit", "write"]);
+const PUBLICATION_COMMAND = /(?:^|[\s;&|])(?:git\s+(?:add|commit|push|tag)|gh\s+pr\s+create|(?:npm|pnpm|yarn)\s+publish)(?:\s|$)/i;
 
 interface JudgeVerdictParams {
   verdict: Verdict;
@@ -24,10 +27,12 @@ interface JudgeVerdictParams {
 
 interface RuntimeState extends OrchestratorState {
   runId?: string;
+  cwd?: string;
   pendingVerdict?: JudgeVerdictParams;
   judgeReminderSent?: boolean;
   plannerReminderSent?: boolean;
   latestJudgeFeedback?: string;
+  toolsBeforeRun?: string[];
   toolsBeforeJudge?: string[];
   modelSelections?: Array<{
     stage: "plan" | "build" | "fast-judge";
@@ -170,8 +175,24 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event) => {
-    if (state.phase === "judging" && MUTATION_TOOLS.has(event.toolName)) {
-      return { block: true, reason: "ai-orchestrator judge phase is read-only; edit/write are blocked." };
+    const readOnlyPhase = state.phase === "planning" || state.phase === "replanning" || state.phase === "judging";
+    if (readOnlyPhase && MUTATION_TOOLS.has(event.toolName)) {
+      return { block: true, reason: `ai-orchestrator ${state.phase} phase is read-only; edit/write are blocked.` };
+    }
+    if (readOnlyPhase && event.toolName === "bash") {
+      const command = (event.input as { command?: unknown }).command;
+      const testCommand = state.phase === "judging" && state.cwd && (runtime?.config.judge.runTests ?? true)
+        ? detectTestCommand(state.cwd)
+        : undefined;
+      if (typeof command !== "string" || !isReadOnlyLifecycleCommand(command, testCommand)) {
+        return { block: true, reason: `ai-orchestrator ${state.phase} phase blocked a non-read-only bash command.` };
+      }
+    }
+    if (state.phase === "coding" && event.toolName === "bash") {
+      const command = (event.input as { command?: unknown }).command;
+      if (typeof command !== "string" || PUBLICATION_COMMAND.test(command)) {
+        return { block: true, reason: "ai-orchestrator coding cannot stage, commit, tag, push, open a PR, or publish; those actions require orchestrator-owned gates." };
+      }
     }
   });
 
@@ -255,16 +276,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     state = {
       ...(nextPhase(createIdleState(), { type: "start", task: parsed.task, yolo }, loopConfigFrom(config)) as RuntimeState),
       runId: createRunId(),
+      cwd: ctx.cwd,
       originalModel: ctx.model
         ? { provider: String(ctx.model.provider), id: String(ctx.model.id), thinking: currentThinking }
         : undefined,
+      toolsBeforeRun: pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict"),
     };
     persist();
 
     const ok = await switchToRole("planner", ctx);
     if (!ok) return;
 
-    deactivateJudgeVerdictTool();
+    activateReadOnlyTools();
     updateUi(ctx);
     pi.sendUserMessage(plannerPrompt(parsed.task));
   }
@@ -359,7 +382,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   async function enterCoding(ctx: ExtensionContext): Promise<void> {
     if (state.phase !== "coding") return;
 
-    restoreToolsAfterJudge();
+    activateBuildTools();
     const ok = await switchToRole("coder", ctx);
     if (!ok) return;
 
@@ -379,8 +402,6 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     if (!ok) return;
 
     runtime = runtime ?? loadPiResolvedConfig(ctx.cwd);
-    state = { ...state, toolsBeforeJudge: pi.getActiveTools() };
-    persist();
     pi.setActiveTools(JUDGE_TOOLS);
     updateUi(ctx);
 
@@ -446,6 +467,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function enterReplanning(ctx: ExtensionContext): Promise<void> {
+    activateReadOnlyTools();
     const ok = await switchToRole("planner", ctx);
     if (!ok) return;
 
@@ -479,6 +501,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
   async function finishRun(ctx: ExtensionContext): Promise<void> {
     const summary = finalSummary(state);
+    restoreRunTools(state);
     await restoreOriginalModel(ctx, state);
     clearUi(ctx);
     pi.sendMessage({ customType: STATE_TYPE, content: summary, display: true, details: state }, { triggerTurn: false });
@@ -497,7 +520,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       if (!ctx.isIdle()) {
         ctx.abort();
       }
-      restoreToolsAfterJudge();
+      restoreRunTools(stoppedState);
       state = nextPhase(stoppedState, { type: "cancelled" }, loopConfig()) as RuntimeState;
       state.runId = undefined;
       persist();
@@ -625,21 +648,34 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
   async function restorePendingSessionState(ctx: ExtensionContext, persistedState: RuntimeState): Promise<RuntimeState> {
     state = persistedState;
-    restoreToolsAfterJudge();
+    restoreRunTools(persistedState);
     await restoreOriginalModel(ctx, persistedState);
-    state = { ...state, originalModel: undefined, toolsBeforeJudge: undefined };
+    state = { ...state, originalModel: undefined, toolsBeforeRun: undefined, toolsBeforeJudge: undefined };
     persist();
     return state;
   }
 
-  function restoreToolsAfterJudge(): void {
-    if (state.toolsBeforeJudge) {
-      pi.setActiveTools(state.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
-      state = { ...state, toolsBeforeJudge: undefined };
-      persist();
+  function activateReadOnlyTools(): void {
+    pi.setActiveTools(READ_ONLY_TOOLS);
+  }
+
+  function activateBuildTools(): void {
+    pi.setActiveTools(state.toolsBeforeRun ?? pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict"));
+  }
+
+  function restoreRunTools(source: RuntimeState): void {
+    if (source.toolsBeforeRun) {
+      pi.setActiveTools(source.toolsBeforeRun.filter((toolName) => toolName !== "judge_verdict"));
+    } else if (source.toolsBeforeJudge) {
+      pi.setActiveTools(source.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
     } else {
       deactivateJudgeVerdictTool();
     }
+  }
+
+  function restoreToolsAfterJudge(): void {
+    if (state.phase === "coding") activateBuildTools();
+    else deactivateJudgeVerdictTool();
   }
 
   function deactivateJudgeVerdictTool(): void {
