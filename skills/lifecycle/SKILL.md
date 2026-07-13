@@ -64,7 +64,7 @@ DEBUG runs after VERIFY or REVIEW rejection. Do not edit files. Reproduce or ins
 
 ### SHIP
 
-Do not edit files. Review code quality, security, and test coverage. Use read-only `agent_team` fan-out when available; otherwise check sequentially. Produce GO/NO-GO, blockers, risks, fixes, and a concrete rollback plan. End with exactly one `ship_decision` call.
+Do not edit files. Review code quality, security, and test coverage sequentially with the available read/search tools and approved inspection commands. Produce GO/NO-GO, blockers, risks, fixes, and a concrete rollback plan. End with exactly one `ship_decision` call.
 
 SHIP never pushes. `--yolo` skips approval pauses but does not grant publication consent. Commit and PR actions follow explicit config and user confirmation. The working tree is never reverted automatically.
 
