@@ -508,6 +508,26 @@ describe("lifecycle Pi extension safety", () => {
     expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
   });
 
+  it("requires fresh consent for an uncommitted finalization checkpoint", async () => {
+    const run = makeRun("finalizing");
+    const state = readState(run.paths)!;
+    state.finalization = { commitBaseSha: "abc1234", commitMessage: "Implement crafted checkpoint" };
+    writeState(run.paths, state);
+    writeFileSync(join(run.cwd, "feature.ts"), "export const feature = true;\n");
+    const harness = extensionHarness(run.cwd);
+    harness.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === "git" && args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: "abc1234\n", stderr: "" };
+      if (command === "git" && args[0] === "status") return { code: 0, stdout: "?? feature.ts\0", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    vi.mocked(harness.ctx.ui.confirm).mockResolvedValue(false);
+
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
+    expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["add"]), expect.anything());
+  });
+
   it("retains terminal ownership until failed model restoration is retried", async () => {
     const run = makeRun("finalizing");
     const harness = extensionHarness(run.cwd);
@@ -570,7 +590,7 @@ describe("lifecycle Pi extension safety", () => {
   it("does not open a pull request after a stale confirmation cancels the run", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
-    state.finalization = { commitSha: "abc1234" };
+    state.finalization = { commitSha: "abc1234", prHead: "feature/crafted" };
     writeState(run.paths, state);
     const harness = extensionHarness(run.cwd);
     const confirm = vi.mocked(harness.ctx.ui.confirm);
