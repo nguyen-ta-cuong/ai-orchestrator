@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -246,6 +246,22 @@ describe("lifecycle Pi extension safety", () => {
 
     expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["add"]), expect.anything());
     expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
+  });
+
+  it("retains terminal ownership until failed model restoration is retried", async () => {
+    const run = makeRun("finalizing");
+    const harness = extensionHarness(run.cwd);
+    vi.mocked(harness.pi.setModel).mockResolvedValue(false);
+
+    await harness.commands.get("ship")!("", harness.ctx);
+
+    expect(readState(run.paths)).toMatchObject({ phase: "done", modelRestored: false });
+    expect(existsSync(join(run.paths.root, "..", "current"))).toBe(true);
+
+    vi.mocked(harness.pi.setModel).mockResolvedValue(true);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+    expect(readState(run.paths)?.modelRestored).toBe(true);
+    expect(existsSync(join(run.paths.root, "..", "current"))).toBe(false);
   });
 
   it("resumes standalone SHIP from finalizing", async () => {
