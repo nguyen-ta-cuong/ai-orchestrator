@@ -347,6 +347,7 @@ describe("loadConfig", () => {
         unknownCost: "exclude",
         allowInferredProfiles: false,
         deny: { providers: ["denied-provider"], models: ["denied/model"] },
+        privacy: { allowed: ["local", "private"], allowUnknown: false, providers: { trusted: "private", public: "public" } },
         limits: { maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 },
         budgets: { maxEstimatedUsdPerRun: 2, maxEstimatedUsdPerStage: 1, allowUnknownCost: false, maxPaidFallbacksPerRun: 1 },
         circuitBreakers: { maxSelectionFailures: 2, requireIndependentChecker: true },
@@ -367,6 +368,7 @@ describe("loadConfig", () => {
         unknownCost: "allow",
         allowInferredProfiles: true,
         deny: { providers: [], models: [] },
+        privacy: { allowed: ["local", "private", "public"], allowUnknown: true, providers: { public: "local" } },
         limits: { maxEstimatedUsdPerRun: 20, maxAttemptsPerStage: 8 },
         budgets: { maxEstimatedUsdPerRun: 20, maxEstimatedUsdPerStage: 10, allowUnknownCost: true, maxPaidFallbacksPerRun: 9 },
         circuitBreakers: { maxSelectionFailures: 9, requireIndependentChecker: false },
@@ -395,6 +397,9 @@ describe("loadConfig", () => {
     expect(config.routing.profiles["trusted/reviewer"]).toMatchObject({ family: "trusted-family", confidence: 9000, scores: { review: 9000 } });
     expect(config.routing.deny.providers).toContain("denied-provider");
     expect(config.routing.deny.models).toContain("denied/model");
+    expect(config.routing.privacy).toEqual({
+      allowed: ["local", "private"], allowUnknown: false, providers: { trusted: "private", public: "public" },
+    });
     expect(config.routing.limits).toEqual({ maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 });
     expect(config.routing.budgets.maxEstimatedUsdPerRun).toBe(2);
     expect(config.routing.budgets.maxEstimatedUsdPerStage).toBe(1);
@@ -411,6 +416,7 @@ describe("loadConfig", () => {
     [{ routing: { engine: "automatic" } }, "routing.engine must be one of"],
     [{ routing: { mode: "fastest" } }, "routing.mode must be one of"],
     [{ routing: { deny: { providers: "unsafe" } } }, "routing.deny.providers must be an array"],
+    [{ routing: { privacy: { allowed: ["secret"] } } }, "routing.privacy.allowed[0] must be one of"],
     [{ routing: { separation: { checkerMustDifferFromBuilder: "yes" } } }, "routing.separation.checkerMustDifferFromBuilder must be a boolean"],
     [{ routing: { profiles: { "": { confidence: 1, scores: {} } } } }, "routing.profiles keys must be non-empty provider/model identities"],
     [{ routing: { profiles: { "p/m": { confidence: 10_001, scores: {} } } } }, "routing.profiles.p/m.confidence must be an integer between 0 and 10000"],
