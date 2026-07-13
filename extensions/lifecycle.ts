@@ -769,13 +769,17 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       appendJournal(runtime.paths, `Routing policy frozen for run: ${runPolicyVersion}`);
     }
     const available = ctx.modelRegistry.getAvailable();
+    const expectedRunId = runtime.state.runId;
+    const expectedPhase = runtime.state.phase;
+    const evidence = await routingEvidence(ctx);
+    if (!ownsRun(expectedRunId, expectedPhase)) return false;
     const plan = createPiRoutingPlan({
       config: runtime.config,
       provenance: runtime.provenance,
       stage,
       role,
       available,
-      evidence: routingEvidence(),
+      evidence,
       priorSelections: runtime.state.modelSelections.map((selection) => ({
         stage: selection.stage,
         provider: selection.provider,
@@ -1128,15 +1132,24 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     return stage === "verify" || stage === "debug" || stage === "review" || stage === "ship";
   }
 
-  function routingEvidence() {
+  async function routingEvidence(ctx: ExtensionContext) {
     if (!runtime) return {};
+    const status = await workingTreeStatus(ctx);
+    const changedPaths = status?.paths ?? runtime.state.baselinePaths ?? [];
     return {
       task: runtime.state.task,
-      spec: existsSync(runtime.paths.spec) ? readFileSync(runtime.paths.spec, "utf8") : undefined,
-      plan: existsSync(runtime.paths.plan) ? readFileSync(runtime.paths.plan, "utf8") : undefined,
-      changedPaths: runtime.state.baselinePaths,
+      spec: existsSync(runtime.paths.spec) ? readFileSync(runtime.paths.spec, "utf8").slice(0, 256_000) : undefined,
+      plan: existsSync(runtime.paths.plan) ? readFileSync(runtime.paths.plan, "utf8").slice(0, 256_000) : undefined,
+      changedPaths,
+      languages: [...new Set(changedPaths.map(languageForPath).filter((value): value is string => Boolean(value)))],
+      testCommand: detectTestCommand(runtime.cwd),
       verdictCategory: runtime.state.verdicts.at(-1)?.reasons,
     };
+  }
+
+  function languageForPath(path: string): string | undefined {
+    const extension = path.split(".").at(-1)?.toLowerCase();
+    return ({ ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", py: "python", rb: "ruby", rs: "rust", go: "go", swift: "swift", kt: "kotlin", java: "java", cs: "csharp" } as Record<string, string>)[extension ?? ""];
   }
 
   async function artifactStageEnded(ctx: ExtensionContext, artifact: "spec" | "plan"): Promise<void> {
