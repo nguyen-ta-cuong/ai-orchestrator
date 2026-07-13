@@ -54,6 +54,7 @@ interface RuntimeState extends OrchestratorState {
     fallbackCount: number;
     estimatedCostUsd?: number;
     failureCategories?: string[];
+    attemptedModels: string[];
     decisionId: string;
     profileVersion: string;
     task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
@@ -712,7 +713,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         taskFeaturesHash: plan.taskFeaturesHash,
         fallbackCount: failed.length,
         ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
-        failureCategories: [],
+        failureCategories: failed.map(fastFailureCategory),
+        attemptedModels: [...failed, `${candidate.provider}/${candidate.model} (selected)`],
         decisionId: `${state.runId ?? "unknown"}:${stage}:${(state.modelSelections?.length ?? 0) + 1}`,
         profileVersion: candidate.profileVersion ?? "legacy-role",
         task: {
@@ -730,6 +732,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
     await abortForModelError(ctx, `${role} has no eligible model (${[...failed, ...exclusions].join(", ") || "no candidates"})`);
     return false;
+  }
+
+  function fastFailureCategory(value: string): string {
+    if (value.includes("provider error")) return "provider-error";
+    if (value.includes("not found")) return "not-found";
+    return "unavailable";
   }
 
   async function retryAfterProviderError(ctx: ExtensionContext): Promise<boolean> {
