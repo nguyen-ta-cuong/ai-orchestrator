@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ConfigProvenance, OrchestratorConfig, RoleName, ThinkingLevel } from "../core/config.js";
 import { lifecycleModelChoices } from "../core/lifecycleRouting.js";
 import {
+  modelIdentityKey,
   rankModels,
   type ModelSelectionIdentity,
   type RankedModelCandidate,
@@ -92,21 +93,23 @@ function capabilityPolicy(input: CreatePiRoutingPlanInput): RoutingPolicy {
 
 function legacyCandidates(input: CreatePiRoutingPlanInput): PiRoutingCandidate[] {
   const available = normalizePiModelCatalog(input.available).map(({ provider, model }) => ({ provider, model }));
-  if (input.stage !== "build" && input.stage !== "fast-judge") {
-    const choices = lifecycleModelChoices(
+  const candidates = input.stage !== "build" && input.stage !== "fast-judge"
+    ? lifecycleModelChoices(
       input.stage,
       input.config,
       available,
       input.config.roles[input.role],
-    );
-    return choices.map((choice, index) => ({
+    ).map((choice, index) => ({
       ...choice.candidate,
       rank: index + 1,
       reason: choice.reason,
-    }));
-  }
-  const role = input.config.roles[input.role];
-  return [{ ...role, rank: 1, reason: `legacy ${input.role} role selection` }];
+    }))
+    : [{ ...input.config.roles[input.role], rank: 1, reason: `legacy ${input.role} role selection` }];
+
+  if (!["verify", "debug", "review", "ship", "fast-judge"].includes(input.stage)) return candidates;
+  const builder = [...(input.priorSelections ?? [])].reverse().find((selection) => selection.stage === "build");
+  if (!builder) return candidates;
+  return candidates.filter((candidate) => modelIdentityKey(candidate) !== modelIdentityKey(builder));
 }
 
 function rankedCandidate(candidate: RankedModelCandidate, index: number): PiRoutingCandidate {
