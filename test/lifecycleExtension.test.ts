@@ -418,6 +418,8 @@ describe("lifecycle Pi extension safety", () => {
     const buildRun = makeRun("building");
     const buildHarness = extensionHarness(buildRun.cwd);
     await buildHarness.commands.get("lifecycle")!("resume", buildHarness.ctx);
+    expect(buildHarness.activeTools()).not.toContain("bash");
+    expect(buildHarness.activeTools()).not.toContain("agent_team");
 
     await expect(buildHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
     await expect(buildHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git -C . commit -am bypass" } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
