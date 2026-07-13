@@ -428,6 +428,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     writeState(created.paths, state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
     const baseline = await workingTreeStatus(ctx);
+    if (!ownsRun(state.runId, "defining")) return;
     runtime.state.baselinePaths = baseline?.paths;
     runtime.state.baselineStagedPaths = baseline?.stagedPaths;
     writeState(created.paths, runtime.state);
@@ -462,6 +463,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     writeState(created.paths, state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
     const baseline = await workingTreeStatus(ctx);
+    if (!ownsRun(state.runId, "defining")) return;
     runtime.state.baselinePaths = baseline?.paths;
     runtime.state.baselineStagedPaths = baseline?.stagedPaths;
     writeState(created.paths, runtime.state);
@@ -708,10 +710,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       const eligible = plan.candidates.some((candidate) => candidate.provider === saved.provider && candidate.model === saved.model);
       const model = eligible ? ctx.modelRegistry.find(saved.provider, saved.model) : undefined;
+      const expectedRunId = runtime.state.runId;
+      const expectedPhase = runtime.state.phase;
       if (!model || !(await pi.setModel(model))) {
+        if (!ownsRun(expectedRunId, expectedPhase)) return false;
         await modelFailure(ctx, stage, [`saved selection ${saved.provider}/${saved.model} is unavailable or ineligible`]);
         return false;
       }
+      if (!ownsRun(expectedRunId, expectedPhase)) return false;
       pi.setThinkingLevel(saved.thinking);
       runtime.state.modelRestored = false;
       writeState(runtime.paths, runtime.state);
@@ -744,7 +750,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
         continue;
       }
-      if (!runtime || runtime.state.runId !== expectedRunId || runtime.state.phase !== expectedPhase) return false;
+      if (!runtime || !ownsRun(expectedRunId, expectedPhase)) return false;
       attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "selected" });
       pi.setThinkingLevel(candidate.thinking);
       recordModelSelection(stage, candidate, plan, attempts);
@@ -833,7 +839,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     });
     if (decision.allowed === true) return true;
     if (decision.allowed === "ask") {
+      const expectedRunId = runtime.state.runId;
+      const expectedPhase = runtime.state.phase;
       const confirmed = ctx.hasUI && await ctx.ui.confirm("Routing budget warning", `${decision.reason}\n\nContinue with ${candidate.provider}/${candidate.model}?`);
+      if (!ownsRun(expectedRunId, expectedPhase)) return false;
       if (confirmed) return true;
     }
     await interruptRun(ctx, `Lifecycle ${stage} paused by routing budget: ${decision.reason}`);
