@@ -132,7 +132,7 @@ export interface RoutingRequest {
 }
 
 export interface ScoreComponent {
-  name: "capability-fit" | "profile-confidence" | "provider-diversity" | "estimated-cost" | "unknown-cost";
+  name: "capability-fit" | "task-feature-fit" | "profile-confidence" | "provider-diversity" | "estimated-cost" | "unknown-cost";
   value: number;
   detail: string;
 }
@@ -436,6 +436,7 @@ function scoreModel(
   const capabilityFit = totalWeight === 0
     ? 0
     : Math.round(weights.reduce((sum, [name, weight]) => sum + profile.scores[name] * weight, 0) / totalWeight);
+  const taskFeatureFit = scoreTaskFeatureFit(profile.scores, request.task);
   const confidence = Math.round(profile.confidence * request.policy.confidenceBonusBasisPoints / 10_000);
   const builder = latestBuildSelection(request.priorSelections);
   const family = profile.family ?? model.family;
@@ -447,6 +448,7 @@ function scoreModel(
 
   return [
     { name: "capability-fit", value: capabilityFit, detail: `weighted ${request.stage} capability fit` },
+    { name: "task-feature-fit", value: taskFeatureFit, detail: `fit for ${request.task.workKind}, risk, scale, and failure signals` },
     { name: "profile-confidence", value: confidence, detail: `profile confidence ${profile.confidence}` },
     { name: "provider-diversity", value: diversity, detail: diversity > 0 ? "different family from BUILD" : "no diversity bonus" },
     {
@@ -455,6 +457,27 @@ function scoreModel(
       detail: estimatedCostUsd === undefined ? "cost metadata unavailable" : `estimated $${estimatedCostUsd.toFixed(4)}`,
     },
   ];
+}
+
+function scoreTaskFeatureFit(scores: ModelCapabilityScores, task: TaskFeatures): number {
+  const relevant: number[] = [];
+  const byWorkKind: Record<TaskFeatures["workKind"], readonly CapabilityName[]> = {
+    feature: ["architecture", "coding"],
+    "bug-fix": ["debugging", "coding"],
+    refactor: ["architecture", "coding", "review"],
+    migration: ["architecture", "longContext", "review"],
+    "test-only": ["verification", "structuredOutput"],
+    documentation: ["requirements", "longContext"],
+    configuration: ["architecture", "review"],
+    release: ["release", "review"],
+    unknown: [],
+  };
+  for (const capability of byWorkKind[task.workKind]) relevant.push(scores[capability]);
+  if (task.risk === "high" || task.riskSignals.length > 0) relevant.push(scores.review, scores.verification);
+  if (task.failureSignals.length > 0) relevant.push(scores.debugging, scores.verification);
+  if (task.fileCount >= 10 || task.contextTokens >= 64_000) relevant.push(scores.longContext, scores.architecture);
+  if (task.languages.length > 1) relevant.push(scores.longContext);
+  return relevant.length === 0 ? 0 : Math.round(relevant.reduce((sum, value) => sum + value, 0) / relevant.length / 5);
 }
 
 function latestBuildSelection(selections: readonly ModelSelectionIdentity[]): ModelSelectionIdentity | undefined {
