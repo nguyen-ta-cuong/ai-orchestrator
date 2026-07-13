@@ -444,6 +444,25 @@ describe("lifecycle Pi extension safety", () => {
     expect(harness.activeTools()).toEqual(["read", "grep", "find", "ls", "bash", "ship_decision"]);
   });
 
+  it("recovers a checker verdict persisted before agent settlement", async () => {
+    const run = makeRun("verifying");
+    const first = extensionHarness(run.cwd);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    const verifyTool = vi.mocked(first.pi.registerTool).mock.calls.find(([tool]) => (tool as { name?: string }).name === "verify_verdict")?.[0] as {
+      execute: (id: string, params: unknown) => Promise<unknown>;
+    };
+    await verifyTool.execute("verdict", { verdict: "approve", reasons: "tests pass" });
+    expect(readState(run.paths)?.pendingCheckerVerdict).toMatchObject({ phase: "verifying", verdict: "approve" });
+    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+
+    const resumed = extensionHarness(run.cwd);
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+
+    expect(readState(run.paths)?.phase).not.toBe("verifying");
+    expect(readState(run.paths)?.pendingCheckerVerdict).toBeUndefined();
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("VERIFY approve: tests pass");
+  });
+
   it("persists modelRestored on the authoritative runtime state", async () => {
     const run = makeRun("shipping");
     const harness = extensionHarness(run.cwd);
