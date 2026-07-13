@@ -405,7 +405,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
 function validateCapabilityRouting(routing: Record<string, unknown>): void {
   requireStringEnum(routing.engine, "routing.engine", ["legacy", "capability-shadow", "capability"] as const);
   requireStringEnum(routing.mode, "routing.mode", ["quality", "balanced", "economy", "pinned", "custom"] as const);
-  requireNonEmptyString(routing.version, "routing.version");
+  requireMetadataToken(routing.version, "routing.version");
   requireBoolean(routing.allowInferredProfiles, "routing.allowInferredProfiles");
   requireStringEnum(routing.unknownCost, "routing.unknownCost", ["exclude", "penalize", "allow"] as const);
   requireNonNegativeInteger(routing.unknownCostPenaltyBasisPoints, "routing.unknownCostPenaltyBasisPoints");
@@ -469,12 +469,12 @@ function validateCapabilityRouting(routing: Record<string, unknown>): void {
       throw new Error("routing.profiles keys must be non-empty provider/model identities");
     }
     const profile = requirePlainObject(value, `routing.profiles.${identity}`);
-    if (profile.family !== undefined) requireNonEmptyString(profile.family, `routing.profiles.${identity}.family`);
+    if (profile.family !== undefined) requireMetadataToken(profile.family, `routing.profiles.${identity}.family`);
     requireBasisPoints(profile.confidence, `routing.profiles.${identity}.confidence`);
     if (profile.provenance !== undefined) {
       requireStringEnum(profile.provenance, `routing.profiles.${identity}.provenance`, ["user", "project", "builtin", "observed", "inferred"] as const);
     }
-    if (profile.version !== undefined) requireNonEmptyString(profile.version, `routing.profiles.${identity}.version`);
+    if (profile.version !== undefined) requireMetadataToken(profile.version, `routing.profiles.${identity}.version`);
     validateCapabilityValues(profile.scores, `routing.profiles.${identity}.scores`, true);
   }
 }
@@ -547,6 +547,12 @@ function validateRoleConfig(value: unknown, path: string): void {
 function requireNonEmptyString(value: unknown, path: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+function requireMetadataToken(value: unknown, path: string): void {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:@/-]{1,128}$/.test(value)) {
+    throw new Error(`${path} must be a bounded canonical metadata token`);
   }
 }
 
