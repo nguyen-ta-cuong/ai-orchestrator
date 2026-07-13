@@ -657,8 +657,21 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         unattended: state.yolo || !ctx.hasUI,
       });
       if (budget.allowed !== true) {
-        await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
-        return false;
+        if (budget.allowed === "ask") {
+          const expectedRunId = state.runId;
+          const expectedPhase = state.phase;
+          const confirmed = ctx.hasUI && await ctx.ui.confirm("Routing budget warning", `${budget.reason}\n\nContinue with ${candidate.provider}/${candidate.model}?`);
+          if (state.runId !== expectedRunId || state.phase !== expectedPhase) return false;
+          if (confirmed) {
+            // Explicit interactive approval applies only to this candidate invocation.
+          } else {
+            await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
+            return false;
+          }
+        } else {
+          await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
+          return false;
+        }
       }
       const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
       if (!model) {
