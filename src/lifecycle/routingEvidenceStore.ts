@@ -15,6 +15,16 @@ export interface ReadRoutingEvidenceResult {
   warnings: string[];
 }
 
+export interface RoutingBudgetLedgerEvent {
+  version: 1;
+  eventId: string;
+  runId: string;
+  recordedAt: string;
+  outcome: "stage-started" | "stage-ended";
+  estimatedUsd?: number;
+  observedUsd?: number;
+}
+
 const MAX_EVIDENCE_LINE_BYTES = 256 * 1024;
 
 export function appendRoutingEvidenceEvent(input: AppendRoutingEvidenceInput): void {
@@ -30,6 +40,28 @@ export function appendUserRoutingEvidenceEvent(userStoreRoot: string, event: Rou
   const validation = validateRoutingEvidenceEvent(event);
   if (!validation.ok) throw new Error(`routing evidence event is invalid: ${validation.error}`);
   appendJsonLine(join(userStoreRoot, "events.jsonl"), event);
+}
+
+export function appendRoutingBudgetLedgerEvent(userStoreRoot: string, event: RoutingBudgetLedgerEvent): void {
+  validateBudgetLedgerEvent(event);
+  appendJsonLine(join(userStoreRoot, "budget.jsonl"), event);
+}
+
+export function readRoutingBudgetLedger(path: string): RoutingBudgetLedgerEvent[] {
+  if (!existsSync(path)) return [];
+  const events: RoutingBudgetLedgerEvent[] = [];
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    if (!line) continue;
+    try {
+      const value = JSON.parse(line) as RoutingBudgetLedgerEvent;
+      validateBudgetLedgerEvent(value);
+      events.push(value);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`routing budget ledger is corrupt: ${message}`);
+    }
+  }
+  return events;
 }
 
 export function readRoutingEvidenceEvents(path: string): ReadRoutingEvidenceResult {
@@ -85,7 +117,7 @@ export function resolveUserEvidenceRoot(home = homedir(), configured = "routing-
   return root;
 }
 
-function appendJsonLine(path: string, value: RoutingEvidenceEvent): void {
+function appendJsonLine(path: string, value: { eventId: string }): void {
   const line = JSON.stringify(value);
   if (Buffer.byteLength(line, "utf8") > MAX_EVIDENCE_LINE_BYTES) {
     throw new Error(`routing evidence event exceeds ${MAX_EVIDENCE_LINE_BYTES} bytes`);
@@ -107,6 +139,15 @@ function appendJsonLine(path: string, value: RoutingEvidenceEvent): void {
     if (duplicate) return;
   }
   writeFileSync(path, `${line}\n`, { flag: "a" });
+}
+
+function validateBudgetLedgerEvent(event: RoutingBudgetLedgerEvent): void {
+  if (event.version !== 1 || !event.eventId || !event.runId || !event.recordedAt ||
+    (event.outcome !== "stage-started" && event.outcome !== "stage-ended") ||
+    (event.estimatedUsd !== undefined && (!Number.isFinite(event.estimatedUsd) || event.estimatedUsd < 0)) ||
+    (event.observedUsd !== undefined && (!Number.isFinite(event.observedUsd) || event.observedUsd < 0))) {
+    throw new Error("routing budget ledger event is invalid");
+  }
 }
 
 function assertNoSymlinkComponents(target: string): void {
