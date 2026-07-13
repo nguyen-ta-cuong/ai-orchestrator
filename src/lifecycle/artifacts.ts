@@ -80,6 +80,9 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
 export function currentRun(cwd: string, artifactsDir: string): { runId: string; paths: RunPaths } | undefined {
   assertArtifactRootSafe(cwd, artifactsDir);
   const registry = readActiveRunRegistry(cwd);
+  if (!registry && existsSync(repositoryActiveRunPath(cwd))) {
+    throw new Error("Lifecycle repository active-run registry is corrupt; explicit recovery is required");
+  }
   if (registry) {
     assertArtifactRootSafe(cwd, registry.artifactsDir);
     return { runId: registry.runId, paths: pathsForRun(cwd, registry.artifactsDir, registry.runId) };
