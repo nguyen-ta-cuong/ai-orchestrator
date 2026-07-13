@@ -45,6 +45,7 @@ export interface LifecycleModelSelection {
     decisionId: string;
     engine: "legacy" | "capability-shadow" | "capability";
     policyVersion: string;
+    profileVersion?: string;
     taskFeaturesHash: string;
     selectedRank: number;
     score?: number;
