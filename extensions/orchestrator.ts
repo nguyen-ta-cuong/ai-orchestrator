@@ -256,11 +256,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   pi.on("message_end", async (event) => {
     if (!runtime || !event.message || event.message.role !== "assistant" || !event.message.usage) return;
     state.lastUsage = {
-      inputTokens: event.message.usage.input,
-      outputTokens: event.message.usage.output,
-      cacheReadTokens: event.message.usage.cacheRead,
-      cacheWriteTokens: event.message.usage.cacheWrite,
-      observedUsd: event.message.usage.cost.total,
+      inputTokens: (state.lastUsage?.inputTokens ?? 0) + event.message.usage.input,
+      outputTokens: (state.lastUsage?.outputTokens ?? 0) + event.message.usage.output,
+      cacheReadTokens: (state.lastUsage?.cacheReadTokens ?? 0) + event.message.usage.cacheRead,
+      cacheWriteTokens: (state.lastUsage?.cacheWriteTokens ?? 0) + event.message.usage.cacheWrite,
+      observedUsd: (state.lastUsage?.observedUsd ?? 0) + event.message.usage.cost.total,
     };
   });
 
@@ -759,7 +759,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         },
         selectedAt: new Date().toISOString(),
       };
-      state = { ...state, modelSelections: [...(state.modelSelections ?? []), selection] };
+      state = { ...state, modelSelections: [...(state.modelSelections ?? []), selection], lastUsage: undefined };
       persist();
       persistFastStageStarted(selection);
       return true;
@@ -790,6 +790,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       : state.phase === "coding" ? "build" : state.phase === "judging" ? "fast-judge" : undefined;
     const role = stage === "plan" ? "planner" : stage === "build" ? "coder" : stage === "fast-judge" ? "judge" : undefined;
     if (!stage || !role) return false;
+    persistFastStageOutcome(stage, "unknown", false);
     const current = [...(state.modelSelections ?? [])].reverse().find((selection) => selection.stage === stage);
     if (current) {
       current.failureCategories = [...(current.failureCategories ?? []), "provider-error"];

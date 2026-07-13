@@ -80,6 +80,7 @@ describe("fast Pi capability routing", () => {
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "planner-backup"]);
 
+    await events.get("message_end")!({ message: { role: "assistant", usage: { input: 50, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } }, ctx as unknown as ExtensionContext);
     await events.get("message_end")!({ message: { role: "assistant", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } }, ctx as unknown as ExtensionContext);
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
@@ -120,7 +121,7 @@ describe("fast Pi capability routing", () => {
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     const evidence = readFileSync(join(cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8")
       .trim().split("\n").map((line) => JSON.parse(line));
-    expect(evidence.filter((event) => event.outcome.type === "stage-ended").map((event) => event.cost.observedUsd)).toEqual([0.02, 0.04]);
+    expect(evidence.filter((event) => event.outcome.type === "stage-ended").map((event) => event.cost.observedUsd)).toEqual(["unknown", 0.03, 0.04]);
     expect(evidence.some((event) => event.stage === "fast-judge" && event.outcome.type === "stage-ended")).toBe(false);
 
     setModel.mockImplementation(async (model: unknown) => (model as { id: string }).id !== "model");
