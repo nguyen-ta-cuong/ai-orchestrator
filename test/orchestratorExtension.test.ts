@@ -91,5 +91,21 @@ describe("fast Pi capability routing", () => {
       ["plan", "planner"], ["build", "coder"], ["fast-judge", "checker"],
     ]);
     expect(activeTools).toContain("judge_verdict");
+
+    setModel.mockImplementation(async (model: unknown) => (model as { id: string }).id !== "model");
+    await commands.get("orchestrate-stop")!("", ctx);
+    const pending = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; originalModel?: { id: string } };
+    expect(pending).toMatchObject({ phase: "idle", originalModel: { id: "model" } });
+    const callsBeforeBlockedStart = setModel.mock.calls.length;
+    await commands.get("orchestrate")!("--yolo another task", ctx);
+    expect(setModel).toHaveBeenCalledTimes(callsBeforeBlockedStart);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("restoration is pending"), "error");
+
+    setModel.mockResolvedValue(true);
+    await commands.get("orchestrate-stop")!("", ctx);
+    const restored = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; originalModel?: unknown };
+    expect(restored.phase).toBe("idle");
+    expect(restored.originalModel).toBeUndefined();
+    expect(activeTools).toEqual(["read", "edit", "bash"]);
   });
 });
