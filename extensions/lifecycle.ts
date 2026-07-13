@@ -33,6 +33,7 @@ import {
   type LifecycleStageVerdict,
   type LifecycleState,
 } from "../src/core/lifecycle.js";
+import { recommendRoutingPolicyChanges } from "../src/core/routingEvidence.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import {
@@ -124,6 +125,23 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       } else {
         await startPipeline(args, ctx);
       }
+    },
+  });
+
+  pi.registerCommand("lifecycle-routing-report", {
+    description: "Show report-only routing recommendations from privacy-minimized user evidence",
+    handler: async (_args, ctx) => {
+      await ctx.waitForIdle();
+      const config = loadPiConfig(ctx.cwd);
+      const store = join(resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir), "events.jsonl");
+      const read = readRoutingEvidenceEvents(store);
+      const recommendations = recommendRoutingPolicyChanges(read.events, {
+        minimumSamples: config.routing.evidence.minRecommendationSamples,
+      });
+      const content = recommendations.length > 0
+        ? `Routing recommendations (report only; no policy was changed):\n\n${JSON.stringify(recommendations, null, 2)}`
+        : `No routing recommendation met the ${config.routing.evidence.minRecommendationSamples}-sample threshold across ${read.events.length} valid events.`;
+      pi.sendMessage({ customType: ENTRY_TYPE, content, display: true, details: { recommendations, warnings: read.warnings } }, { triggerTurn: false });
     },
   });
 
