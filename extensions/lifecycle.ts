@@ -1642,6 +1642,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         return "failed";
       }
     }
+    const staged = await workingTreeStatus(ctx);
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!staged || !sameStringSet(files, staged.stagedPaths)) {
+      notify(ctx, "Refusing to commit because the staged index does not exactly match the confirmed lifecycle manifest.", "error");
+      return "failed";
+    }
     const message = runtime.state.finalization?.commitMessage ?? `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
     const commit = await pi.exec("git", ["commit", "-m", message], { timeout: 30_000, signal: ctx.signal });
     if (!ownsRun(runId, "finalizing")) return "failed";
