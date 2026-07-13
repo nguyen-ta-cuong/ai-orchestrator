@@ -146,6 +146,16 @@ describe("capability model routing", () => {
     expect(exactDecision.excluded.find((item) => item.identity.model === "build")?.code).toBe("same-builder-model");
     expect(exactDecision.eligible.map((item) => item.identity.model)).toEqual(["review"]);
 
+    const separationDisabled = structuredClone(DEFAULT_ROUTING_POLICY);
+    separationDisabled.separation.checkerMustDifferFromBuilder = false;
+    expect(rankModels(request([exact], profiles, { priorSelections, policy: separationDisabled })).excluded[0]?.code).toBe("same-builder-model");
+
+    const previousBuilder = { stage: "build" as const, provider: "old", model: "builder", family: "family-old" };
+    const latestDecision = rankModels(request([exact, sibling], profiles, {
+      priorSelections: [previousBuilder, ...priorSelections],
+    }));
+    expect(latestDecision.excluded.find((item) => item.identity.model === "build")?.code).toBe("same-builder-model");
+
     const strictPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
     strictPolicy.separation.requireDifferentProviderFamilyFor = ["review"];
     const familyDecision = rankModels(request([exact, sibling], profiles, { priorSelections, policy: strictPolicy }));
