@@ -170,33 +170,36 @@ export function recommendRoutingPolicyChanges(
   for (const [key, group] of groups) {
     if (group.length < minimumSamples) continue;
     const [stage, workKind, risk] = key.split("\u0000") as [RoutingStage, string, string];
-    const modelStats = new Map<string, { model: EvidenceModelIdentity; count: number; approvals: number; cost: number }>();
+    const modelStats = new Map<string, { model: EvidenceModelIdentity; count: number; successes: number; reversals: number; overrides: number; cost: number }>();
     for (const event of group) {
       const identity = identityKey(event.selected);
-      const stats = modelStats.get(identity) ?? { model: event.selected, count: 0, approvals: 0, cost: 0 };
+      const stats = modelStats.get(identity) ?? { model: event.selected, count: 0, successes: 0, reversals: 0, overrides: 0, cost: 0 };
       stats.count += 1;
-      if (event.outcome.verdict === "approve" || event.outcome.finalRunStatus === "done") stats.approvals += 1;
+      if (event.outcome.laterReversal) stats.reversals += 1;
+      if (event.outcome.humanOverride) stats.overrides += 1;
+      const initiallySuccessful = event.outcome.verdict === "approve" || event.outcome.finalRunStatus === "done";
+      if (initiallySuccessful && !event.outcome.laterReversal && !event.outcome.humanOverride) stats.successes += 1;
       if (typeof event.cost.observedUsd === "number") stats.cost += event.cost.observedUsd;
       modelStats.set(identity, stats);
     }
     const ranked = [...modelStats.values()].sort((left, right) => {
-      const leftRate = left.approvals / left.count;
-      const rightRate = right.approvals / right.count;
+      const leftRate = left.successes / left.count;
+      const rightRate = right.successes / right.count;
       if (rightRate !== leftRate) return rightRate - leftRate;
       return left.cost / left.count - right.cost / right.count;
     });
     const best = ranked[0];
     const second = ranked[1];
     if (!best || !second) continue;
-    const bestRate = best.approvals / best.count;
-    const secondRate = second.approvals / second.count;
+    const bestRate = best.successes / best.count;
+    const secondRate = second.successes / second.count;
     if (bestRate - secondRate < 0.15) continue;
     recommendations.push({
       stage,
       taskCategory: `${workKind}/${risk}`,
       sampleCount: group.length,
       uncertainty: `simple approval-rate band: ${Math.round(bestRate * 100)}% vs ${Math.round(secondRate * 100)}% across ${group.length} samples`,
-      downstreamEvidence: `${best.approvals}/${best.count} downstream approvals or completions for ${identityKey(best.model)}`,
+      downstreamEvidence: `${best.successes}/${best.count} non-reversed, non-overridden downstream successes for ${identityKey(best.model)}; ${best.reversals} reversals; ${best.overrides} human overrides`,
       expectedTradeoff: `Prefer ${identityKey(best.model)}; average observed cost $${averageCost(best).toFixed(4)} versus $${averageCost(second).toFixed(4)} for next ranked observed model.`,
       recommendedChange: { kind: "prefer-model", provider: best.model.provider, model: best.model.model },
       rollback: `Remove ${identityKey(best.model)} from routing.stages.${stage}.prefer or restore the previous user config version.`,
