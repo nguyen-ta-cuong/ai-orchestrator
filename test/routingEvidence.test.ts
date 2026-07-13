@@ -53,6 +53,7 @@ describe("routing evidence", () => {
     const samples = Array.from({ length: 10 }, (_, index): RoutingEvidenceEvent => ({
       ...baseEvent,
       eventId: `event-${index}`,
+      runId: `run-${index}`,
       decisionId: `decision-${index}`,
       selected: { provider: "p", model: index < 7 ? "strong" : "cheap", family: "family-a" },
       cost: { estimatedUsd: index < 7 ? 0.04 : 0.01, observedUsd: index < 7 ? 0.04 : 0.01 },
@@ -69,6 +70,18 @@ describe("routing evidence", () => {
       recommendedChange: { kind: "prefer-model", provider: "p", model: "strong" },
     });
     expect(recommendations[0]?.rollback).toContain("Remove");
+    const buildStageEvents = samples.map((sample) => ({
+      ...sample,
+      outcome: { type: "stage-ended" as const, verdict: "unknown" as const, buildIteration: 1 },
+    }));
+    const finalEvents = samples.map((sample) => ({
+      ...sample,
+      eventId: `${sample.eventId}-final`,
+      outcome: { type: "final-status" as const, finalRunStatus: sample.selected.model === "strong" ? "done" as const : "failed" as const, buildIteration: 1 },
+    }));
+    expect(recommendRoutingPolicyChanges([...buildStageEvents, ...finalEvents])[0]).toMatchObject({
+      recommendedChange: { kind: "prefer-model", provider: "p", model: "strong" },
+    });
     const mixedVersions = samples.map((sample, index) => ({ ...sample, profileVersion: index < 5 ? "profiles-v1" : "profiles-v2" }));
     expect(recommendRoutingPolicyChanges(mixedVersions)).toEqual([]);
   });
