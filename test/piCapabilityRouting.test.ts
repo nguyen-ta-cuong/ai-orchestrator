@@ -73,11 +73,11 @@ describe("Pi capability routing plan", () => {
     expect(plan.candidates[0]).toMatchObject({ provider: "private", model: "trusted-coder" });
   });
 
-  it("keeps legacy and shadow engines on exact legacy selection", () => {
+  it("keeps legacy and shadow engines on exact legacy selection without allowing self-review", () => {
     for (const engine of ["legacy", "capability-shadow"] as const) {
       const config = structuredClone(DEFAULT_CONFIG);
       config.routing.engine = engine;
-      const plan = createPiRoutingPlan({
+      const build = createPiRoutingPlan({
         config,
         provenance: builtin,
         stage: "build",
@@ -85,7 +85,22 @@ describe("Pi capability routing plan", () => {
         available: [available("openai-codex", "gpt-5.5")],
         evidence: "task",
       });
-      expect(plan.candidates[0]).toMatchObject({ provider: "openai-codex", model: "gpt-5.5" });
+      expect(build.candidates[0]).toMatchObject({ provider: "openai-codex", model: "gpt-5.5" });
+
+      config.roles.judge = { ...config.roles.coder };
+      const judge = createPiRoutingPlan({
+        config,
+        provenance: builtin,
+        stage: "fast-judge",
+        role: "judge",
+        available: [available("openai-codex", "gpt-5.5")],
+        evidence: "task",
+        priorSelections: [
+          { stage: "build", provider: "old", model: "builder" },
+          { stage: "build", provider: "openai-codex", model: "gpt-5.5" },
+        ],
+      });
+      expect(judge.candidates).toEqual([]);
     }
   });
 });
