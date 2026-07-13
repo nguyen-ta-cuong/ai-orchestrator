@@ -24,6 +24,26 @@ The adapters intentionally differ where their hosts differ:
 
 For MCP, Cursor supplies the task, repository context, diff, tests, loop counters, and coder identity. The server treats supplied text as untrusted data and does not inspect the repository.
 
+## Design influences and deliberate differences
+
+The project uses Geoffrey Huntley’s [Ralph Wiggum technique](https://ghuntley.com/ralph/) as an iteration discipline: keep specifications and the prioritized plan in repository state, search before assuming work is missing, take one highest-value item per loop, and apply fast build/test backpressure before the next loop. It does **not** copy Ralph as an unattended greenfield Bash loop. This package targets existing repositories where deterministic state machines, bounded attempts and spend, independent checking, human gates, and recoverable artifacts are required.
+
+The supplied reference architecture can be summarized as:
+
+```text
+                         USER
+                  (approval gate owner)
+                           |
+                       ORCHESTRATOR
+            coordination · gates · Git policy
+               (never authors feature code)
+                 /          |          \
+            PLANNER     IMPLEMENTER    CHECKERS
+             plan       source + tests  verdict + smoke evidence
+```
+
+AI Orchestrator preserves those ownership boundaries but deliberately uses host-native mechanics rather than reproducing the diagram exactly. Pi switches role models inside one session; the durable lifecycle adds DEFINE, read-only DEBUG, and SHIP; MCP routes only its server-side planner/checker while Cursor remains the manually selected implementer. In every surface, the latest maker identity is excluded from checking, and Git publication remains orchestrator-owned and explicitly gated.
+
 ## Requirements
 
 - Node.js 20 or newer.
@@ -102,7 +122,7 @@ The run directory is authoritative:
   evidence.jsonl
 ```
 
-Standalone stage commands do not skip or rewind `state.json`. VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses; BUILD edits. A checker cannot approve the exact BUILD identity, and configured family separation can be stricter. Commit/PR actions remain configuration- and confirmation-gated; SHIP never pushes.
+Standalone stage commands do not skip or rewind `state.json`. VERIFY, REVIEW, DEBUG, and SHIP are read-only. DEBUG diagnoses; BUILD edits. A checker cannot approve the exact BUILD identity, and configured family separation can be stricter. Commit/PR actions remain configuration- and explicit-confirmation-gated; even `ship.commit: "auto"` cannot bypass the per-run confirmation. SHIP never pushes, and PR creation requires an already-pushed upstream whose tip matches local `HEAD`.
 
 ## Cursor installation
 
@@ -259,7 +279,7 @@ The fresh default is `routing.engine: "capability-shadow"`.
 | `capability-shadow` | Exact configured legacy roles/routes | Capability candidates are ranked observationally |
 | `capability` | Capability ranking is active | Shows the same candidate policy used by active calls |
 
-For MCP, active capability routing requires a non-empty trusted `mcp.models` catalog. If the catalog is empty, even `capability` falls back to the exact planner/judge role and reports `legacyFallback: true`. In active MCP capability mode, identity pins are `routing.stages.plan.pins` and `routing.stages.fast-judge.pins`; `roles.*` are legacy fallbacks, not implicit catalog pins. Pi additionally interprets explicitly configured role identities through its local-registry pin policy.
+For MCP, active capability routing requires a non-empty trusted `mcp.models` catalog and fails closed when none is configured. `legacy` and `capability-shadow` continue to use exact planner/judge roles and report `legacyFallback: true`; preview can still explain the exact fallback when no catalog exists. In active MCP capability mode, identity pins are `routing.stages.plan.pins` and `routing.stages.fast-judge.pins`; `roles.*` are legacy routes, not implicit catalog pins. Pi additionally interprets explicitly configured role identities through its local-registry pin policy.
 
 `orchestrator_models` accepts `stage: "plan" | "fast-judge"`, a task, optional validated task features, and optional `coderIdentity`. It invokes no model and returns no endpoint, header, credential, or key state. It returns:
 
@@ -285,7 +305,7 @@ legacyFallback
 
 The judge also returns a structured verdict, required fixes when rejecting, `nextAction`, and the exact counters for the next call.
 
-`coderIdentity` must use canonical `provider/model` syntax without whitespace. In active capability mode, `orchestrator_judge` requires it whenever independent-checker, exact-model, or `fast-judge` family separation policy is enabled. Strict mode always excludes the exact coder. If that identity exists in the trusted MCP catalog, its configured/profile family is used for family separation; otherwise strict family separation fails closed rather than inferring family from a name. Legacy and shadow calls preserve compatibility and do not activate this catalog check, so clients must still record an independent handoff. The identity is a client declaration; the server reports the comparison but cannot attest Cursor's actual host selection.
+`coderIdentity` must use canonical `provider/model` syntax without whitespace. Every `orchestrator_judge` call requires it and excludes the exact coder, including legacy and shadow engines. If that identity exists in the trusted MCP catalog, its configured/profile family is used for configured family separation; otherwise strict family separation fails closed rather than inferring family from a name. The identity is a client declaration; the server reports the comparison but cannot attest Cursor's actual host selection.
 
 ### Provider compatibility and completion fallback
 
