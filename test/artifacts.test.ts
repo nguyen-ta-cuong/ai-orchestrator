@@ -334,6 +334,16 @@ describe("lifecycle artifacts", () => {
     expect(exclude).not.toContain("/.orch/current.lock/");
   });
 
+  it("fails closed when the repository active-run registry is corrupt", () => {
+    const cwd = makeTempDir();
+    const registry = join(cwd, ".ai-orchestrator", "active-run.json");
+    mkdirSync(join(registry, ".."), { recursive: true });
+    writeFileSync(registry, "not-json\n");
+
+    expect(() => currentRun(cwd, artifactsDir)).toThrow(/registry is corrupt/);
+    expect(() => createRun(cwd, artifactsDir, "blocked")).toThrow(/registry is corrupt/);
+  });
+
   it("keeps repository ownership visible after artifactsDir changes", () => {
     const cwd = makeTempDir();
     const first = createRun(cwd, ".one/runs", "first");
