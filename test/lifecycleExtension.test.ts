@@ -437,6 +437,24 @@ describe("lifecycle Pi extension safety", () => {
     await expect(planHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git diff" } }, planHarness.ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
   });
 
+  it("allows source edits beside a custom nested artifact directory", async () => {
+    const cwd = join(tmpdir(), `ai-orchestrator-custom-artifacts-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(cwd, { recursive: true });
+    tempDirs.push(cwd);
+    const created = createRun(cwd, "src/orch-runs", "custom artifacts");
+    const state = readState(created.paths)!;
+    Object.assign(state, { phase: "building", baselinePaths: [], baselineStagedPaths: [], originalModel: { provider: "test", id: "original", thinking: "high" }, modelRestored: false });
+    writeFileSync(created.paths.spec, "# Spec\n");
+    writeFileSync(created.paths.plan, "# Plan\n");
+    writeState(created.paths, state);
+    writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({ lifecycle: { artifactsDir: "src/orch-runs" } }));
+    const harness = extensionHarness(cwd);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    await expect(harness.events.get("tool_call")!({ toolName: "edit", input: { path: join(cwd, "src", "feature.ts") } }, harness.ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
+    await expect(harness.events.get("tool_call")!({ toolName: "edit", input: { path: created.paths.plan } }, harness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+  });
+
   it("does not expose agent_team during SHIP", async () => {
     const run = makeRun("shipping");
     const harness = extensionHarness(run.cwd);
