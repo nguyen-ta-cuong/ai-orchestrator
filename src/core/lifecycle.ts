@@ -72,6 +72,7 @@ export interface LifecycleState {
   modelSelections: LifecycleModelSelection[];
   rejectionFingerprints: string[];
   buildEvidenceFingerprints: string[];
+  planFingerprint?: string;
   routingPolicyVersion?: string;
   baselinePaths?: string[];
   baselineStagedPaths?: string[];

@@ -500,6 +500,7 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     candidate.verdicts.every(isLifecycleVerdict) &&
     (candidate.rejectionFingerprints === undefined || (Array.isArray(candidate.rejectionFingerprints) && candidate.rejectionFingerprints.every(isFingerprint))) &&
     (candidate.buildEvidenceFingerprints === undefined || (Array.isArray(candidate.buildEvidenceFingerprints) && candidate.buildEvidenceFingerprints.every(isFingerprint))) &&
+    (candidate.planFingerprint === undefined || isFingerprint(candidate.planFingerprint)) &&
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
     (candidate.routingPolicyVersion === undefined || (typeof candidate.routingPolicyVersion === "string" && candidate.routingPolicyVersion.length > 0)) &&
