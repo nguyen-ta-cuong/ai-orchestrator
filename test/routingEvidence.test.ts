@@ -69,6 +69,8 @@ describe("routing evidence", () => {
       recommendedChange: { kind: "prefer-model", provider: "p", model: "strong" },
     });
     expect(recommendations[0]?.rollback).toContain("Remove");
+    const mixedVersions = samples.map((sample, index) => ({ ...sample, profileVersion: index < 5 ? "profiles-v1" : "profiles-v2" }));
+    expect(recommendRoutingPolicyChanges(mixedVersions)).toEqual([]);
   });
 
   it("does not reward approvals that are later reversed or overridden", () => {
