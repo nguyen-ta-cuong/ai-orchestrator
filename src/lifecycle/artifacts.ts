@@ -283,7 +283,7 @@ function assertArtifactRootSafe(cwd: string, artifactsDir: string): void {
   assertNoSymlinkComponents(artifactRoot);
 }
 
-function assertRunPathsSafe(paths: RunPaths): void {
+export function assertRunPathsSafe(paths: RunPaths): void {
   for (const path of Object.values(paths)) assertNoSymlinkComponents(path);
 }
 
