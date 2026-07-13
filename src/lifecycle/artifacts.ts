@@ -329,7 +329,9 @@ function resolveGitDir(cwd: string): string | undefined {
 function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () => T): T {
   assertArtifactRootSafe(cwd, artifactsDir);
   const lockPath = currentRunLockPath(cwd, artifactsDir);
+  assertNoSymlinkComponents(lockPath);
   mkdirSync(join(lockPath, ".."), { recursive: true });
+  assertNoSymlinkComponents(lockPath);
   assertArtifactRootSafe(cwd, artifactsDir);
   const owner = `current-${process.pid}-${randomBytes(6).toString("hex")}`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
