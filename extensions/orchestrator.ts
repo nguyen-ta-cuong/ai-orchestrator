@@ -46,6 +46,7 @@ interface RuntimeState extends OrchestratorState {
     taskFeaturesHash: string;
     fallbackCount: number;
     estimatedCostUsd?: number;
+    failureCategories?: string[];
   }>;
 }
 
@@ -233,7 +234,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
           return;
         }
         if (stopReason === "error") {
-          await stopRun(ctx, "ai-orchestrator run stopped because the phase ended with a model/provider error.");
+          if (await retryAfterProviderError(ctx)) return;
+          await stopRun(ctx, "ai-orchestrator run stopped because all eligible provider fallbacks failed.");
           return;
         }
       }
@@ -588,7 +590,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
   }
 
-  async function switchToRole(role: keyof OrchestratorConfig["roles"], ctx: ExtensionContext): Promise<boolean> {
+  async function switchToRole(
+    role: keyof OrchestratorConfig["roles"],
+    ctx: ExtensionContext,
+    excludedIdentities: ReadonlySet<string> = new Set(),
+  ): Promise<boolean> {
     const resolved = runtime ?? loadPiResolvedConfig(ctx.cwd);
     runtime = resolved;
     const stage = fastRoutingStage(role);
@@ -609,6 +615,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     });
     const failed: string[] = [];
     for (const candidate of plan.candidates) {
+      const identity = `${candidate.provider}/${candidate.model}`;
+      if (excludedIdentities.has(identity)) {
+        failed.push(`${identity} (provider error)`);
+        continue;
+      }
       const estimate: RoutingCostEstimate = candidate.estimatedCostUsd === undefined
         ? { status: "unknown", reason: "candidate cost metadata unavailable" }
         : { status: "known", estimatedUsd: candidate.estimatedCostUsd };
@@ -650,6 +661,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
           taskFeaturesHash: plan.taskFeaturesHash,
           fallbackCount: failed.length,
           ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
+          failureCategories: [],
         }],
       };
       persist();
@@ -658,6 +670,35 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
     await abortForModelError(ctx, `${role} has no eligible model (${[...failed, ...exclusions].join(", ") || "no candidates"})`);
     return false;
+  }
+
+  async function retryAfterProviderError(ctx: ExtensionContext): Promise<boolean> {
+    const stage = state.phase === "planning" || state.phase === "replanning" ? "plan"
+      : state.phase === "coding" ? "build" : state.phase === "judging" ? "fast-judge" : undefined;
+    const role = stage === "plan" ? "planner" : stage === "build" ? "coder" : stage === "fast-judge" ? "judge" : undefined;
+    if (!stage || !role) return false;
+    const current = [...(state.modelSelections ?? [])].reverse().find((selection) => selection.stage === stage);
+    if (current) {
+      current.failureCategories = [...(current.failureCategories ?? []), "provider-error"];
+      persist();
+    }
+    const failed = new Set((state.modelSelections ?? [])
+      .filter((selection) => selection.stage === stage && selection.failureCategories?.includes("provider-error"))
+      .map((selection) => `${selection.provider}/${selection.model}`));
+    const ok = await switchToRole(role, ctx, failed);
+    if (!ok) return true;
+
+    if (state.phase === "planning") {
+      pi.sendUserMessage(plannerPrompt(state.task), { deliverAs: "followUp" });
+    } else if (state.phase === "replanning") {
+      pi.sendUserMessage(replanPrompt(state.task, state.plan ?? "", await getDiffSummary(ctx), state.judgeReports), { deliverAs: "followUp" });
+    } else if (state.phase === "coding") {
+      pi.sendUserMessage(coderPrompt(state.plan ?? "", state.latestJudgeFeedback), { deliverAs: "followUp" });
+    } else if (state.phase === "judging") {
+      const command = runtime?.config.judge.runTests ? detectTestCommand(ctx.cwd) : undefined;
+      pi.sendUserMessage(judgePrompt(state.task, state.plan ?? "", command), { deliverAs: "followUp" });
+    }
+    return true;
   }
 
   function fastBudgetSnapshot(current: RuntimeState): RoutingBudgetSnapshot {
