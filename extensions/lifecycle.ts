@@ -1610,19 +1610,19 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, "No lifecycle-attributable source files were available to commit.", "info");
       return "skipped";
     }
+    const shouldCommit = ctx.hasUI && await ctx.ui.confirm(
+      "Commit lifecycle changes",
+      `${runtime.config.ship.commit === "auto" ? "Commit policy is auto, but explicit confirmation is still required.\n\n" : ""}Files:\n${files.map((file) => `- ${file}`).join("\n")}\n\nCommit now?`,
+    );
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!shouldCommit) return "skipped";
+    const revalidated = await changedFiles(ctx);
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!sameStringSet(files, revalidated)) {
+      notify(ctx, "Working-tree manifest changed after confirmation; commit was not attempted.", "error");
+      return "failed";
+    }
     if (!checkpointed) {
-      const shouldCommit = ctx.hasUI && await ctx.ui.confirm(
-        "Commit lifecycle changes",
-        `${runtime.config.ship.commit === "auto" ? "Commit policy is auto, but explicit confirmation is still required.\n\n" : ""}Files:\n${files.map((file) => `- ${file}`).join("\n")}\n\nCommit now?`,
-      );
-      if (!ownsRun(runId, "finalizing")) return "failed";
-      if (!shouldCommit) return "skipped";
-      const revalidated = await changedFiles(ctx);
-      if (!ownsRun(runId, "finalizing")) return "failed";
-      if (!sameStringSet(files, revalidated)) {
-        notify(ctx, "Working-tree manifest changed after confirmation; commit was not attempted.", "error");
-        return "failed";
-      }
       const base = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
       if (!ownsRun(runId, "finalizing")) return "failed";
       if (base.code !== 0 || !base.stdout.trim()) {
@@ -1711,11 +1711,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         persistMirror(runtime.state);
         return "opened";
       }
-    } else {
-      const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
-      if (!ownsRun(runId, "finalizing")) return "failed";
-      if (!confirmed) return "skipped";
     }
+    const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!confirmed) return "skipped";
     const branch = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, signal: ctx.signal });
     const localHead = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
     const upstreamHead = await pi.exec("git", ["rev-parse", "@{upstream}"], { timeout: 10_000, signal: ctx.signal });

@@ -542,11 +542,24 @@ function isLifecycleFinalization(value: unknown): boolean {
   if (value === undefined) return true;
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
-  return (candidate.commitSha === undefined || typeof candidate.commitSha === "string") &&
-    (candidate.commitBaseSha === undefined || typeof candidate.commitBaseSha === "string") &&
-    (candidate.commitMessage === undefined || typeof candidate.commitMessage === "string") &&
-    (candidate.prUrl === undefined || typeof candidate.prUrl === "string") &&
-    (candidate.prHead === undefined || typeof candidate.prHead === "string");
+  return (candidate.commitSha === undefined || isGitSha(candidate.commitSha)) &&
+    (candidate.commitBaseSha === undefined || isGitSha(candidate.commitBaseSha)) &&
+    (candidate.commitMessage === undefined || (typeof candidate.commitMessage === "string" && candidate.commitMessage.trim().length > 0 && candidate.commitMessage.length <= 200 && !/[\r\n]/.test(candidate.commitMessage))) &&
+    (candidate.prUrl === undefined || isHttpsUrl(candidate.prUrl)) &&
+    (candidate.prHead === undefined || (typeof candidate.prHead === "string" && /^[A-Za-z0-9._/-]{1,255}$/.test(candidate.prHead) && !candidate.prHead.includes("..") && !candidate.prHead.startsWith("-")));
+}
+
+function isGitSha(value: unknown): boolean {
+  return typeof value === "string" && /^[a-f0-9]{7,64}$/i.test(value);
+}
+
+function isHttpsUrl(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function isThinkingLevel(value: unknown): boolean {

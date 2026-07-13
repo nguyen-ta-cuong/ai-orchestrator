@@ -497,27 +497,27 @@ describe("lifecycle Pi extension safety", () => {
   it("recovers a commit created before its SHA checkpoint was persisted", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
-    state.finalization = { commitBaseSha: "base123", commitMessage: "Implement recovered work" };
+    state.finalization = { commitBaseSha: "abc1234", commitMessage: "Implement recovered work" };
     writeState(run.paths, state);
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ ship: { openPr: "never" } }));
     const harness = extensionHarness(run.cwd);
     harness.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === "git" && args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: "new456\n", stderr: "" };
-      if (command === "git" && args.join(" ") === "rev-parse HEAD^") return { code: 0, stdout: "base123\n", stderr: "" };
+      if (command === "git" && args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: "def5678\n", stderr: "" };
+      if (command === "git" && args.join(" ") === "rev-parse HEAD^") return { code: 0, stdout: "abc1234\n", stderr: "" };
       if (command === "git" && args.join(" ") === "log -1 --format=%s") return { code: 0, stdout: "Implement recovered work\n", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     });
 
     await harness.commands.get("lifecycle")!("resume", harness.ctx);
 
-    expect(readState(run.paths)).toMatchObject({ phase: "done", finalization: { commitSha: "new456" } });
+    expect(readState(run.paths)).toMatchObject({ phase: "done", finalization: { commitSha: "def5678" } });
     expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
   });
 
   it("refuses PR creation until an explicitly pushed upstream matches HEAD", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
-    state.finalization = { commitSha: "abc123" };
+    state.finalization = { commitSha: "abc1234" };
     writeState(run.paths, state);
     const harness = extensionHarness(run.cwd);
 
@@ -531,7 +531,7 @@ describe("lifecycle Pi extension safety", () => {
   it("does not open a pull request after a stale confirmation cancels the run", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
-    state.finalization = { commitSha: "abc123" };
+    state.finalization = { commitSha: "abc1234" };
     writeState(run.paths, state);
     const harness = extensionHarness(run.cwd);
     const confirm = vi.mocked(harness.ctx.ui.confirm);
