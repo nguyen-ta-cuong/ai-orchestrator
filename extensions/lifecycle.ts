@@ -921,7 +921,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       estimate,
       budgets: runtime.config.routing.budgets,
       snapshot: routingBudgetSnapshot(),
-      unattended: runtime.automatic || !ctx.hasUI,
+      unattended: !ctx.hasUI,
     });
     if (decision.allowed === true) return true;
     if (decision.allowed === "ask") {

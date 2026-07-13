@@ -257,6 +257,7 @@ describe("lifecycle Pi extension safety", () => {
       provider: "invented", id: "coder", reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
       cost: { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 },
     }]);
+    harness.ctx.ui.confirm = vi.fn(async () => false);
 
     await harness.commands.get("lifecycle")!("resume", harness.ctx);
 
@@ -277,6 +278,7 @@ describe("lifecycle Pi extension safety", () => {
       provider: "invented", id: "coder", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 16000,
       cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
     }]);
+    harness.ctx.ui.confirm = vi.fn(async () => false);
     const userStore = join(run.cwd, "home", ".ai-orchestrator", "routing-evidence");
     mkdirSync(userStore, { recursive: true });
     writeFileSync(join(userStore, "events.jsonl"), `${JSON.stringify({
