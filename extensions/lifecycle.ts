@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -250,6 +250,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           await artifactStageEnded(ctx, "plan");
           break;
         case "building":
+          await recordBuildEvidenceFingerprint(ctx);
+          if (!runtime || !ownsRun(runtime.state.runId, "building")) return;
           persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
           await transition({ type: "build_produced" }, "BUILD completed; entering VERIFY", ctx);
           await continueOrPause(ctx, "test");
@@ -762,6 +764,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const breaker = convergenceBreakerReason(runtime.state, runtime.config);
+    if (breaker) {
+      await interruptRun(ctx, `Lifecycle BUILD paused by convergence circuit breaker: ${breaker}`);
+      return;
+    }
     const plan = readRequired(runtime.paths.plan, "plan");
     restoreBuildTools();
     if (!(await enterModelStage("build", "coder", ctx))) return;
@@ -1127,6 +1134,45 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (outcome.type !== "final-status") runtime.lastUsage = undefined;
   }
 
+  async function recordBuildEvidenceFingerprint(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const active = runtime;
+    const runId = active.state.runId;
+    const [diff, untracked] = await Promise.all([
+      pi.exec("git", ["diff", "--no-ext-diff", "--binary", "HEAD"], { timeout: 20_000, signal: ctx.signal }),
+      pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    if (runtime !== active || !ownsRun(runId, "building")) return;
+    const evidence = `${diff.code}:${diff.stdout}\n${diff.stderr}\n${untracked.code}:${untracked.stdout}\n${untracked.stderr}`;
+    active.state.buildEvidenceFingerprints.push(convergenceFingerprint(evidence));
+    writeState(active.paths, active.state);
+    appendJournal(active.paths, `BUILD convergence fingerprint recorded for pass ${active.state.buildIterations + 1}`);
+  }
+
+  function convergenceBreakerReason(state: LifecycleState, config: OrchestratorConfig): string | undefined {
+    const repeatedRejections = trailingEqualCount(state.rejectionFingerprints);
+    if (repeatedRejections >= config.routing.circuitBreakers.repeatedRejectionFingerprintLimit) {
+      return `${repeatedRejections} identical checker rejections reached the configured limit; inspect debug.md and re-plan with new evidence.`;
+    }
+    const unchangedBuilds = Math.max(0, trailingEqualCount(state.buildEvidenceFingerprints) - 1);
+    if (unchangedBuilds >= config.routing.circuitBreakers.maxBuildPassesWithoutImprovement) {
+      return `${unchangedBuilds} consecutive BUILD passes produced unchanged evidence; inspect the diff and re-plan before spending another pass.`;
+    }
+    return undefined;
+  }
+
+  function trailingEqualCount(values: readonly string[]): number {
+    const latest = values.at(-1);
+    if (!latest) return 0;
+    let count = 0;
+    for (let index = values.length - 1; index >= 0 && values[index] === latest; index -= 1) count += 1;
+    return count;
+  }
+
+  function convergenceFingerprint(value: string): string {
+    return createHash("sha256").update(value.trim().replace(/\s+/g, " ").toLowerCase()).digest("hex").slice(0, 16);
+  }
+
   function persistDownstreamReversal(stage: "verify" | "review", reason: string): void {
     if (!runtime?.config.routing.evidence.enabled) return;
     const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
@@ -1220,6 +1266,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       structuredToolCompliance: true,
       verdict: "unknown",
     });
+    if (artifact === "plan") {
+      runtime.state.rejectionFingerprints = [];
+      runtime.state.buildEvidenceFingerprints = [];
+      writeState(runtime.paths, runtime.state);
+    }
     await transition(
       artifact === "spec"
         ? { type: "spec_produced", specPath: rel(path) }
@@ -1285,6 +1336,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const verdict = runtime.pendingVerdict;
     if (!verdict) throw new Error(`${stage} verdict was not available after recovery`);
     runtime.pendingVerdict = undefined;
+    if (verdict.verdict === "reject") {
+      runtime.state.rejectionFingerprints.push(convergenceFingerprint(`${verdict.reasons}\n${verdict.requiredFixes ?? ""}`));
+      writeState(runtime.paths, runtime.state);
+    }
     persistRoutingStageOutcome(stage, { structuredToolCompliance, verdict: verdict.verdict });
     if (verdict.verdict === "reject" && stage === "review") persistDownstreamReversal("verify", verdict.reasons);
     if (verdict.verdict === "reject" && stage === "ship") {
