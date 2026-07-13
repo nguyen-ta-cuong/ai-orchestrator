@@ -271,6 +271,7 @@ describe("lifecycle Pi extension safety", () => {
       routing: {
         engine: "capability",
         budgets: { maxEstimatedUsdPerDay: 0.5 },
+        evidence: { enabled: false },
         profiles: { "invented/coder": { confidence: 9000, scores: { coding: 9500 } } },
       },
     }));
@@ -290,6 +291,7 @@ describe("lifecycle Pi extension safety", () => {
 
     expect(readFileSync(run.paths.journal, "utf8")).toContain("daily estimated budget");
     expect(harness.pi.setModel).not.toHaveBeenCalledWith(expect.objectContaining({ id: "coder" }));
+    expect(existsSync(join(userStore, "events.jsonl"))).toBe(false);
   });
 
   it("does not access runtime tool state while the extension factory is loading", () => {
