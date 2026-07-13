@@ -114,7 +114,9 @@ The repository, not the conversation, remembers lifecycle truth:
     journal.md
     routing.jsonl
     evidence.jsonl
-    budget.jsonl
+
+~/.ai-orchestrator/routing-evidence/
+  budget.jsonl
 ```
 
 Only one lifecycle run may own a Git worktree, including commands started from different subdirectories. State writes are atomic, locks and process leases are reclaimable after a proven stale owner, and corrupt or ambiguous ownership fails closed.
