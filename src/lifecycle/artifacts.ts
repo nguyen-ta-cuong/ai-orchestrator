@@ -290,21 +290,25 @@ function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () 
   const lockPath = currentRunLockPath(cwd, artifactsDir);
   mkdirSync(join(lockPath, ".."), { recursive: true });
   assertArtifactRootSafe(cwd, artifactsDir);
-  let locked = false;
-  try {
-    mkdirSync(lockPath);
-    locked = true;
-    return operation();
-  } catch (error) {
-    if (isNodeErrorWithCode(error, "EEXIST")) {
-      throw new Error("An ai-orchestrator lifecycle run is already active or starting");
-    }
-    throw error;
-  } finally {
-    if (locked) {
+  const owner = `current-${process.pid}-${randomBytes(6).toString("hex")}`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let locked = false;
+    try {
+      writeFileSync(lockPath, `${JSON.stringify({ owner, pid: process.pid, createdAt: new Date().toISOString() })}\n`, { flag: "wx" });
+      locked = true;
+      return operation();
+    } catch (error) {
+      if (!isNodeErrorWithCode(error, "EEXIST")) throw error;
+      const existing = readExecutionLease(lockPath);
+      if (!existing || isProcessAlive(existing.pid)) {
+        throw new Error("An ai-orchestrator lifecycle run is already active or starting");
+      }
       rmSync(lockPath, { recursive: true, force: true });
+    } finally {
+      if (locked) rmSync(lockPath, { force: true });
     }
   }
+  throw new Error("Lifecycle current-run lock could not be acquired");
 }
 
 function assertArtifactRootSafe(cwd: string, artifactsDir: string): void {
