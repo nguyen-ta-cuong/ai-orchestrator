@@ -136,6 +136,40 @@ describe("lifecycle Pi extension safety", () => {
     expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
   });
 
+  it("persists stage-ended usage, cost, compliance, and profile evidence", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: {
+        engine: "capability",
+        unknownCost: "allow",
+        profiles: {
+          "invented/coder": { family: "maker", confidence: 9000, version: "coder-profile-v1", scores: { coding: 9500, verification: 6000 } },
+          "invented/checker": { family: "checker", confidence: 9000, version: "checker-profile-v1", scores: { coding: 6000, verification: 9500 } },
+        },
+      },
+    }));
+    const models = ["coder", "checker"].map((id) => ({
+      provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+    }));
+    const harness = extensionHarness(run.cwd, models);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+    await harness.events.get("message_end")!({
+      message: { role: "assistant", usage: { input: 1000, output: 200, cacheRead: 50, cacheWrite: 10, cost: { total: 0.012 } } },
+    }, harness.ctx as unknown as ExtensionContext);
+    await harness.events.get("agent_end")!({ messages: [{ role: "assistant", content: "implemented" }] }, harness.ctx as unknown as ExtensionContext);
+    await harness.events.get("agent_settled")!({}, harness.ctx as unknown as ExtensionContext);
+
+    const events = readFileSync(run.paths.evidence, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({
+      stage: "build",
+      profileVersion: "coder-profile-v1",
+      usage: { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 10 },
+      cost: expect.objectContaining({ observedUsd: 0.012 }),
+      outcome: expect.objectContaining({ type: "stage-ended", structuredToolCompliance: true }),
+    }));
+  });
+
   it("pauses before model activation when a routing budget would be exceeded", async () => {
     const run = makeRun("building");
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
