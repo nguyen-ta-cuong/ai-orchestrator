@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -26,6 +26,7 @@ const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
 const JUDGE_TOOLS = [...READ_ONLY_TOOLS, "judge_verdict"];
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
+const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
 
 interface JudgeVerdictParams {
   verdict: Verdict;
@@ -234,10 +235,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         return { block: true, reason: `ai-orchestrator ${state.phase} phase blocked a non-read-only bash command.` };
       }
     }
+    if (state.phase === "coding" && MUTATION_TOOLS.has(event.toolName)) {
+      const requested = (event.input as { path?: unknown }).path;
+      const path = typeof requested === "string" && state.cwd ? resolveFastPath(state.cwd, requested) : undefined;
+      const metadataRoot = state.cwd ? join(state.cwd, ".ai-orchestrator") : undefined;
+      if (path && metadataRoot && (path === metadataRoot || path.startsWith(`${metadataRoot}/`))) {
+        return { block: true, reason: "ai-orchestrator coding cannot modify orchestrator metadata." };
+      }
+    }
     if (state.phase === "coding" && event.toolName === "bash") {
       const command = (event.input as { command?: unknown }).command;
-      if (typeof command !== "string" || isPublicationCommand(command)) {
-        return { block: true, reason: "ai-orchestrator coding cannot stage, commit, tag, push, open a PR, or publish; those actions require orchestrator-owned gates." };
+      if (typeof command !== "string" || isBlockedFastBuildCommand(command)) {
+        return { block: true, reason: "ai-orchestrator coding cannot modify orchestrator metadata, perform destructive Git operations, stage, commit, tag, push, open a PR, or publish." };
       }
     }
   });
@@ -1081,11 +1090,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 }
 
-function isPublicationCommand(command: string): boolean {
+function isBlockedFastBuildCommand(command: string): boolean {
   // Normalize quoting and shell escapes so equivalent forms such as
   // `git -C . push`, `g\\it push`, and `bash -lc 'git push'` remain gated.
   const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
-  return PUBLICATION_COMMAND.test(normalized);
+  return PUBLICATION_COMMAND.test(normalized) || DESTRUCTIVE_GIT_COMMAND.test(normalized) ||
+    normalized.includes(".ai-orchestrator") ||
+    /\brm\b[\s\S]*?(?:\s\.\/?(?:\s|$)|\s\*|\/\*)/i.test(normalized) ||
+    /\bfind\b[\s\S]*?\s-delete\b/i.test(normalized);
+}
+
+function resolveFastPath(cwd: string, requested: string): string {
+  return resolve(cwd, requested.replace(/^@/, ""));
 }
 
 function createRuntimeState(overrides: Partial<RuntimeState> = {}): RuntimeState {
