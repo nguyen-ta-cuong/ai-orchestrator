@@ -194,4 +194,4 @@ Before removing a run directory, ensure the run is terminal and retain any artif
 - [Setup guide](setup.md)
 - [Configuration reference](../README.md#configuration-and-trust-boundaries)
 - [Troubleshooting](../README.md#troubleshooting)
-- [Adaptive routing PRD](adaptive-capability-model-routing-prd.md)
+- [Adaptive routing PRD](https://github.com/nguyen-ta-cuong/ai-orchestrator/blob/main/docs/adaptive-capability-model-routing-prd.md)
