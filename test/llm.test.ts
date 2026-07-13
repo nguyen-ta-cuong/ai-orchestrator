@@ -65,6 +65,16 @@ describe("completeWithRole", () => {
       .rejects.not.toThrow(apiKey);
   });
 
+  it("rejects oversized provider responses before buffering their body", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", {
+      status: 200,
+      headers: { "content-length": String(3 * 1024 * 1024) },
+    })));
+
+    await expect(completeWithRole({ config: configFor("openai-responses"), role: "planner", prompt: "plan" }))
+      .rejects.toThrow(/response exceeded the size limit/);
+  });
+
   it("handles OpenAI Responses failed status explicitly", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({
       status: "failed",
