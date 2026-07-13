@@ -67,6 +67,7 @@ describe("Pi capability routing plan", () => {
       evidence: "build a feature",
     });
     expect(plan.candidates.map((candidate) => candidate.model)).toEqual(["checker"]);
+    expect(plan.candidates[0]?.thinking).toBe("high");
   });
 
   it("honors an explicit callable pin even when it has no capability profile", () => {
