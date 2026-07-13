@@ -30,6 +30,8 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
   ensureArtifactsExcludedFromGit(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => {
     const currentPath = currentRunPath(cwd, artifactsDir);
+    const registryPath = repositoryActiveRunPath(cwd);
+    const activeRegistry = readActiveRunRegistry(cwd);
     const active = currentRun(cwd, artifactsDir);
     if (active) {
       const activeState = readState(active.paths);
@@ -39,14 +41,16 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       if (isActivePhase(activeState.phase)) {
         throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
       }
-      rmSync(currentPath, { force: true });
-    } else if (existsSync(currentPath)) {
+      rmSync(currentRunPath(cwd, activeRegistry?.artifactsDir ?? artifactsDir), { force: true });
+      rmSync(registryPath, { force: true });
+    } else if (existsSync(currentPath) || existsSync(registryPath)) {
       throw new Error("Lifecycle current pointer is invalid; explicit recovery is required");
     }
 
     const runId = createRunId();
     const paths = pathsForRun(cwd, artifactsDir, runId);
     let currentPointerWritten = false;
+    let registryWritten = false;
     try {
       mkdirSync(paths.root, { recursive: true });
       assertRunPathsSafe(paths);
@@ -57,11 +61,16 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeFileSync(paths.routing, "");
       writeFileSync(paths.evidence, "");
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
+      mkdirSync(join(registryPath, ".."), { recursive: true });
+      assertNoSymlinkComponents(registryPath);
+      writeFileSync(registryPath, `${JSON.stringify({ runId, artifactsDir: normalizeArtifactsDir(artifactsDir) })}\n`, { flag: "wx" });
+      registryWritten = true;
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
       currentPointerWritten = true;
       return { runId, paths };
     } finally {
       if (!currentPointerWritten) {
+        if (registryWritten) rmSync(registryPath, { force: true });
         rmSync(paths.root, { recursive: true, force: true });
       }
     }
@@ -70,6 +79,11 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
 
 export function currentRun(cwd: string, artifactsDir: string): { runId: string; paths: RunPaths } | undefined {
   assertArtifactRootSafe(cwd, artifactsDir);
+  const registry = readActiveRunRegistry(cwd);
+  if (registry) {
+    assertArtifactRootSafe(cwd, registry.artifactsDir);
+    return { runId: registry.runId, paths: pathsForRun(cwd, registry.artifactsDir, registry.runId) };
+  }
   const currentPath = currentRunPath(cwd, artifactsDir);
   assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath)) return undefined;
@@ -191,17 +205,38 @@ function currentRunPath(cwd: string, artifactsDir: string): string {
   return join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), "current");
 }
 
-function currentRunLockPath(cwd: string, artifactsDir: string): string {
-  return join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), "current.lock");
+function currentRunLockPath(cwd: string, _artifactsDir: string): string {
+  return join(realpathSync(cwd), ".ai-orchestrator", "current.lock");
+}
+
+function repositoryActiveRunPath(cwd: string): string {
+  return join(realpathSync(cwd), ".ai-orchestrator", "active-run.json");
+}
+
+function readActiveRunRegistry(cwd: string): { runId: string; artifactsDir: string } | undefined {
+  const path = repositoryActiveRunPath(cwd);
+  assertNoSymlinkComponents(path);
+  if (!existsSync(path)) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as { runId?: unknown; artifactsDir?: unknown };
+    if (typeof value.runId !== "string" || !isRunId(value.runId) || typeof value.artifactsDir !== "string") return undefined;
+    return { runId: value.runId, artifactsDir: normalizeArtifactsDir(value.artifactsDir) };
+  } catch {
+    return undefined;
+  }
 }
 
 function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId: string): boolean {
-  const currentPath = currentRunPath(cwd, artifactsDir);
+  const registry = readActiveRunRegistry(cwd);
+  if (registry && registry.runId !== runId) return false;
+  const currentPath = currentRunPath(cwd, registry?.artifactsDir ?? artifactsDir);
   assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath) || readFileSync(currentPath, "utf8").trim() !== runId) {
     return false;
   }
   rmSync(currentPath, { force: true });
+  const registryPath = repositoryActiveRunPath(cwd);
+  if (registry?.runId === runId) rmSync(registryPath, { force: true });
   return true;
 }
 

@@ -174,7 +174,7 @@ describe("lifecycle artifacts", () => {
 
   it("reclaims a current-run lock owned by a dead process", () => {
     const cwd = makeTempDir();
-    const lock = join(cwd, artifactsDir, "current.lock");
+    const lock = join(cwd, ".ai-orchestrator", "current.lock");
     mkdirSync(join(lock, ".."), { recursive: true });
     writeFileSync(lock, `${JSON.stringify({ owner: "dead", pid: 99_999_999, createdAt: new Date().toISOString() })}\n`);
 
@@ -184,7 +184,7 @@ describe("lifecycle artifacts", () => {
 
   it("blocks creating a run while another process holds the current-run lock", () => {
     const cwd = makeTempDir();
-    mkdirSync(join(cwd, ".ai-orchestrator", "runs", "current.lock"), { recursive: true });
+    mkdirSync(join(cwd, ".ai-orchestrator", "current.lock"), { recursive: true });
 
     expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/active or starting/);
     expect(existsSync(join(cwd, ".ai-orchestrator", "runs", "current"))).toBe(false);
