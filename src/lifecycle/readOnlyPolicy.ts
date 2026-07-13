@@ -7,8 +7,9 @@ const SAFE_INSPECTION_COMMANDS = [
 const MUTATING_OR_EXECUTING_OPTIONS = /(?:^|\s)(?:--output(?:=|\s)|--ext-diff\b|--textconv\b|--pre(?:=|\s)|--hostname-bin(?:=|\s)|-o(?:\s|$))/;
 
 export function isReadOnlyLifecycleCommand(command: string, testCommand?: string): boolean {
+  if (/[\0\r\n]/.test(command)) return false;
   const normalized = command.trim().replace(/\s+/g, " ");
-  if (!normalized || /[;&|><`]|\$\(|\r|\n/.test(normalized)) return false;
+  if (!normalized || /[;&|><`]|\$\(/.test(normalized)) return false;
   if (MUTATING_OR_EXECUTING_OPTIONS.test(normalized)) return false;
   if (testCommand && normalized === testCommand) return true;
   return SAFE_INSPECTION_COMMANDS.some((pattern) => pattern.test(normalized));
