@@ -100,31 +100,35 @@ Standalone stage commands do not skip, rewind, or replace the phase recorded in 
 
 ### Durable state and recovery
 
-The repository, not the conversation, remembers lifecycle truth:
+The repository, not the conversation, remembers lifecycle truth. The defaults below are configurable where marked:
 
 ```text
-.ai-orchestrator/
-  active-run.json
-  current.lock
-  runs/
-    current                         active run pointer
-    <run-id>/
-      spec.md
-      plan.md
-      debug.md
-      state.json
-      journal.md
-      routing.jsonl
-      evidence.jsonl
-      execution.lock               transient process lease
+<git-worktree>/.ai-orchestrator/
+  active-run.json                   worktree-wide active-run registry
+  current.lock                      transient coordinator lock
 
-~/.ai-orchestrator/routing-evidence/
-  events.jsonl                     minimized cross-run analytical evidence
-  budget.jsonl                     strict cumulative budget ledger
-  recommendations/<id>.json        apply/rollback transaction records
+<run-start-cwd>/<lifecycle.artifactsDir>/
+  current                           active run pointer
+  <run-id>/
+    spec.md
+    plan.md
+    debug.md
+    state.json
+    journal.md
+    routing.jsonl
+    evidence.jsonl
+    execution.lock                  transient process lease
+
+~/.ai-orchestrator/<routing.evidence.userStoreDir>/
+  events.jsonl                      minimized cross-run analytical evidence
+  events.jsonl.quarantine           invalid evidence lines, when encountered
+  budget.jsonl                      strict cumulative budget ledger
+  recommendations/<id>.json         apply/rollback transaction records
 ```
 
-`state.json`, the journal, run evidence, and trusted-user evidence are persistent until removed. `current.lock` and `execution.lock` are transient ownership/lease files. Only one lifecycle run may own a Git worktree, including commands started from different subdirectories. State writes are atomic, locks and process leases are reclaimable after a proven stale owner, and corrupt or ambiguous ownership fails closed.
+`lifecycle.artifactsDir` defaults to `.ai-orchestrator/runs` and is resolved from the directory where the lifecycle command starts; `routing.evidence.userStoreDir` defaults to `routing-evidence` and must remain under `~/.ai-orchestrator/`. Coordination stays at the Git worktree root even when a run starts in a subdirectory or uses a custom artifact directory.
+
+`state.json`, the journal, run evidence, trusted-user evidence, recommendation records, and any quarantine sidecar are persistent until removed. `current.lock` and `execution.lock` are transient ownership/lease files. Only one lifecycle run may own a Git worktree, including commands started from different subdirectories. State writes are atomic, locks and process leases are reclaimable after a proven stale owner, and corrupt or ambiguous ownership fails closed.
 
 Use `/lifecycle resume` after an interruption. Resume re-reads state after obtaining the execution lease, restores any pending structured checker verdict, reconciles recoverable commit/PR intent, and continues only from the saved phase. Missing artifacts, policy drift, unsafe paths, unavailable models, unknown budget state, or ownership loss pause/fail rather than silently guessing.
 
