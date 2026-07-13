@@ -415,10 +415,12 @@ describe("loadConfig", () => {
   it.each([
     [{ routing: { engine: "automatic" } }, "routing.engine must be one of"],
     [{ routing: { mode: "fastest" } }, "routing.mode must be one of"],
+    [{ routing: { version: "raw prompt text" } }, "routing.version must be a bounded canonical metadata token"],
     [{ routing: { deny: { providers: "unsafe" } } }, "routing.deny.providers must be an array"],
     [{ routing: { privacy: { allowed: ["secret"] } } }, "routing.privacy.allowed[0] must be one of"],
     [{ routing: { separation: { checkerMustDifferFromBuilder: "yes" } } }, "routing.separation.checkerMustDifferFromBuilder must be a boolean"],
     [{ routing: { profiles: { "": { confidence: 1, scores: {} } } } }, "routing.profiles keys must be non-empty provider/model identities"],
+    [{ routing: { profiles: { "p/m": { family: "source text with spaces", confidence: 1, scores: {} } } } }, "routing.profiles.p/m.family must be a bounded canonical metadata token"],
     [{ routing: { profiles: { "p/m": { confidence: 10_001, scores: {} } } } }, "routing.profiles.p/m.confidence must be an integer between 0 and 10000"],
     [{ routing: { profiles: { "p/m": { confidence: 1, provenance: "marketing", scores: {} } } } }, "routing.profiles.p/m.provenance must be one of"],
     [{ routing: { profiles: { "p/m": { confidence: 1, scores: { coding: -1 } } } } }, "routing.profiles.p/m.scores.coding must be an integer between 0 and 10000"],
