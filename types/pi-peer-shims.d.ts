@@ -57,6 +57,19 @@ declare module "@earendil-works/pi-coding-agent" {
     messages: unknown[];
   }
 
+  export interface MessageEndEvent {
+    message: {
+      role: string;
+      usage?: {
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        cost: { total: number };
+      };
+    };
+  }
+
   export interface ToolCallEvent {
     toolName: string;
     input: Record<string, unknown>;
@@ -94,6 +107,7 @@ declare module "@earendil-works/pi-coding-agent" {
     on(event: "session_shutdown", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "agent_end", handler: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "agent_settled", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+    on(event: "message_end", handler: (event: MessageEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
     on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<{ block: boolean; reason: string } | void> | { block: boolean; reason: string } | void): void;
     getThinkingLevel(): ThinkingLevel;
     setThinkingLevel(level: ThinkingLevel): void;
