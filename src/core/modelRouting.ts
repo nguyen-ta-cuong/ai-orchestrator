@@ -140,6 +140,8 @@ export interface ScoreComponent {
 export interface RankedModelCandidate {
   identity: ModelSelectionIdentity;
   thinking: ThinkingLevel;
+  requestedThinking: ThinkingLevel;
+  thinkingReason: string;
   score: number;
   scoreBreakdown: readonly ScoreComponent[];
   profile: Pick<ResolvedModelProfile, "confidence" | "provenance" | "version">;
@@ -307,6 +309,8 @@ export function rankModels(request: RoutingRequest): RoutingDecision {
     eligible.push({
       identity: rankedIdentity,
       thinking: thinking.selected,
+      requestedThinking: thinking.requested,
+      thinkingReason: thinking.reason,
       score: scoreBreakdown.reduce((sum, component) => sum + component.value, 0),
       scoreBreakdown,
       profile: { confidence: profile.confidence, provenance: profile.provenance, version: profile.version },
