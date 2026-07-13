@@ -68,6 +68,18 @@ describe("ai-orchestrator install-cursor", () => {
     expect(stdout).toContain(`Wrote MCP config: ${mcpPath}`);
   });
 
+  it("writes the portable pinned command when invoked through npx", () => {
+    const cwd = makeTempDir();
+    const options = installerOptions(cwd);
+    execFileSync(process.execPath, [binPath, "install-cursor"], {
+      ...options,
+      env: { ...options.env, npm_command: "exec" },
+    });
+
+    expect(JSON.parse(readFileSync(join(cwd, ".cursor", "mcp.json"), "utf8")))
+      .toEqual(JSON.parse(readFileSync(staticSnippetPath, "utf8")));
+  });
+
   it("does not overwrite an existing customized MCP config", () => {
     const cwd = makeTempDir();
     const mcpPath = join(cwd, ".cursor", "mcp.json");
