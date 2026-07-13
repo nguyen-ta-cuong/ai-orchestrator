@@ -393,8 +393,8 @@ function exclusionFor(
   if (builder && CHECKER_STAGES.has(request.stage) && modelIdentityKey(builder) === modelIdentityKey(model)) {
     return excluded("same-builder-model", `${identityText} is the BUILD model and cannot check its own work`);
   }
-  if ((policy.mode === "pinned" || stage.pins.length > 0) && !stage.pins.includes(identityText)) {
-    return excluded("pinned-only", `${identityText} is not pinned for ${request.stage}`);
+  if ((policy.mode === "pinned" || stage.pins.length > 0) && !stage.pins.some((selector) => selectorMatches(selector, identityText, family))) {
+    return excluded("pinned-only", `${identityText}${family ? ` (family ${family})` : ""} is not pinned for ${request.stage}`);
   }
   if (!profile) return excluded("profile-unknown", `${identityText} has no explicit profile and inferred profiles are disabled`);
   if (profile.confidence < stage.minimumProfileConfidence) {
@@ -501,8 +501,8 @@ function compareCandidates(
 ): number {
   const stagePolicy = policy.stages[stage];
   if (stagePolicy.pins.length > 0) {
-    const leftPinned = preferIndex(left.identity, stagePolicy.pins);
-    const rightPinned = preferIndex(right.identity, stagePolicy.pins);
+    const leftPinned = selectorIndex(left.identity, stagePolicy.pins);
+    const rightPinned = selectorIndex(right.identity, stagePolicy.pins);
     if (leftPinned !== rightPinned) return leftPinned - rightPinned;
   }
   if (policy.mode === "economy") {
@@ -511,8 +511,8 @@ function compareCandidates(
     if (leftCost !== rightCost) return leftCost - rightCost;
   }
   if (right.score !== left.score) return right.score - left.score;
-  const leftPreferred = preferIndex(left.identity, stagePolicy.prefer);
-  const rightPreferred = preferIndex(right.identity, stagePolicy.prefer);
+  const leftPreferred = selectorIndex(left.identity, stagePolicy.prefer);
+  const rightPreferred = selectorIndex(right.identity, stagePolicy.prefer);
   if (leftPreferred !== rightPreferred) return leftPreferred - rightPreferred;
   if (right.profile.confidence !== left.profile.confidence) return right.profile.confidence - left.profile.confidence;
   const leftCost = left.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
@@ -523,9 +523,14 @@ function compareCandidates(
   return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
 }
 
-function preferIndex(identity: ModelSelectionIdentity, prefer: readonly string[]): number {
-  const index = prefer.indexOf(`${identity.provider}/${identity.model}`);
+function selectorIndex(identity: ModelSelectionIdentity, selectors: readonly string[]): number {
+  const identityText = `${identity.provider}/${identity.model}`;
+  const index = selectors.findIndex((selector) => selectorMatches(selector, identityText, identity.family));
   return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+}
+
+function selectorMatches(selector: string, identity: string, family: string | undefined): boolean {
+  return selector === identity || (family !== undefined && selector === `family:${family}`);
 }
 
 function identityFor(stage: RoutingStage | undefined, model: DiscoveredModel): ModelSelectionIdentity {
