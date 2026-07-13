@@ -162,7 +162,7 @@ export function recommendRoutingPolicyChanges(
   const groups = new Map<string, RoutingEvidenceEvent[]>();
   for (const event of events) {
     if (event.outcome.type !== "stage-ended") continue;
-    const key = `${event.stage}\u0000${event.task.workKind}\u0000${event.task.risk}`;
+    const key = `${event.stage}\u0000${event.task.workKind}\u0000${event.task.risk}\u0000${event.policyVersion}\u0000${event.profileVersion}`;
     const group = groups.get(key) ?? [];
     group.push(event);
     groups.set(key, group);
@@ -171,7 +171,7 @@ export function recommendRoutingPolicyChanges(
   const recommendations: RoutingPolicyRecommendation[] = [];
   for (const [key, group] of groups) {
     if (group.length < minimumSamples) continue;
-    const [stage, workKind, risk] = key.split("\u0000") as [RoutingStage, string, string];
+    const [stage, workKind, risk] = key.split("\u0000") as [RoutingStage, string, string, string, string];
     const modelStats = new Map<string, { model: EvidenceModelIdentity; count: number; successes: number; reversals: number; overrides: number; cost: number }>();
     for (const event of group) {
       const identity = identityKey(event.selected);
