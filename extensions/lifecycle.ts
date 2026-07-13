@@ -119,6 +119,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       await ctx.waitForIdle();
       if (args.trim() === "resume") {
         await resumeRun(ctx);
+      } else if (args.trim() === "migrate-routing") {
+        await migrateRoutingPolicy(ctx);
       } else {
         await startPipeline(args, ctx);
       }
@@ -473,6 +475,50 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     await runCurrentPhase(ctx);
   }
 
+  async function migrateRoutingPolicy(ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "Pause or stop the active lifecycle turn before migrating its routing policy.", "warning");
+      return;
+    }
+    const loaded = loadCurrent(ctx.cwd);
+    if (!loaded || !isActivePhase(loaded.state.phase)) {
+      notify(ctx, "No active lifecycle run is available for routing migration.", "error");
+      return;
+    }
+    const leaseOwner = randomUUID();
+    try {
+      acquireRunLease(loaded.paths, leaseOwner);
+    } catch {
+      notify(ctx, "Lifecycle run is executing in another Pi process; routing migration was not applied.", "warning");
+      return;
+    }
+    try {
+      if (!ctx.hasUI || !(await ctx.ui.confirm(
+        "Migrate lifecycle routing policy?",
+        "This explicitly adopts the current trusted routing and role configuration for the unfinished phase. Completed routing evidence remains unchanged.",
+      ))) return;
+      if (!ownsRunLease(loaded.paths, leaseOwner)) return;
+      const resolved = loadPiResolvedConfig(ctx.cwd);
+      const nextVersion = piRoutingRunVersion(resolved.config, resolved.provenance);
+      const latest = readState(loaded.paths);
+      if (!latest || latest.runId !== loaded.state.runId || !isActivePhase(latest.phase)) {
+        notify(ctx, "Lifecycle state changed before routing migration; retry after inspecting the active run.", "warning");
+        return;
+      }
+      const entryKey = currentPhaseEntryKey(latest);
+      const saved = [...latest.modelSelections].reverse().find((selection) =>
+        selection.routing?.phaseEntryKey === entryKey && !selection.routing.failureCategories.includes("policy-migrated"));
+      if (saved?.routing) saved.routing.failureCategories.push("policy-migrated");
+      latest.routingPolicyVersion = nextVersion;
+      writeState(loaded.paths, latest);
+      appendJournal(loaded.paths, `Routing policy explicitly migrated for unfinished phase to ${nextVersion}`);
+      persistMirror(latest);
+      notify(ctx, "Lifecycle routing policy migrated. Use /lifecycle resume to continue.", "info");
+    } finally {
+      releaseRunLease(loaded.paths, leaseOwner);
+    }
+  }
+
   async function resumeRun(ctx: ExtensionCommandContext): Promise<void> {
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before resuming lifecycle.", "error");
@@ -716,7 +762,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const phaseEntryKey = currentPhaseEntryKey(runtime.state);
     const saved = [...runtime.state.modelSelections].reverse().find((selection) =>
       selection.stage === stage && selection.routing?.phaseEntryKey === phaseEntryKey
-      && !selection.routing.failureCategories.includes("provider-error"));
+      && !selection.routing.failureCategories.some((category) => category === "provider-error" || category === "policy-migrated"));
     if (saved) {
       if (saved.routing!.policyVersion !== plan.policyVersion || saved.routing!.engine !== plan.engine) {
         await modelFailure(ctx, stage, [`saved decision ${saved.routing!.decisionId} uses a different routing policy`]);
