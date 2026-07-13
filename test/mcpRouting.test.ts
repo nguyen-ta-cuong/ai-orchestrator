@@ -113,6 +113,8 @@ describe("MCP capability routing", () => {
     emptyCatalog.mcp.models = [];
     expect(() => resolveMcpRoute({ config: emptyCatalog, stage: "fast-judge", role: "judge", task: defaultTaskFeatures("judge") }))
       .toThrow(/requires coderIdentity/);
+    expect(() => resolveMcpRoute({ config: emptyCatalog, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") }))
+      .toThrow(/No trusted MCP model catalog/);
   });
 
   it("excludes the coder and selects an independent checker", () => {

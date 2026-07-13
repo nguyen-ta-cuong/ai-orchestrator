@@ -92,13 +92,7 @@ export function resolveMcpRoute(input: {
   const { config, stage, role } = input;
   const familySeparationRequired = stage === "fast-judge"
     && config.routing.separation.requireDifferentProviderFamilyFor.includes("fast-judge");
-  const strict = stage === "fast-judge"
-    && config.routing.engine === "capability"
-    && (
-      config.routing.circuitBreakers.requireIndependentChecker
-      || config.routing.separation.checkerMustDifferFromBuilder
-      || familySeparationRequired
-    );
+  const strict = stage === "fast-judge";
   const builder = input.coderIdentity ? resolveBuilderIdentity(config, parseIdentity(input.coderIdentity)) : undefined;
   if (strict && !builder && !input.preview) {
     throw new Error("Strict maker/checker separation requires coderIdentity for orchestrator_judge");
@@ -106,6 +100,9 @@ export function resolveMcpRoute(input: {
 
   // Capability-shadow is observational on every surface. Active planner/judge
   // calls keep the exact legacy role while orchestrator_models exposes ranking.
+  if (!input.preview && config.routing.engine === "capability" && config.mcp.models.length === 0) {
+    throw new Error(`No trusted MCP model catalog is configured for active capability routing at ${stage}`);
+  }
   if ((!input.preview && config.routing.engine !== "capability") || config.mcp.models.length === 0) {
     const exact = completionCandidateForRole(config, config.roles[role], input.task.expectedOutputTokens);
     const separation = separationFor(strict, familySeparationRequired, builder, exact);

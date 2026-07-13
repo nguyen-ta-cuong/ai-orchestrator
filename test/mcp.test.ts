@@ -392,6 +392,7 @@ describe("MCP server", () => {
           plan: "1. edit cli\n2. test",
           diff: "diff --git a/cli.ts b/cli.ts\n+broken",
           testOutput: "failing test",
+          coderIdentity: "openai-codex/gpt-5.5",
           ...counters,
         },
       });
@@ -426,6 +427,7 @@ describe("MCP server", () => {
           plan: "1. edit cli\n2. test",
           diff: "diff --git a/cli.ts b/cli.ts\n+working",
           testOutput: "passing test",
+          coderIdentity: "openai-codex/gpt-5.5",
           iteration: 1,
           consecutiveRejections: 0,
         },
