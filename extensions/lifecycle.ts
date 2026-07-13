@@ -237,11 +237,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const usage = event.message.usage;
     if (!usage) return;
     runtime.lastUsage = {
-      inputTokens: usage.input,
-      outputTokens: usage.output,
-      cacheReadTokens: usage.cacheRead,
-      cacheWriteTokens: usage.cacheWrite,
-      observedUsd: usage.cost.total,
+      inputTokens: (runtime.lastUsage?.inputTokens ?? 0) + usage.input,
+      outputTokens: (runtime.lastUsage?.outputTokens ?? 0) + usage.output,
+      cacheReadTokens: (runtime.lastUsage?.cacheReadTokens ?? 0) + usage.cacheRead,
+      cacheWriteTokens: (runtime.lastUsage?.cacheWriteTokens ?? 0) + usage.cacheWrite,
+      observedUsd: (runtime.lastUsage?.observedUsd ?? 0) + usage.cost.total,
     };
   });
 
@@ -1022,6 +1022,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const fallbackCount = attempts.filter((attempt) => attempt.outcome !== "selected").length;
     const reason = `${candidate.reason}${fallbackCount > 0 ? `; fallback count ${fallbackCount}` : ""}`;
     runtime.state.modelRestored = false;
+    runtime.lastUsage = undefined;
     runtime.state.modelSelections.push({
       stage,
       provider: candidate.provider,
