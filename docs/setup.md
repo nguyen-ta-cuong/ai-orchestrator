@@ -19,7 +19,7 @@ Choose one setup:
 
 ## Install for Pi
 
-Install the published package:
+Install the published package after reviewing it; Pi packages and their extensions run with full system access:
 
 ```sh
 pi install npm:ai-orchestrator
@@ -58,7 +58,20 @@ A fresh install creates:
 .cursor/mcp.json                     only when absent
 ```
 
-The installer never overwrites customized rule, skill, or MCP files. When `.cursor/mcp.json` already exists, merge the printed server snippet manually. The published `npx` install writes a portable version-pinned MCP command. A source-checkout install writes machine-specific absolute paths; do not commit those paths for teammates.
+The installer never overwrites customized rule, skill, or MCP files. When `.cursor/mcp.json` already exists, merge the printed server snippet manually. The published `npx` install writes a portable version-pinned MCP command.
+
+To install from a source checkout, build it and run its installer from the target Cursor project:
+
+```sh
+cd /absolute/path/to/ai-orchestrator
+npm install
+npm run build
+
+cd /path/to/your-project
+node /absolute/path/to/ai-orchestrator/bin/ai-orchestrator.js install-cursor
+```
+
+A source-checkout install writes machine-specific absolute paths; do not commit those paths for teammates.
 
 Other installation modes:
 
@@ -78,7 +91,18 @@ Restart or reload Cursor after installation. For MCP mode, enable the `ai-orches
 
 ### Configure trusted MCP providers and models
 
-Create `~/.ai-orchestrator/config.json`. Provider endpoints, API keys, model catalogs, profiles, and the active MCP routing engine belong in this trusted user file—not in repository config.
+Secure the trusted user directory and config file **before** adding provider credentials. This creates a private `{}` file only when one does not already exist:
+
+```sh
+mkdir -p ~/.ai-orchestrator
+chmod 700 ~/.ai-orchestrator
+if [ ! -e ~/.ai-orchestrator/config.json ]; then
+  (umask 077 && printf '{}\n' > ~/.ai-orchestrator/config.json)
+fi
+chmod 600 ~/.ai-orchestrator/config.json
+```
+
+Edit `~/.ai-orchestrator/config.json`. Provider endpoints, API keys, model catalogs, profiles, and the active MCP routing engine belong in this trusted user file—not in repository config.
 
 The following is a minimal capability-routing shape. Replace the provider URL, API type, model metadata, prices, and capability claims with values verified for your provider:
 
@@ -155,12 +179,7 @@ Set the referenced environment variable in the environment that launches Cursor:
 export ACME_API_KEY='replace-me'
 ```
 
-An API key may instead be a literal value, but the user config can then contain credentials and must remain private. AI Orchestrator writes its own user-policy updates with credential-safe permissions; protect manually created files as well:
-
-```sh
-chmod 700 ~/.ai-orchestrator
-chmod 600 ~/.ai-orchestrator/config.json
-```
+An API key may instead be a literal value, but the user config then contains credentials and must retain private permissions. AI Orchestrator preserves credential-safe permissions when it applies or rolls back trusted-user routing recommendations.
 
 Supported MCP APIs are `anthropic-messages`, `openai-responses`, and `openai-completions`. Provider URLs must use HTTPS. API-key references must be an exact `$ENV_VAR`; `${VAR}` and shell expressions are rejected.
 
@@ -193,11 +212,22 @@ Do not run `npm test` concurrently with `npm run build` or `npm pack`; packaged-
 
 ## Update or remove
 
-- Update Pi using Pi's package-management command, then restart Pi.
-- Re-run the Cursor installer after an npm version update. Customized files are reported, not overwritten; review and merge new guidance manually.
-- Remove project installation by deleting only the AI Orchestrator entries/files under `.cursor/`. Preserve unrelated servers, rules, and skills.
+Update or remove the Pi package, then restart Pi:
+
+```sh
+pi update npm:ai-orchestrator
+pi remove npm:ai-orchestrator
+```
+
+`pi update` by itself updates Pi, not installed packages. Use `pi update --extensions` to update all unpinned installed packages.
+
+For Cursor, re-run the installer after an npm version update. Customized files are reported, not overwritten; review and merge new guidance manually. To remove it:
+
+- Delete only the AI Orchestrator server entry and installed rule/skill under project `.cursor/`; preserve unrelated servers, rules, and skills.
 - Remove global installation from `~/.cursor/` with the same care.
-- Do not delete `.ai-orchestrator/runs/` for an active lifecycle run unless you intend to abandon its durable state.
+- After all Pi and Cursor installations are removed, delete `~/.ai-orchestrator/config.json` only if no other installation needs its provider credentials or routing policy.
+- Review and remove `~/.ai-orchestrator/routing-evidence/` when its budget, evidence, and recommendation history is no longer required.
+- Do not delete a project's `.ai-orchestrator/` metadata for an active lifecycle run unless you intend to abandon its durable state. Remove terminal run artifacts only after retaining any evidence your project requires.
 
 ## Next steps
 
