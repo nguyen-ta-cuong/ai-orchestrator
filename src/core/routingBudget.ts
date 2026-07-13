@@ -91,6 +91,12 @@ export function enforceRoutingBudget(input: {
   if (input.snapshot.paidFallbacks > input.budgets.maxPaidFallbacksPerRun) {
     return { allowed: false, reason: `paid fallback budget exceeded: ${input.snapshot.paidFallbacks} > ${input.budgets.maxPaidFallbacksPerRun}` };
   }
+  if (input.snapshot.observedRunUsd >= input.budgets.maxObservedUsdPerRun) {
+    return { allowed: false, reason: `run observed budget reached: $${input.snapshot.observedRunUsd.toFixed(4)} >= $${input.budgets.maxObservedUsdPerRun.toFixed(4)}` };
+  }
+  if (input.snapshot.observedDayUsd >= input.budgets.maxObservedUsdPerDay) {
+    return { allowed: false, reason: `daily observed budget reached: $${input.snapshot.observedDayUsd.toFixed(4)} >= $${input.budgets.maxObservedUsdPerDay.toFixed(4)}` };
+  }
   if (input.estimate.status === "unknown") {
     if (input.budgets.allowUnknownCost) return { allowed: true, reason: `cost unknown allowed: ${input.estimate.reason}` };
     return input.unattended
