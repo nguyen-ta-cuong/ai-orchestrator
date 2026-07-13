@@ -112,6 +112,13 @@ describe("lifecycle artifacts", () => {
     expect(readState(run.paths)).toBeUndefined();
     writeFileSync(run.paths.state, JSON.stringify({ phase: "defining" }));
     expect(readState(run.paths)).toBeUndefined();
+    for (const counters of [{ buildIterations: -1 }, { consecutiveRejections: 1.5 }]) {
+      writeFileSync(run.paths.state, JSON.stringify({
+        ...createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task" }),
+        ...counters,
+      }));
+      expect(readState(run.paths)).toBeUndefined();
+    }
     writeFileSync(run.paths.state, JSON.stringify(createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task", verdicts: [{ stage: "bad", verdict: "approve", reasons: "x" } as never] })));
     expect(readState(run.paths)).toBeUndefined();
     writeFileSync(run.paths.state, JSON.stringify(createIdleLifecycleState({
