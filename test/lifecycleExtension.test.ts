@@ -281,12 +281,9 @@ describe("lifecycle Pi extension safety", () => {
     harness.ctx.ui.confirm = vi.fn(async () => false);
     const userStore = join(run.cwd, "home", ".ai-orchestrator", "routing-evidence");
     mkdirSync(userStore, { recursive: true });
-    writeFileSync(join(userStore, "events.jsonl"), `${JSON.stringify({
-      version: 1, eventId: "prior", runId: "prior-run", decisionId: "prior-decision", stage: "build",
-      recordedAt: new Date().toISOString(), policyVersion: "v1", profileVersion: "v1",
-      task: { workKind: "feature", risk: "medium", languages: [], fileCount: 1 }, selected: { provider: "p", model: "m" },
-      usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
-      cost: { estimatedUsd: 0.5, observedUsd: "unknown" }, outcome: { type: "stage-started", buildIteration: 0 },
+    writeFileSync(join(userStore, "budget.jsonl"), `${JSON.stringify({
+      version: 1, eventId: "prior", runId: "prior-run", recordedAt: new Date().toISOString(),
+      outcome: "stage-started", estimatedUsd: 0.5,
     })}\n`);
 
     await harness.commands.get("lifecycle")!("resume", harness.ctx);

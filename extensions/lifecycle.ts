@@ -50,7 +50,13 @@ import {
   writeState,
   type RunPaths,
 } from "../src/lifecycle/artifacts.js";
-import { appendRoutingEvidenceEvent, readRoutingEvidenceEvents, resolveUserEvidenceRoot } from "../src/lifecycle/routingEvidenceStore.js";
+import {
+  appendRoutingBudgetLedgerEvent,
+  appendRoutingEvidenceEvent,
+  readRoutingBudgetLedger,
+  readRoutingEvidenceEvents,
+  resolveUserEvidenceRoot,
+} from "../src/lifecycle/routingEvidenceStore.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -954,28 +960,22 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) {
       return { estimatedRunUsd: 0, observedRunUsd: 0, estimatedDayUsd: 0, observedDayUsd: 0, paidFallbacks: 0, attemptsByStage: {} };
     }
-    const events = readRoutingEvidenceEvents(runtime.paths.evidence).events;
     const userRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    const ledger = readRoutingBudgetLedger(join(userRoot, "budget.jsonl"));
+    const runEvents = ledger.filter((event) => event.runId === runtime!.state.runId);
     const today = new Date().toISOString().slice(0, 10);
-    const dailyEvents = readRoutingEvidenceEvents(join(userRoot, "events.jsonl")).events
-      .filter((event) => event.recordedAt.startsWith(today));
+    const dailyEvents = ledger.filter((event) => event.recordedAt.startsWith(today));
     const snapshot: RoutingBudgetSnapshot = {
       estimatedRunUsd: 0,
       observedRunUsd: 0,
-      estimatedDayUsd: dailyEvents.reduce((sum, event) =>
-        sum + (event.outcome.type === "stage-started" && typeof event.cost.estimatedUsd === "number" ? event.cost.estimatedUsd : 0), 0),
-      observedDayUsd: dailyEvents.reduce((sum, event) =>
-        sum + (event.outcome.type === "stage-ended" && typeof event.cost.observedUsd === "number" ? event.cost.observedUsd : 0), 0),
+      estimatedDayUsd: dailyEvents.reduce((sum, event) => sum + (event.outcome === "stage-started" ? event.estimatedUsd ?? 0 : 0), 0),
+      observedDayUsd: dailyEvents.reduce((sum, event) => sum + (event.outcome === "stage-ended" ? event.observedUsd ?? 0 : 0), 0),
       paidFallbacks: runtime.state.modelSelections.reduce((sum, selection) => sum + (selection.routing?.fallbackCount ?? 0), 0),
       attemptsByStage: {},
     };
-    for (const event of events) {
-      if (event.outcome.type === "stage-started" && typeof event.cost.estimatedUsd === "number") {
-        snapshot.estimatedRunUsd += event.cost.estimatedUsd;
-      }
-      if (typeof event.cost.observedUsd === "number") {
-        snapshot.observedRunUsd += event.cost.observedUsd;
-      }
+    for (const event of runEvents) {
+      if (event.outcome === "stage-started") snapshot.estimatedRunUsd += event.estimatedUsd ?? 0;
+      if (event.outcome === "stage-ended") snapshot.observedRunUsd += event.observedUsd ?? 0;
     }
     for (const selection of runtime.state.modelSelections) {
       snapshot.attemptsByStage[selection.stage] = (snapshot.attemptsByStage[selection.stage] ?? 0) + 1;
@@ -989,10 +989,20 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     plan: PiRoutingPlan,
     decisionId: string,
   ): void {
-    if (!runtime || !runtime.config.routing.evidence.enabled) return;
+    if (!runtime) return;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    appendRoutingBudgetLedgerEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${decisionId}:budget:stage-started`,
+      runId: runtime.state.runId,
+      recordedAt: new Date().toISOString(),
+      outcome: "stage-started",
+      ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedUsd: candidate.estimatedCostUsd }),
+    });
+    if (!runtime.config.routing.evidence.enabled) return;
     appendRoutingEvidenceEvent({
       runPaths: runtime.paths,
-      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
+      userStoreRoot,
       event: {
         version: 1,
         eventId: `${decisionId}:stage-started`,
@@ -1037,15 +1047,30 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     stage: LifecycleRoutedStage | "build",
     outcome: { type?: "stage-ended" | "final-status"; structuredToolCompliance: boolean | "unknown"; verdict: "approve" | "reject" | "unknown"; finalRunStatus?: "done" | "failed" | "cancelled" },
   ): void {
-    if (!runtime || !runtime.config.routing.evidence.enabled) return;
+    if (!runtime) return;
     const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
     if (!selection?.routing) return;
+    const usage = outcome.type === "final-status" ? undefined : runtime.lastUsage;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    if (outcome.type !== "final-status") {
+      appendRoutingBudgetLedgerEvent(userStoreRoot, {
+        version: 1,
+        eventId: `${selection.routing.decisionId}:budget:stage-ended:${runtime.state.buildIterations}:${runtime.state.verdicts.length}`,
+        runId: runtime.state.runId,
+        recordedAt: new Date().toISOString(),
+        outcome: "stage-ended",
+        ...(usage ? { observedUsd: usage.observedUsd } : {}),
+      });
+    }
+    if (!runtime.config.routing.evidence.enabled) {
+      if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+      return;
+    }
     const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
       event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
-    const usage = outcome.type === "final-status" ? undefined : runtime.lastUsage;
     appendRoutingEvidenceEvent({
       runPaths: runtime.paths,
-      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
+      userStoreRoot,
       event: {
         version: 1,
         eventId: `${selection.routing.decisionId}:${outcome.type ?? "stage-ended"}:${runtime.state.buildIterations}:${runtime.state.verdicts.length}`,
