@@ -74,7 +74,7 @@ export interface LifecycleState {
   baselinePaths?: string[];
   baselineStagedPaths?: string[];
   modelRestored?: boolean;
-  finalization?: { commitSha?: string; prUrl?: string };
+  finalization?: { commitSha?: string; commitBaseSha?: string; commitMessage?: string; prUrl?: string; prHead?: string };
   shipReport?: string;
   yolo: boolean;
   originalModel?: LifecycleOriginalModelState;

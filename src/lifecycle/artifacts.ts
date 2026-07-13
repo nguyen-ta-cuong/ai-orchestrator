@@ -521,7 +521,10 @@ function isLifecycleFinalization(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   return (candidate.commitSha === undefined || typeof candidate.commitSha === "string") &&
-    (candidate.prUrl === undefined || typeof candidate.prUrl === "string");
+    (candidate.commitBaseSha === undefined || typeof candidate.commitBaseSha === "string") &&
+    (candidate.commitMessage === undefined || typeof candidate.commitMessage === "string") &&
+    (candidate.prUrl === undefined || typeof candidate.prUrl === "string") &&
+    (candidate.prHead === undefined || typeof candidate.prHead === "string");
 }
 
 function isThinkingLevel(value: unknown): boolean {
