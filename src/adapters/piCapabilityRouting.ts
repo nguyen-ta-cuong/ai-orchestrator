@@ -47,6 +47,10 @@ export interface CreatePiRoutingPlanInput {
   forceCapability?: boolean;
 }
 
+export function piRoutingRunVersion(config: OrchestratorConfig, provenance: ConfigProvenance): string {
+  return stableHash({ routing: config.routing, roles: config.roles, provenance });
+}
+
 export function createPiRoutingPlan(input: CreatePiRoutingPlanInput): PiRoutingPlan {
   const taskFeatures = extractTaskFeatures(input.evidence);
   const taskFeaturesHash = stableHash(taskFeatures);
