@@ -64,6 +64,7 @@ interface RuntimeState extends OrchestratorState {
   }>;
   rejectionFingerprints?: string[];
   buildEvidenceFingerprints?: string[];
+  routingFailures?: Array<{ stage: "plan" | "build" | "fast-judge"; identity: string; category: "not-found" | "unavailable" | "provider-error" }>;
   lastUsage?: {
     inputTokens: number;
     outputTokens: number;
@@ -363,6 +364,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       toolsBeforeRun: pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict"),
       rejectionFingerprints: [],
       buildEvidenceFingerprints: [],
+      routingFailures: [],
     };
     persist();
 
@@ -686,6 +688,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       const identity = `${candidate.provider}/${candidate.model}`;
       if (excludedIdentities.has(identity)) {
         failed.push(`${identity} (provider error)`);
+        recordFastRoutingFailure(stage, identity, "provider-error");
         continue;
       }
       const estimate: RoutingCostEstimate = candidate.estimatedCostUsd === undefined
@@ -718,6 +721,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
       if (!model) {
         failed.push(`${candidate.provider}/${candidate.model} (not found)`);
+        recordFastRoutingFailure(stage, identity, "not-found");
         continue;
       }
       const runId = state.runId;
@@ -726,6 +730,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       if (state.runId !== runId || state.phase !== phase) return false;
       if (!activated) {
         failed.push(`${candidate.provider}/${candidate.model} (unavailable)`);
+        recordFastRoutingFailure(stage, identity, "unavailable");
         continue;
       }
       pi.setThinkingLevel(candidate.thinking);
@@ -761,6 +766,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
     await abortForModelError(ctx, `${role} has no eligible model (${[...failed, ...exclusions].join(", ") || "no candidates"})`);
     return false;
+  }
+
+  function recordFastRoutingFailure(
+    stage: "plan" | "build" | "fast-judge",
+    identity: string,
+    category: "not-found" | "unavailable" | "provider-error",
+  ): void {
+    if (state.routingFailures?.some((failure) => failure.stage === stage && failure.identity === identity && failure.category === category)) return;
+    state.routingFailures = [...(state.routingFailures ?? []), { stage, identity, category }];
+    persist();
   }
 
   function fastFailureCategory(value: string): string {
