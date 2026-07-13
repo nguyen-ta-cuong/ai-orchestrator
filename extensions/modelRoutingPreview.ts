@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createPiRoutingPlan, type PiRoutingCandidate } from "../src/adapters/piCapabilityRouting.js";
 import {
@@ -36,8 +37,9 @@ export default function modelRoutingPreviewExtension(pi: ExtensionAPI): void {
       }));
       const evidence = {
         task: state?.task ?? `routing preview for ${stage}`,
-        spec: current?.paths.spec,
-        plan: current?.paths.plan,
+        spec: boundedArtifact(current?.paths.spec),
+        plan: boundedArtifact(current?.paths.plan),
+        changedPaths: state?.baselinePaths,
       };
       const common = {
         provenance: resolved.provenance,
@@ -55,6 +57,11 @@ export default function modelRoutingPreviewExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(formatPreview(stage, legacy.candidates[0], capability.decision), "info");
     },
   });
+}
+
+function boundedArtifact(path: string | undefined): string | undefined {
+  if (!path || !existsSync(path)) return undefined;
+  return readFileSync(path, "utf8").slice(0, 256_000);
 }
 
 function parseStage(value: string): RoutingStage | undefined {
