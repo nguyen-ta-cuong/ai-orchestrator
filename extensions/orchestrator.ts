@@ -693,11 +693,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       }
       const runId = state.runId;
       const phase = state.phase;
-      if (!(await pi.setModel(model))) {
+      const activated = await pi.setModel(model);
+      if (state.runId !== runId || state.phase !== phase) return false;
+      if (!activated) {
         failed.push(`${candidate.provider}/${candidate.model} (unavailable)`);
         continue;
       }
-      if (state.runId !== runId || state.phase !== phase) return false;
       pi.setThinkingLevel(candidate.thinking);
       const selection: NonNullable<RuntimeState["modelSelections"]>[number] = {
         stage,
