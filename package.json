@@ -25,7 +25,9 @@
     "skills",
     "extensions",
     "mcp",
-    "src"
+    "src",
+    "docs/setup.md",
+    "docs/user-guide.md"
   ],
   "repository": {
     "type": "git",
