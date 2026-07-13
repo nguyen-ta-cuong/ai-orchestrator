@@ -1028,11 +1028,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const runId = runtime.state.runId;
     if (runtime.state.finalization?.commitSha) return "committed";
     if (runtime.config.ship.commit === "never") return "skipped";
-    let shouldCommit = runtime.config.ship.commit === "auto";
-    if (runtime.config.ship.commit === "ask") {
-      shouldCommit = ctx.hasUI && await ctx.ui.confirm("Commit changes", "Commit the lifecycle changes now?");
-      if (!ownsRun(runId, "finalizing")) return "failed";
-    }
+    const shouldCommit = ctx.hasUI && await ctx.ui.confirm(
+      "Commit changes",
+      runtime.config.ship.commit === "auto"
+        ? "Commit policy is auto, but this action still requires explicit confirmation. Commit now?"
+        : "Commit the lifecycle changes now?",
+    );
+    if (!ownsRun(runId, "finalizing")) return "failed";
     if (!shouldCommit) return "skipped";
     if (!runtime.state.baselinePaths || !runtime.state.baselineStagedPaths) {
       notify(ctx, "Cannot safely attribute files for this older run; commit skipped.", "error");
@@ -1087,7 +1089,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
     if (!ownsRun(runId, "finalizing")) return "failed";
     if (!confirmed) return "skipped";
-    const result = await pi.exec("gh", ["pr", "create", "--fill"], { timeout: 60_000, signal: ctx.signal });
+    const branch = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    const localHead = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    const upstreamHead = await pi.exec("git", ["rev-parse", "@{upstream}"], { timeout: 10_000, signal: ctx.signal });
+    if (branch.code !== 0 || !branch.stdout.trim() || branch.stdout.trim() === "HEAD" ||
+      localHead.code !== 0 || upstreamHead.code !== 0 || localHead.stdout.trim() !== upstreamHead.stdout.trim()) {
+      notify(ctx, "Refusing to open a PR until the current branch is explicitly pushed and its upstream matches HEAD.", "error");
+      return "failed";
+    }
+    const result = await pi.exec("gh", ["pr", "create", "--fill", "--head", branch.stdout.trim()], { timeout: 60_000, signal: ctx.signal });
     if (result.code !== 0) {
       notify(ctx, `gh pr create failed: ${result.stderr || result.stdout}`, "error");
       return "failed";
