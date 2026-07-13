@@ -411,9 +411,9 @@ function exclusionFor(
     return excluded("cost-limit-exceeded", `${identityText} estimated cost $${estimatedCost.toFixed(4)} exceeds $${policy.limits.maxEstimatedUsdPerRun}`);
   }
 
-  const builder = request.priorSelections.find((selection) => selection.stage === "build");
+  const builder = latestBuildSelection(request.priorSelections);
   if (builder && CHECKER_STAGES.has(request.stage)) {
-    if (policy.separation.checkerMustDifferFromBuilder && modelIdentityKey(builder) === modelIdentityKey(model)) {
+    if (modelIdentityKey(builder) === modelIdentityKey(model)) {
       return excluded("same-builder-model", `${identityText} is the BUILD model and cannot check its own work`);
     }
     if (policy.separation.requireDifferentProviderFamilyFor.includes(request.stage)) {
@@ -437,7 +437,7 @@ function scoreModel(
     ? 0
     : Math.round(weights.reduce((sum, [name, weight]) => sum + profile.scores[name] * weight, 0) / totalWeight);
   const confidence = Math.round(profile.confidence * request.policy.confidenceBonusBasisPoints / 10_000);
-  const builder = request.priorSelections.find((selection) => selection.stage === "build");
+  const builder = latestBuildSelection(request.priorSelections);
   const family = profile.family ?? model.family;
   const diversity = builder && request.policy.separation.preferDifferentProviderFamily && family && builder.family && family !== builder.family ? 250 : 0;
   const cost = estimatedCostUsd === undefined
@@ -454,6 +454,10 @@ function scoreModel(
       detail: estimatedCostUsd === undefined ? "cost metadata unavailable" : `estimated $${estimatedCostUsd.toFixed(4)}`,
     },
   ];
+}
+
+function latestBuildSelection(selections: readonly ModelSelectionIdentity[]): ModelSelectionIdentity | undefined {
+  return [...selections].reverse().find((selection) => selection.stage === "build");
 }
 
 function estimateCost(model: DiscoveredModel, task: TaskFeatures): number | undefined {
