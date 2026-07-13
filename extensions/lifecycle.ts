@@ -86,6 +86,13 @@ interface Runtime {
   specRevisionFeedback?: string;
   planRevisionFeedback?: string;
   attemptedModels: string[];
+  lastUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    observedUsd: number;
+  };
 }
 
 export default function lifecycleExtension(pi: ExtensionAPI): void {
@@ -171,6 +178,19 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     return { block: true, reason: `${stageLabel(state.phase)} is read-only; edit/write are blocked.` };
   });
 
+  pi.on("message_end", async (event) => {
+    if (!runtime || !event.message || event.message.role !== "assistant") return;
+    const usage = event.message.usage;
+    if (!usage) return;
+    runtime.lastUsage = {
+      inputTokens: usage.input,
+      outputTokens: usage.output,
+      cacheReadTokens: usage.cacheRead,
+      cacheWriteTokens: usage.cacheWrite,
+      observedUsd: usage.cost.total,
+    };
+  });
+
   pi.on("agent_end", async (event) => {
     if (runtime) pendingSettlement = { runId: runtime.state.runId, messages: event.messages };
   });
@@ -197,6 +217,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           await artifactStageEnded(ctx, "plan");
           break;
         case "building":
+          persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
           await transition({ type: "build_produced" }, "BUILD completed; entering VERIFY", ctx);
           await continueOrPause(ctx, "test");
           break;
@@ -736,6 +757,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         decisionId,
         engine: plan.engine,
         policyVersion: plan.policyVersion,
+        ...(candidate.profileVersion ? { profileVersion: candidate.profileVersion } : {}),
         taskFeaturesHash: plan.taskFeaturesHash,
         selectedRank: candidate.rank,
         ...(candidate.score === undefined ? {} : { score: candidate.score }),
@@ -823,7 +845,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       attemptsByStage: {},
     };
     for (const event of events) {
-      if (typeof event.cost.estimatedUsd === "number") {
+      if (event.outcome.type === "stage-started" && typeof event.cost.estimatedUsd === "number") {
         snapshot.estimatedRunUsd += event.cost.estimatedUsd;
         snapshot.estimatedDayUsd += event.cost.estimatedUsd;
       }
@@ -855,7 +877,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         stage,
         recordedAt: new Date().toISOString(),
         policyVersion: plan.policyVersion,
-        profileVersion: plan.policyVersion,
+        profileVersion: candidate.profileVersion ?? "legacy-role",
         task: {
           workKind: plan.taskFeatures.workKind,
           risk: plan.taskFeatures.risk,
@@ -887,6 +909,55 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     });
   }
 
+  function persistRoutingStageOutcome(
+    stage: LifecycleRoutedStage | "build",
+    outcome: { type?: "stage-ended" | "final-status"; structuredToolCompliance: boolean | "unknown"; verdict: "approve" | "reject" | "unknown"; finalRunStatus?: "done" | "failed" | "cancelled" },
+  ): void {
+    if (!runtime || !runtime.config.routing.evidence.enabled) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing) return;
+    const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
+      event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
+    const usage = outcome.type === "final-status" ? undefined : runtime.lastUsage;
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      event: {
+        version: 1,
+        eventId: `${selection.routing.decisionId}:${outcome.type ?? "stage-ended"}:${runtime.state.buildIterations}:${runtime.state.verdicts.length}`,
+        runId: runtime.state.runId,
+        decisionId: selection.routing.decisionId,
+        stage,
+        recordedAt: new Date().toISOString(),
+        policyVersion: selection.routing.policyVersion,
+        profileVersion: selection.routing.profileVersion ?? "legacy-role",
+        task: started?.task ?? { workKind: "unknown", risk: "medium", languages: [], fileCount: 0 },
+        selected: {
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.family ? { family: selection.family } : {}),
+        },
+        usage: {
+          inputTokens: usage?.inputTokens ?? "unknown",
+          outputTokens: usage?.outputTokens ?? "unknown",
+          cacheReadTokens: usage?.cacheReadTokens ?? "unknown",
+          cacheWriteTokens: usage?.cacheWriteTokens ?? "unknown",
+        },
+        cost: {
+          estimatedUsd: started?.cost.estimatedUsd ?? "unknown",
+          observedUsd: usage?.observedUsd ?? "unknown",
+        },
+        outcome: {
+          type: outcome.type ?? "stage-ended",
+          structuredToolCompliance: outcome.structuredToolCompliance,
+          verdict: outcome.verdict,
+          buildIteration: runtime.state.buildIterations,
+          ...(outcome.finalRunStatus ? { finalRunStatus: outcome.finalRunStatus } : {}),
+        },
+      },
+    });
+    if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+  }
+
   function isCheckerRoutingStage(stage: LifecycleRoutedStage | "build"): boolean {
     return stage === "verify" || stage === "debug" || stage === "review" || stage === "ship";
   }
@@ -915,6 +986,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
 
+    persistRoutingStageOutcome(artifact === "spec" ? "define" : "plan", {
+      structuredToolCompliance: true,
+      verdict: "unknown",
+    });
     await transition(
       artifact === "spec"
         ? { type: "spec_produced", specPath: rel(path) }
@@ -962,6 +1037,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function checkerStageEnded(ctx: ExtensionContext, stage: "verify" | "review" | "ship"): Promise<void> {
     if (!runtime) return;
+    const structuredToolCompliance = Boolean(runtime.pendingVerdict && runtime.pendingVerdict.kind === stage);
     if (!runtime.pendingVerdict || runtime.pendingVerdict.kind !== stage) {
       if (runtime.remindedPhase !== runtime.state.phase) {
         runtime.remindedPhase = runtime.state.phase;
@@ -979,6 +1055,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const verdict = runtime.pendingVerdict;
     if (!verdict) throw new Error(`${stage} verdict was not available after recovery`);
     runtime.pendingVerdict = undefined;
+    persistRoutingStageOutcome(stage, { structuredToolCompliance, verdict: verdict.verdict });
     await transition({
       type: "verdict",
       stage,
@@ -1001,6 +1078,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function debugStageEnded(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const structuredToolCompliance = Boolean(runtime.pendingDiagnosis && isNonEmpty(runtime.paths.debug));
     if (!runtime.pendingDiagnosis || !isNonEmpty(runtime.paths.debug)) {
       if (runtime.remindedPhase !== "debugging") {
         runtime.remindedPhase = "debugging";
@@ -1024,6 +1102,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       appendJournal(runtime.paths, "Synthesized DEBUG diagnosis after missing structured output");
     }
     runtime.pendingDiagnosis = undefined;
+    persistRoutingStageOutcome("debug", { structuredToolCompliance, verdict: "unknown" });
     await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "DEBUG diagnosis produced", ctx);
     if (!runtime) return;
     if (runtime.state.phase === "failed") await finishRun(ctx);
@@ -1200,6 +1279,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const finished = runtime.state;
     const summary = finalSummary(finished, runtime.paths);
+    const lastStage = finished.modelSelections.at(-1)?.stage;
+    if (lastStage) {
+      persistRoutingStageOutcome(lastStage, {
+        type: "final-status",
+        structuredToolCompliance: true,
+        verdict: finished.verdicts.at(-1)?.verdict ?? "unknown",
+        finalRunStatus: finished.phase === "failed" ? "failed" : "done",
+      });
+    }
     restoreTools();
     const restored = await restoreRuntimeModel(ctx);
     if (restored) {
