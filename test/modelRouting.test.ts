@@ -146,6 +146,16 @@ describe("capability model routing", () => {
     expect(exactDecision.excluded.find((item) => item.identity.model === "build")?.code).toBe("same-builder-model");
     expect(exactDecision.eligible.map((item) => item.identity.model)).toEqual(["review"]);
 
+    const separationDisabled = structuredClone(DEFAULT_ROUTING_POLICY);
+    separationDisabled.separation.checkerMustDifferFromBuilder = false;
+    expect(rankModels(request([exact], profiles, { priorSelections, policy: separationDisabled })).excluded[0]?.code).toBe("same-builder-model");
+
+    const previousBuilder = { stage: "build" as const, provider: "old", model: "builder", family: "family-old" };
+    const latestDecision = rankModels(request([exact, sibling], profiles, {
+      priorSelections: [previousBuilder, ...priorSelections],
+    }));
+    expect(latestDecision.excluded.find((item) => item.identity.model === "build")?.code).toBe("same-builder-model");
+
     const strictPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
     strictPolicy.separation.requireDifferentProviderFamilyFor = ["review"];
     const familyDecision = rankModels(request([exact, sibling], profiles, { priorSelections, policy: strictPolicy }));
@@ -163,6 +173,54 @@ describe("capability model routing", () => {
       expect(candidate.scoreBreakdown.reduce((sum, component) => sum + component.value, 0)).toBe(candidate.score);
     }
     expect(first.eligible.map((item) => `${item.identity.provider}/${item.identity.model}`)).toEqual(["a/first", "z/second"]);
+  });
+
+  it("uses task features to distinguish feature and bug-fix suitability", () => {
+    const architect = model({ provider: "p", model: "architect" });
+    const debuggerModel = model({ provider: "p", model: "debugger" });
+    const profiles = {
+      "p/architect": profile({ scores: { coding: 7_000, architecture: 10_000, debugging: 1_000 } }),
+      "p/debugger": profile({ scores: { coding: 7_000, architecture: 1_000, debugging: 10_000 } }),
+    };
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.stages.build.weights = { coding: 1 };
+    const featureTask = { ...request([], {}).task, workKind: "feature" as const };
+    const bugTask = { ...featureTask, workKind: "bug-fix" as const, failureSignals: ["test-assertion"] };
+
+    expect(rankModels(request([architect, debuggerModel], profiles, { stage: "build", policy, task: featureTask })).eligible[0]?.identity.model).toBe("architect");
+    expect(rankModels(request([architect, debuggerModel], profiles, { stage: "build", policy, task: bugTask })).eligible[0]?.identity.model).toBe("debugger");
+  });
+
+  it("supports family pins and preferences", () => {
+    const familyA = model({ provider: "p", model: "a", family: "family-a" });
+    const familyB = model({ provider: "p", model: "b", family: "family-b" });
+    const profiles = { "p/a": profile(), "p/b": profile() };
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.stages.review.pins = ["family:family-b"];
+    expect(rankModels(request([familyA, familyB], profiles, { policy })).eligible.map((candidate) => candidate.identity.model)).toEqual(["b"]);
+
+    policy.stages.review.pins = [];
+    policy.stages.review.prefer = ["family:family-b"];
+    expect(rankModels(request([familyA, familyB], profiles, { policy })).eligible[0]?.identity.model).toBe("b");
+  });
+
+  it("makes quality and economy modes behaviorally distinct while preserving pin order", () => {
+    const expensive = model({ provider: "p", model: "strong", cost: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0 } });
+    const cheap = model({ provider: "p", model: "cheap", cost: { input: 0.1, output: 0.1, cacheRead: 0, cacheWrite: 0 } });
+    const profiles = {
+      "p/strong": profile({ scores: { coding: 9_500 } }),
+      "p/cheap": profile({ scores: { coding: 5_500 } }),
+    };
+    const quality = structuredClone(DEFAULT_ROUTING_POLICY);
+    quality.mode = "quality";
+    const economy = structuredClone(DEFAULT_ROUTING_POLICY);
+    economy.mode = "economy";
+
+    expect(rankModels(request([expensive, cheap], profiles, { stage: "build", policy: quality })).eligible[0]?.identity.model).toBe("strong");
+    expect(rankModels(request([expensive, cheap], profiles, { stage: "build", policy: economy })).eligible[0]?.identity.model).toBe("cheap");
+
+    economy.stages.build.pins = ["p/strong", "p/cheap"];
+    expect(rankModels(request([expensive, cheap], profiles, { stage: "build", policy: economy })).eligible[0]?.identity.model).toBe("strong");
   });
 
   it("breaks score ties by prefer order, confidence, cost, then lexical identity", () => {
@@ -194,6 +252,21 @@ describe("capability model routing", () => {
 
     expect(selectThinkingLevel("build", candidate, policy, "low")).toMatchObject({ requested: "medium", selected: "low", clamped: true });
     expect(selectThinkingLevel("build", candidate, policy, "high")).toMatchObject({ requested: "high", selected: "high", clamped: false });
+  });
+
+  it("excludes models that violate privacy policy before scoring", () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.privacy = { allowed: ["local", "private"], allowUnknown: false, providers: { local: "local", cloud: "public" } };
+    const decision = rankModels(request([
+      model({ provider: "local", model: "safe" }),
+      model({ provider: "cloud", model: "public" }),
+      model({ provider: "mystery", model: "unknown" }),
+    ], {
+      "local/safe": profile(), "cloud/public": profile(), "mystery/unknown": profile(),
+    }, { policy }));
+
+    expect(decision.eligible.map((candidate) => candidate.identity.model)).toEqual(["safe"]);
+    expect(decision.excluded.filter((candidate) => candidate.code === "privacy-not-allowed")).toHaveLength(2);
   });
 
   it("returns typed exclusions when no candidate is eligible", () => {

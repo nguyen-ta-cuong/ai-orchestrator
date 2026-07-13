@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import type { ConfigProvenance, OrchestratorConfig, RoleName, ThinkingLevel } from "../core/config.js";
 import { lifecycleModelChoices } from "../core/lifecycleRouting.js";
 import {
+  modelIdentityKey,
   rankModels,
+  resolveModelProfiles,
   type ModelSelectionIdentity,
   type RankedModelCandidate,
   type RoutingDecision,
@@ -21,6 +23,7 @@ export interface PiRoutingCandidate {
   rank: number;
   score?: number;
   estimatedCostUsd?: number;
+  profileVersion?: string;
   reason: string;
 }
 
@@ -41,18 +44,24 @@ export interface CreatePiRoutingPlanInput {
   available: readonly PiModelLike[];
   evidence: TaskFeatureEvidence | string;
   priorSelections?: readonly ModelSelectionIdentity[];
+  /** Compute active capability policy for a read-only preview without changing configured engine behavior. */
+  forceCapability?: boolean;
+}
+
+export function piRoutingRunVersion(config: OrchestratorConfig, provenance: ConfigProvenance): string {
+  return stableHash({ routing: config.routing, roles: config.roles, provenance });
 }
 
 export function createPiRoutingPlan(input: CreatePiRoutingPlanInput): PiRoutingPlan {
   const taskFeatures = extractTaskFeatures(input.evidence);
   const taskFeaturesHash = stableHash(taskFeatures);
-  if (input.config.routing.engine !== "capability") {
+  if (input.config.routing.engine !== "capability" && !input.forceCapability) {
     return {
       engine: input.config.routing.engine,
       policyVersion: `${input.config.routing.version}:${stableHash({ engine: input.config.routing.engine, role: input.config.roles[input.role] })}`,
       taskFeatures,
       taskFeaturesHash,
-      candidates: legacyCandidates(input),
+      candidates: legacyCandidates(input, taskFeatures),
     };
   }
 
@@ -85,28 +94,65 @@ function capabilityPolicy(input: CreatePiRoutingPlanInput): RoutingPolicy {
     stage.pins = [identity];
     stage.minimumProfileConfidence = 0;
     stage.minimumScores = {};
+    stage.thinking = input.config.roles[input.role].thinking;
     policy.allowInferredProfiles = true;
   }
   return policy;
 }
 
-function legacyCandidates(input: CreatePiRoutingPlanInput): PiRoutingCandidate[] {
-  const available = normalizePiModelCatalog(input.available).map(({ provider, model }) => ({ provider, model }));
-  if (input.stage !== "build" && input.stage !== "fast-judge") {
-    const choices = lifecycleModelChoices(
+function legacyCandidates(input: CreatePiRoutingPlanInput, taskFeatures: TaskFeatures): PiRoutingCandidate[] {
+  const catalog = normalizePiModelCatalog(input.available);
+  const available = catalog.map(({ provider, model }) => ({ provider, model }));
+  const rawCandidates = input.stage !== "build" && input.stage !== "fast-judge"
+    ? lifecycleModelChoices(
       input.stage,
       input.config,
       available,
       input.config.roles[input.role],
-    );
-    return choices.map((choice, index) => ({
+    ).map((choice, index) => ({
       ...choice.candidate,
       rank: index + 1,
       reason: choice.reason,
-    }));
-  }
-  const role = input.config.roles[input.role];
-  return [{ ...role, rank: 1, reason: `legacy ${input.role} role selection` }];
+    }))
+    : [{ ...input.config.roles[input.role], rank: 1, reason: `legacy ${input.role} role selection` }];
+  const profiles = resolveModelProfiles(
+    catalog,
+    [{ provenance: "project", profiles: input.config.routing.profiles }],
+    input.config.routing,
+  );
+  const candidates = rawCandidates.map((candidate) => {
+    const identity = modelIdentityKey(candidate);
+    const model = catalog.find((item) => modelIdentityKey(item) === identity);
+    const profile = profiles.get(identity);
+    const estimatedCostUsd = model?.cost
+      ? (taskFeatures.contextTokens * model.cost.input + taskFeatures.expectedOutputTokens * model.cost.output) / 1_000_000
+      : undefined;
+    return {
+      ...candidate,
+      ...(profile?.family ? { family: profile.family } : model?.family ? { family: model.family } : {}),
+      ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }),
+      ...(profile?.version ? { profileVersion: profile.version } : {}),
+    };
+  }).filter((candidate) => {
+    const identity = `${candidate.provider}/${candidate.model}`;
+    const model = catalog.find((item) => item.provider === candidate.provider && item.model === candidate.model);
+    const privacy = model?.privacy ?? input.config.routing.privacy.providers[candidate.provider] ?? "unknown";
+    return !input.config.routing.deny.providers.includes(candidate.provider) &&
+      !input.config.routing.deny.models.includes(identity) &&
+      !(candidate.family && input.config.routing.deny.families.includes(candidate.family)) &&
+      !((privacy === "unknown" && !input.config.routing.privacy.allowUnknown) ||
+        (privacy !== "unknown" && !input.config.routing.privacy.allowed.includes(privacy)));
+  });
+
+  if (!["verify", "debug", "review", "ship", "fast-judge"].includes(input.stage)) return candidates;
+  const builder = [...(input.priorSelections ?? [])].reverse().find((selection) => selection.stage === "build");
+  if (!builder) return candidates;
+  const requireDifferentFamily = input.config.routing.separation.requireDifferentProviderFamilyFor.includes(input.stage);
+  return candidates.filter((candidate) => {
+    if (modelIdentityKey(candidate) === modelIdentityKey(builder)) return false;
+    if (!requireDifferentFamily) return true;
+    return Boolean(builder.family && candidate.family && builder.family !== candidate.family);
+  });
 }
 
 function rankedCandidate(candidate: RankedModelCandidate, index: number): PiRoutingCandidate {
@@ -119,7 +165,8 @@ function rankedCandidate(candidate: RankedModelCandidate, index: number): PiRout
     rank: index + 1,
     score: candidate.score,
     ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
-    reason: `${capability?.detail ?? "capability fit"}; score ${candidate.score}; profile ${candidate.profile.provenance}/${candidate.profile.version}`,
+    profileVersion: candidate.profile.version,
+    reason: `${capability?.detail ?? "capability fit"}; score ${candidate.score}; profile ${candidate.profile.provenance}/${candidate.profile.version}; ${candidate.thinkingReason}`,
   };
 }
 

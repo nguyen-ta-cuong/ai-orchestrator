@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -10,18 +10,21 @@ const dirs: string[] = [];
 describe("fast Pi capability routing", () => {
   afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    vi.unstubAllEnvs();
   });
 
   it("routes planner, coder, and an independent judge without changing loop transitions", async () => {
     const cwd = join(tmpdir(), `ai-orchestrator-fast-${process.pid}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(cwd, { recursive: true });
     dirs.push(cwd);
+    vi.stubEnv("HOME", join(cwd, "home"));
     writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({
       routing: {
         engine: "capability",
         unknownCost: "allow",
         profiles: {
           "invented/planner": { family: "architect", confidence: 9000, version: "test", scores: { architecture: 9500, coding: 6000, verification: 6000, review: 6000 } },
+          "invented/planner-backup": { family: "architect-backup", confidence: 9000, version: "test", scores: { architecture: 8500, coding: 6000, verification: 6000, review: 6000 } },
           "invented/coder": { family: "maker", confidence: 9000, version: "test", scores: { architecture: 6000, coding: 9500, verification: 6000, review: 6000 } },
           "invented/checker": { family: "checker", confidence: 9000, version: "test", scores: { architecture: 6000, coding: 6000, verification: 9500, review: 9500 } },
         },
@@ -49,7 +52,7 @@ describe("fast Pi capability routing", () => {
       exec: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })),
     };
     orchestratorExtension(pi as unknown as ExtensionAPI);
-    const models = ["planner", "coder", "checker"].map((id) => ({
+    const models = ["planner", "planner-backup", "coder", "checker"].map((id) => ({
       provider: "invented", id, reasoning: true, input: ["text"], contextWindow: 128_000, maxTokens: 16_000,
     }));
     const ctx = {
@@ -66,16 +69,75 @@ describe("fast Pi capability routing", () => {
       abort: vi.fn(),
     } as unknown as ExtensionCommandContext;
 
-    await commands.get("orchestrate")!("--yolo build a feature", ctx);
-    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
-    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implemented" }] }, ctx as unknown as ExtensionContext);
+    const judgeTool = vi.mocked(pi.registerTool).mock.calls.find(([tool]) => (tool as { name?: string }).name === "judge_verdict")?.[0] as { execute: (id: string, params: unknown) => Promise<unknown> };
 
-    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "coder", "checker"]);
+    await commands.get("orchestrate")!("--yolo build a feature", ctx);
+    expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
+    await expect(events.get("tool_call")!({ toolName: "edit", input: {} }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "rm -rf src" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+
+    await events.get("agent_end")!({ messages: [{ role: "assistant", stopReason: "error" }] }, ctx as unknown as ExtensionContext);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
+    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "planner-backup"]);
+
+    await events.get("message_end")!({ message: { role: "assistant", usage: { input: 50, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } }, ctx as unknown as ExtensionContext);
+    await events.get("message_end")!({ message: { role: "assistant", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } }, ctx as unknown as ExtensionContext);
+    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
+    expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
+    expect(activeTools).toEqual(["read", "edit"]);
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git -C . push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "bash -lc 'git push origin main'" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "g\\it push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git reset --hard" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+    await expect(events.get("tool_call")!({ toolName: "write", input: { path: ".ai-orchestrator/active-run.json" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+
+    await events.get("message_end")!({ message: { role: "assistant", usage: { input: 200, output: 40, cacheRead: 0, cacheWrite: 0, cost: { total: 0.04 } } } }, ctx as unknown as ExtensionContext);
+    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implemented" }] }, ctx as unknown as ExtensionContext);
+    expect(activeTools).toEqual(["read", "edit"]);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
+    expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash", "judge_verdict"]);
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git diff --staged" } }, ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
+    await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git reset --hard" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
+
+    expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "planner-backup", "coder", "checker"]);
     const latest = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; modelSelections: Array<{ stage: string; model: string }> };
     expect(latest.phase).toBe("judging");
     expect(latest.modelSelections.map(({ stage, model }) => [stage, model])).toEqual([
-      ["plan", "planner"], ["build", "coder"], ["fast-judge", "checker"],
+      ["plan", "planner"], ["plan", "planner-backup"], ["build", "coder"], ["fast-judge", "checker"],
+    ]);
+    expect((latest.modelSelections[0] as { failureCategories?: string[] }).failureCategories).toContain("provider-error");
+    expect(latest.modelSelections[1]).toMatchObject({
+      failureCategories: ["provider-error"], attemptedModels: [expect.stringContaining("planner"), expect.stringContaining("selected")],
+    });
+    expect((latest as unknown as { routingFailures: unknown[] }).routingFailures).toEqual([
+      expect.objectContaining({ stage: "plan", identity: "invented/planner", category: "provider-error" }),
     ]);
     expect(activeTools).toContain("judge_verdict");
+    await expect(judgeTool.execute("bad", { verdict: "reject", reasons: " ", requiredFixes: " " })).rejects.toThrow(/reasons must be non-empty/);
+    await expect(judgeTool.execute("bad", { verdict: "reject", reasons: "real issue" })).rejects.toThrow(/requires non-empty requiredFixes/);
+    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "review without verdict" }] }, ctx as unknown as ExtensionContext);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
+    const evidence = readFileSync(join(cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(evidence.filter((event) => event.outcome.type === "stage-ended").map((event) => event.cost.observedUsd)).toEqual(["unknown", 0.03, 0.04]);
+    expect(evidence.some((event) => event.stage === "fast-judge" && event.outcome.type === "stage-ended")).toBe(false);
+
+    setModel.mockImplementation(async (model: unknown) => (model as { id: string }).id !== "model");
+    await commands.get("orchestrate-stop")!("", ctx);
+    const pending = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; originalModel?: { id: string } };
+    expect(pending).toMatchObject({ phase: "idle", originalModel: { id: "model" } });
+    const callsBeforeBlockedStart = setModel.mock.calls.length;
+    await commands.get("orchestrate")!("--yolo another task", ctx);
+    expect(setModel).toHaveBeenCalledTimes(callsBeforeBlockedStart);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("restoration is pending"), "error");
+
+    setModel.mockResolvedValue(true);
+    await commands.get("orchestrate-stop")!("", ctx);
+    const restored = appendEntry.mock.calls.at(-1)?.[1] as { phase: string; originalModel?: unknown };
+    expect(restored.phase).toBe("idle");
+    expect(restored.originalModel).toBeUndefined();
+    expect(activeTools).toEqual(["read", "edit", "bash"]);
   });
 });

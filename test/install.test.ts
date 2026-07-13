@@ -1,5 +1,5 @@
 import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -68,6 +68,18 @@ describe("ai-orchestrator install-cursor", () => {
     expect(stdout).toContain(`Wrote MCP config: ${mcpPath}`);
   });
 
+  it("writes the portable pinned command when invoked through npx", () => {
+    const cwd = makeTempDir();
+    const options = installerOptions(cwd);
+    execFileSync(process.execPath, [binPath, "install-cursor"], {
+      ...options,
+      env: { ...options.env, npm_command: "exec" },
+    });
+
+    expect(JSON.parse(readFileSync(join(cwd, ".cursor", "mcp.json"), "utf8")))
+      .toEqual(JSON.parse(readFileSync(staticSnippetPath, "utf8")));
+  });
+
   it("does not overwrite an existing customized MCP config", () => {
     const cwd = makeTempDir();
     const mcpPath = join(cwd, ".cursor", "mcp.json");
@@ -107,6 +119,16 @@ describe("ai-orchestrator install-cursor", () => {
     expect(existsSync(join(homeCursor, "rules", "ai-orchestrator.mdc"))).toBe(true);
     expect(existsSync(join(homeCursor, "skills", "orchestrate", "SKILL.md"))).toBe(true);
     expect(stdout).toContain(`Installed Cursor rule: ${join(homeCursor, "rules", "ai-orchestrator.mdc")}`);
+  });
+
+  it("refuses a symlinked project Cursor directory", () => {
+    const cwd = makeTempDir();
+    const outside = makeTempDir();
+    symlinkSync(outside, join(cwd, ".cursor"), "dir");
+
+    expect(() => runInstaller(cwd, "--no-mcp")).toThrow(/refuses symlinked Cursor path/);
+    expect(existsSync(join(outside, "rules"))).toBe(false);
+    expect(existsSync(join(outside, "skills"))).toBe(false);
   });
 
   it("does not overwrite customized existing rule and skill files", () => {

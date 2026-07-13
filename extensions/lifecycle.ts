@@ -1,5 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -14,7 +16,7 @@ import {
   type RoleName,
   type ThinkingLevel,
 } from "../src/core/config.js";
-import { createPiRoutingPlan, type PiRoutingCandidate, type PiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
+import { createPiRoutingPlan, piRoutingRunVersion, type PiRoutingCandidate, type PiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
 import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
 import {
   debugPrompt,
@@ -32,19 +34,30 @@ import {
   type LifecycleStageVerdict,
   type LifecycleState,
 } from "../src/core/lifecycle.js";
+import { recommendRoutingPolicyChanges } from "../src/core/routingEvidence.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import {
+  acquireRunLease,
   appendJournal,
   appendRoutingTrace,
+  assertRunPathsSafe,
   createRun,
   currentRun,
+  ownsRunLease,
   readState,
   releaseRun,
+  releaseRunLease,
   writeState,
   type RunPaths,
 } from "../src/lifecycle/artifacts.js";
-import { appendRoutingEvidenceEvent, readRoutingEvidenceEvents } from "../src/lifecycle/routingEvidenceStore.js";
+import {
+  appendRoutingBudgetLedgerEvent,
+  appendRoutingEvidenceEvent,
+  readRoutingBudgetLedger,
+  readRoutingEvidenceEvents,
+  resolveUserEvidenceRoot,
+} from "../src/lifecycle/routingEvidenceStore.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -52,6 +65,10 @@ const WIDGET_KEY = ENTRY_TYPE;
 const VERDICT_TOOLS = new Set(["verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
+const BUILD_TOOL_ALLOWLIST = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
+const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
+const TESTABLE_READ_ONLY_PHASES = new Set<LifecyclePhase>(["verifying", "reviewing", "debugging", "shipping"]);
 
 type StandaloneStage = "spec" | "plan" | "build" | "test" | "debug" | "review" | "ship";
 interface PendingDiagnosis {
@@ -83,6 +100,14 @@ interface Runtime {
   specRevisionFeedback?: string;
   planRevisionFeedback?: string;
   attemptedModels: string[];
+  leaseOwner: string;
+  lastUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    observedUsd: number;
+  };
 }
 
 export default function lifecycleExtension(pi: ExtensionAPI): void {
@@ -104,9 +129,44 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       await ctx.waitForIdle();
       if (args.trim() === "resume") {
         await resumeRun(ctx);
+      } else if (args.trim() === "migrate-routing") {
+        await migrateRoutingPolicy(ctx);
       } else {
         await startPipeline(args, ctx);
       }
+    },
+  });
+
+  pi.registerCommand("lifecycle-routing-report", {
+    description: "Show report-only routing recommendations from privacy-minimized user evidence",
+    handler: async (_args, ctx) => {
+      await ctx.waitForIdle();
+      const config = loadPiConfig(ctx.cwd);
+      const store = join(resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir), "events.jsonl");
+      const read = readRoutingEvidenceEvents(store);
+      const recommendations = recommendRoutingPolicyChanges(read.events, {
+        minimumSamples: config.routing.evidence.minRecommendationSamples,
+      });
+      const content = recommendations.length > 0
+        ? `Routing recommendations (report only; no policy was changed):\n\n${JSON.stringify(recommendations, null, 2)}`
+        : `No routing recommendation met the ${config.routing.evidence.minRecommendationSamples}-sample threshold across ${read.events.length} valid events.`;
+      pi.sendMessage({ customType: ENTRY_TYPE, content, display: true, details: { recommendations, warnings: read.warnings } }, { triggerTurn: false });
+    },
+  });
+
+  pi.registerCommand("lifecycle-routing-apply", {
+    description: "Explicitly apply one report recommendation to trusted user preferences",
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle();
+      await applyRoutingRecommendation(args, ctx);
+    },
+  });
+
+  pi.registerCommand("lifecycle-routing-rollback", {
+    description: "Rollback a previously applied routing recommendation by id",
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle();
+      await rollbackRoutingRecommendation(args, ctx);
     },
   });
 
@@ -123,23 +183,43 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   registerStageCommand("test", "Run VERIFY for the current lifecycle", async (_args, ctx) => startStandalone("test", "verifying", ctx));
   registerStageCommand("debug", "Run read-only DEBUG for the current lifecycle", async (_args, ctx) => startStandalone("debug", "debugging", ctx));
   registerStageCommand("review", "Run REVIEW for the current lifecycle", async (_args, ctx) => startStandalone("review", "reviewing", ctx));
-  registerStageCommand("ship", "Run SHIP for the current lifecycle", async (_args, ctx) => startStandalone("ship", "shipping", ctx));
+  registerStageCommand("ship", "Run or resume SHIP finalization for the current lifecycle", async (_args, ctx) =>
+    startStandalone("ship", ["shipping", "awaiting_ship_approval", "finalizing"], ctx));
 
   pi.on("tool_call", async (event) => {
     const activeRuntime = runtime;
     const state = activeRuntime?.state;
     if (!activeRuntime || !state) return;
-    if (event.toolName === "bash" && state.phase !== "building") {
+    assertRunPathsSafe(activeRuntime.paths);
+    if (event.toolName === "bash") {
       const command = typeof event.input.command === "string" ? event.input.command : "";
-      const testCommand = activeRuntime.config.judge.runTests ? detectTestCommand(activeRuntime.cwd) : undefined;
+      if (state.phase === "building") {
+        const artifactsRoot = resolve(activeRuntime.paths.root, "..");
+        if (isBlockedBuildCommand(command, activeRuntime.config.lifecycle.artifactsDir, artifactsRoot)) {
+          return { block: true, reason: "BUILD may edit source but cannot modify orchestrator metadata, perform destructive Git operations, or stage, commit, tag, push, open a PR, or publish." };
+        }
+        return;
+      }
+      const testCommand = activeRuntime.config.judge.runTests && TESTABLE_READ_ONLY_PHASES.has(state.phase)
+        ? detectTestCommand(activeRuntime.cwd)
+        : undefined;
       if (!isReadOnlyLifecycleCommand(command, testCommand)) {
-        return { block: true, reason: `${stageLabel(state.phase)} allows only reviewed read-only inspection commands and the exact detected test command.` };
+        return { block: true, reason: `${stageLabel(state.phase)} allows only reviewed read-only inspection commands${testCommand ? " and the exact detected test command" : ""}.` };
       }
       return;
     }
     if (!MUTATION_TOOLS.has(event.toolName)) return;
 
-    if (state.phase === "building") return;
+    if (state.phase === "building") {
+      const input = event.input as { path?: unknown };
+      const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
+      const protectedRoots = [
+        resolve(activeRuntime.paths.root, ".."),
+        resolve(activeRuntime.cwd, ".ai-orchestrator"),
+      ];
+      if (!protectedRoots.some((root) => requestedPath === root || requestedPath.startsWith(`${root}/`))) return;
+      return { block: true, reason: "BUILD may edit source files but orchestrator metadata and lifecycle artifacts are orchestrator-owned." };
+    }
     if (state.phase === "defining" || state.phase === "planning") {
       const input = event.input as { path?: unknown };
       const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
@@ -149,6 +229,19 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
 
     return { block: true, reason: `${stageLabel(state.phase)} is read-only; edit/write are blocked.` };
+  });
+
+  pi.on("message_end", async (event) => {
+    if (!runtime || !event.message || event.message.role !== "assistant") return;
+    const usage = event.message.usage;
+    if (!usage) return;
+    runtime.lastUsage = {
+      inputTokens: (runtime.lastUsage?.inputTokens ?? 0) + usage.input,
+      outputTokens: (runtime.lastUsage?.outputTokens ?? 0) + usage.output,
+      cacheReadTokens: (runtime.lastUsage?.cacheReadTokens ?? 0) + usage.cacheRead,
+      cacheWriteTokens: (runtime.lastUsage?.cacheWriteTokens ?? 0) + usage.cacheWrite,
+      observedUsd: (runtime.lastUsage?.observedUsd ?? 0) + usage.cost.total,
+    };
   });
 
   pi.on("agent_end", async (event) => {
@@ -162,9 +255,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     try {
       const stopReason = lastAssistantStopReason(messages);
       if (stopReason === "aborted" || stopReason === "error") {
+        if (stopReason === "error") recordProviderFailure();
         await interruptRun(ctx, stopReason === "aborted"
           ? "Lifecycle turn was aborted. Run /lifecycle resume to continue."
-          : "Lifecycle turn ended with a model/provider error. Run /lifecycle resume to retry.");
+          : "Lifecycle turn ended with a model/provider error. Run /lifecycle resume to try the next eligible fallback.");
         return;
       }
 
@@ -177,6 +271,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           await artifactStageEnded(ctx, "plan");
           break;
         case "building":
+          await recordBuildEvidenceFingerprint(ctx);
+          if (!runtime || !ownsRun(runtime.state.runId, "building")) return;
+          persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
           await transition({ type: "build_produced" }, "BUILD completed; entering VERIFY", ctx);
           await continueOrPause(ctx, "test");
           break;
@@ -203,14 +300,36 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     deactivateVerdictTools();
     const loaded = loadCurrent(ctx.cwd);
-    if (!loaded || !isActivePhase(loaded.state.phase)) {
+    if (!loaded || (!isActivePhase(loaded.state.phase) && loaded.state.modelRestored !== false)) {
       clearUi(ctx);
       return;
     }
 
     if (loaded.state.modelRestored === false) {
-      await restoreOriginalModel(ctx, loaded.state);
-      writeState(loaded.paths, loaded.state);
+      const sessionLeaseOwner = randomUUID();
+      try {
+        acquireRunLease(loaded.paths, sessionLeaseOwner);
+      } catch {
+        clearUi(ctx);
+        notify(ctx, `Lifecycle run ${loaded.state.runId} is executing in another Pi process; this session will not restore or mutate it.`, "warning");
+        return;
+      }
+      try {
+        const restored = await restoreOriginalModel(ctx, loaded.state);
+        writeState(loaded.paths, loaded.state);
+        if (!restored) {
+          clearUi(ctx);
+          notify(ctx, `Lifecycle run ${loaded.state.runId} still needs original-model restoration. Fix model availability and use /lifecycle resume or /lifecycle-stop.`, "warning");
+          return;
+        }
+        if (!isActivePhase(loaded.state.phase)) {
+          releaseRun(ctx.cwd, loadPiConfig(ctx.cwd).lifecycle.artifactsDir, loaded.state.runId);
+          clearUi(ctx);
+          return;
+        }
+      } finally {
+        releaseRunLease(loaded.paths, sessionLeaseOwner);
+      }
     }
     clearUi(ctx);
     runtime = undefined;
@@ -222,6 +341,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       restoreTools();
       await restoreRuntimeModel(ctx);
       persistMirror(runtime.state);
+      releaseRuntimeLease();
     }
     runtime = undefined;
     deactivateVerdictTools();
@@ -242,8 +362,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }),
       async execute(_id, params) {
         requireToolPhase("verifying", "verify_verdict");
-        runtime!.pendingVerdict = { kind: "verify", ...params };
-        persistMirror(runtime!.state);
+        persistPendingCheckerVerdict("verifying", { kind: "verify", ...params });
         return { content: [{ type: "text", text: `Recorded VERIFY verdict: ${params.verdict}` }], details: params, terminate: true };
       },
     });
@@ -261,8 +380,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }),
       async execute(_id, params) {
         requireToolPhase("reviewing", "review_verdict");
-        runtime!.pendingVerdict = { kind: "review", ...params };
-        persistMirror(runtime!.state);
+        persistPendingCheckerVerdict("reviewing", { kind: "review", ...params });
         return { content: [{ type: "text", text: `Recorded REVIEW verdict: ${params.verdict}` }], details: params, terminate: true };
       },
     });
@@ -287,6 +405,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         runtime!.pendingDiagnosis = diagnosis;
         runtime!.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
         writeState(runtime!.paths, runtime!.state);
+        assertRunPathsSafe(runtime!.paths);
         writeFileSync(runtime!.paths.debug, formatDiagnosis(diagnosis));
         appendJournal(runtime!.paths, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
         persistMirror(runtime!.state);
@@ -307,16 +426,31 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }),
       async execute(_id, params) {
         requireToolPhase("shipping", "ship_decision");
-        runtime!.pendingVerdict = {
+        persistPendingCheckerVerdict("shipping", {
           kind: "ship",
           verdict: params.decision === "go" ? "approve" : "reject",
           reasons: params.report,
           requiredFixes: params.blockers,
-        };
-        persistMirror(runtime!.state);
+        });
         return { content: [{ type: "text", text: `Recorded SHIP decision: ${params.decision}` }], details: params, terminate: true };
       },
     });
+  }
+
+  function persistPendingCheckerVerdict(
+    phase: "verifying" | "reviewing" | "shipping",
+    verdict: PendingVerdict,
+  ): void {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    const reasons = verdict.reasons.trim();
+    const requiredFixes = verdict.requiredFixes?.trim();
+    if (!reasons) throw new Error("checker verdict reasons must be non-empty");
+    if (verdict.verdict === "reject" && !requiredFixes) throw new Error("checker rejection requires non-empty requiredFixes");
+    runtime.pendingVerdict = { ...verdict, reasons, ...(requiredFixes ? { requiredFixes } : {}) };
+    runtime.state.pendingCheckerVerdict = { phase, ...runtime.pendingVerdict };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `${verdict.kind.toUpperCase()} structured verdict checkpointed`);
+    persistMirror(runtime.state);
   }
 
   function registerStageCommand(
@@ -333,7 +467,119 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     });
   }
 
+  async function applyRoutingRecommendation(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const index = Number.parseInt(args.trim(), 10) - 1;
+    if (!Number.isInteger(index) || index < 0) {
+      notify(ctx, "Usage: /lifecycle-routing-apply <1-based recommendation number>", "error");
+      return;
+    }
+    const config = loadPiConfig(ctx.cwd);
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir);
+    const events = readRoutingEvidenceEvents(join(userStoreRoot, "events.jsonl")).events;
+    const recommendations = recommendRoutingPolicyChanges(events, { minimumSamples: config.routing.evidence.minRecommendationSamples });
+    const recommendation = recommendations[index];
+    if (!recommendation || recommendation.recommendedChange.kind !== "prefer-model") {
+      notify(ctx, "That bounded prefer-model recommendation is no longer available; run /lifecycle-routing-report again.", "error");
+      return;
+    }
+    if (!ctx.hasUI || !(await ctx.ui.confirm(
+      "Apply routing recommendation to trusted user config?",
+      `Observed category: ${recommendation.taskCategory}\n${recommendation.downstreamEvidence}\n${recommendation.expectedTradeoff}\n\nScope: this writes a GLOBAL routing.stages.${recommendation.stage}.prefer entry for every task in trusted user config and creates a rollback record.`,
+    ))) return;
+
+    const configPath = join(homedir(), ".ai-orchestrator", "config.json");
+    const raw = readUserConfigObject(configPath);
+    const routing = objectChild(raw, "routing");
+    const stages = objectChild(routing, "stages");
+    const stage = objectChild(stages, recommendation.stage);
+    const previousPrefer = Array.isArray(stage.prefer) ? stage.prefer.filter((value): value is string => typeof value === "string") : [];
+    const identity = `${recommendation.recommendedChange.provider}/${recommendation.recommendedChange.model}`;
+    const appliedPrefer = [identity, ...previousPrefer.filter((value) => value !== identity)];
+    stage.prefer = appliedPrefer;
+    const previousVersion = typeof routing.version === "string" ? routing.version : undefined;
+    const id = `${Date.now()}-${randomUUID().slice(0, 8)}`;
+    routing.version = `recommendation-${id}`;
+    const recordPath = join(userStoreRoot, "recommendations", `${id}.json`);
+    const record = {
+      version: 1, id, status: "pending", appliedAt: new Date().toISOString(), stage: recommendation.stage,
+      identity, previousPrefer, appliedPrefer, previousVersion, appliedVersion: routing.version,
+    };
+    writeUserJson(recordPath, record);
+    writeUserJson(configPath, raw);
+    writeUserJson(recordPath, { ...record, status: "applied" });
+    notify(ctx, `Applied routing recommendation ${id}. Roll back with /lifecycle-routing-rollback ${id}.`, "info");
+  }
+
+  async function rollbackRoutingRecommendation(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const id = args.trim();
+    if (!/^\d+-[a-f0-9-]{8}$/i.test(id)) {
+      notify(ctx, "Usage: /lifecycle-routing-rollback <recommendation-id>", "error");
+      return;
+    }
+    const config = loadPiConfig(ctx.cwd);
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir);
+    const recordPath = join(userStoreRoot, "recommendations", `${id}.json`);
+    const record = readUserConfigObject(recordPath) as Record<string, unknown>;
+    const validStage = typeof record.stage === "string" && ["define", "plan", "build", "verify", "debug", "review", "ship", "fast-judge"].includes(record.stage);
+    const validPrevious = Array.isArray(record.previousPrefer) && record.previousPrefer.every((value) => typeof value === "string");
+    const validApplied = Array.isArray(record.appliedPrefer) && record.appliedPrefer.every((value) => typeof value === "string");
+    if ((record.status !== "applied" && record.status !== "pending") || !validStage || !validPrevious || !validApplied || typeof record.appliedVersion !== "string") {
+      notify(ctx, `Recommendation ${id} is unavailable or already rolled back.`, "error");
+      return;
+    }
+    const recordStage = record.stage as string;
+    if (!ctx.hasUI || !(await ctx.ui.confirm("Rollback routing recommendation?", `Restore the previous trusted user preference list for ${recordStage}?`))) return;
+    const configPath = join(homedir(), ".ai-orchestrator", "config.json");
+    const raw = readUserConfigObject(configPath);
+    const routing = objectChild(raw, "routing");
+    const stages = objectChild(routing, "stages");
+    const stage = objectChild(stages, recordStage);
+    if (JSON.stringify(stage.prefer ?? []) !== JSON.stringify(record.appliedPrefer) || routing.version !== record.appliedVersion) {
+      notify(ctx, "Current user preferences or policy version changed after application; refusing an unsafe automatic rollback.", "error");
+      return;
+    }
+    stage.prefer = record.previousPrefer;
+    if (typeof record.previousVersion === "string") routing.version = record.previousVersion;
+    else delete routing.version;
+    writeUserJson(configPath, raw);
+    writeUserJson(recordPath, { ...record, status: "rolled-back", rolledBackAt: new Date().toISOString() });
+    notify(ctx, `Rolled back routing recommendation ${id}.`, "info");
+  }
+
+  function readUserConfigObject(path: string): Record<string, unknown> {
+    if (!existsSync(path)) return {};
+    if (lstatSync(path).isSymbolicLink()) throw new Error(`Refusing symlinked user policy file: ${path}`);
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`User policy file must contain a JSON object: ${path}`);
+    return parsed as Record<string, unknown>;
+  }
+
+  function objectChild(parent: Record<string, unknown>, key: string): Record<string, unknown> {
+    const current = parent[key];
+    if (current && typeof current === "object" && !Array.isArray(current)) return current as Record<string, unknown>;
+    const created: Record<string, unknown> = {};
+    parent[key] = created;
+    return created;
+  }
+
+  function writeUserJson(path: string, value: Record<string, unknown>): void {
+    const directory = join(path, "..");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (lstatSync(directory).isSymbolicLink()) throw new Error(`Refusing symlinked user policy directory: ${directory}`);
+    if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw new Error(`Refusing symlinked user policy file: ${path}`);
+    const existingMode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600;
+    const secureMode = existingMode & 0o600 || 0o600;
+    const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode: secureMode });
+    renameSync(temporary, path);
+    chmodSync(path, secureMode);
+  }
+
   async function startPipeline(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before starting lifecycle.", "error");
       return;
@@ -354,18 +600,24 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
     const state = readState(created.paths);
     if (!state) throw new Error("new lifecycle state could not be read");
-    const baseline = await workingTreeStatus(ctx);
-    state.baselinePaths = baseline?.paths;
-    state.baselineStagedPaths = baseline?.stagedPaths;
-    state.originalModel = currentModelState(ctx);
-    writeState(created.paths, state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
+    runtime.state.originalModel = currentModelState(ctx);
+    writeState(created.paths, runtime.state);
+    const baseline = await workingTreeStatus(ctx);
+    if (!ownsRun(state.runId, "defining")) return;
+    runtime.state.baselinePaths = baseline?.paths;
+    runtime.state.baselineStagedPaths = baseline?.stagedPaths;
+    writeState(created.paths, runtime.state);
     appendJournal(created.paths, "Lifecycle pipeline started");
-    persistMirror(state);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
   async function startSpec(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before starting lifecycle.", "error");
       return;
@@ -387,18 +639,68 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
     const state = readState(created.paths);
     if (!state) throw new Error("new lifecycle state could not be read");
-    const baseline = await workingTreeStatus(ctx);
-    state.baselinePaths = baseline?.paths;
-    state.baselineStagedPaths = baseline?.stagedPaths;
-    state.originalModel = currentModelState(ctx);
-    writeState(created.paths, state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
+    runtime.state.originalModel = currentModelState(ctx);
+    writeState(created.paths, runtime.state);
+    const baseline = await workingTreeStatus(ctx);
+    if (!ownsRun(state.runId, "defining")) return;
+    runtime.state.baselinePaths = baseline?.paths;
+    runtime.state.baselineStagedPaths = baseline?.stagedPaths;
+    writeState(created.paths, runtime.state);
     appendJournal(created.paths, "Standalone DEFINE started");
-    persistMirror(state);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
+  async function migrateRoutingPolicy(ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "Pause or stop the active lifecycle turn before migrating its routing policy.", "warning");
+      return;
+    }
+    const loaded = loadCurrent(ctx.cwd);
+    if (!loaded || !isActivePhase(loaded.state.phase)) {
+      notify(ctx, "No active lifecycle run is available for routing migration.", "error");
+      return;
+    }
+    const leaseOwner = randomUUID();
+    try {
+      acquireRunLease(loaded.paths, leaseOwner);
+    } catch {
+      notify(ctx, "Lifecycle run is executing in another Pi process; routing migration was not applied.", "warning");
+      return;
+    }
+    try {
+      if (!ctx.hasUI || !(await ctx.ui.confirm(
+        "Migrate lifecycle routing policy?",
+        "This explicitly adopts the current trusted routing and role configuration for the unfinished phase. Completed routing evidence remains unchanged.",
+      ))) return;
+      if (!ownsRunLease(loaded.paths, leaseOwner)) return;
+      const resolved = loadPiResolvedConfig(ctx.cwd);
+      const nextVersion = piRoutingRunVersion(resolved.config, resolved.provenance);
+      const latest = readState(loaded.paths);
+      if (!latest || latest.runId !== loaded.state.runId || !isActivePhase(latest.phase)) {
+        notify(ctx, "Lifecycle state changed before routing migration; retry after inspecting the active run.", "warning");
+        return;
+      }
+      const entryKey = currentPhaseEntryKey(latest);
+      const saved = [...latest.modelSelections].reverse().find((selection) =>
+        selection.routing?.phaseEntryKey === entryKey && !selection.routing.failureCategories.includes("policy-migrated"));
+      if (saved?.routing) saved.routing.failureCategories.push("policy-migrated");
+      latest.routingPolicyVersion = nextVersion;
+      writeState(loaded.paths, latest);
+      appendJournal(loaded.paths, `Routing policy explicitly migrated for unfinished phase to ${nextVersion}`);
+      persistMirror(latest);
+      notify(ctx, "Lifecycle routing policy migrated. Use /lifecycle resume to continue.", "info");
+    } finally {
+      releaseRunLease(loaded.paths, leaseOwner);
+    }
+  }
+
   async function resumeRun(ctx: ExtensionCommandContext): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before resuming lifecycle.", "error");
       return;
@@ -408,23 +710,47 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, "No lifecycle run is available to resume.", "error");
       return;
     }
+    const resolved = loadPiResolvedConfig(ctx.cwd);
     if (!isActivePhase(loaded.state.phase)) {
-      notify(ctx, `Lifecycle run ${loaded.state.runId} is ${loaded.state.phase}; it cannot be resumed.`, "info");
+      if (loaded.state.modelRestored !== false) {
+        notify(ctx, `Lifecycle run ${loaded.state.runId} is ${loaded.state.phase}; it cannot be resumed.`, "info");
+        return;
+      }
+      runtime = makeRuntime(resolved.config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
+      restoreTools();
+      const restored = await restoreRuntimeModel(ctx);
+      if (restored) {
+        releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, loaded.state.runId);
+        notify(ctx, "Original lifecycle model restored; terminal run ownership released.", "info");
+      } else {
+        notify(ctx, "Original-model restoration is still pending. Fix model availability and run /lifecycle resume again.", "warning");
+      }
+      releaseRuntimeLease();
+      runtime = undefined;
+      deactivateVerdictTools();
+      clearUi(ctx);
       return;
     }
-    const resolved = loadPiResolvedConfig(ctx.cwd);
     const config = resolved.config;
-    if (!loaded.state.originalModel) {
-      loaded.state.originalModel = currentModelState(ctx);
-      writeState(loaded.paths, loaded.state);
-    }
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
-    appendJournal(loaded.paths, `Resumed at ${loaded.state.phase}`);
-    persistMirror(loaded.state);
+    if (!runtime.state.originalModel) {
+      runtime.state.originalModel = currentModelState(ctx);
+      writeState(runtime.paths, runtime.state);
+    }
+    appendJournal(runtime.paths, `Resumed at ${runtime.state.phase}`);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
-  async function startStandalone(stage: StandaloneStage, expected: LifecyclePhase, ctx: ExtensionCommandContext): Promise<void> {
+  async function startStandalone(
+    stage: StandaloneStage,
+    expected: LifecyclePhase | readonly LifecyclePhase[],
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    if (runtime) {
+      notify(ctx, "A lifecycle operation is already active or restoring its model in this Pi session.", "warning");
+      return;
+    }
     if (hasActiveFastPath(ctx)) {
       notify(ctx, "A /orchestrate fast-path run is active in this session. Stop it before running a lifecycle stage.", "error");
       return;
@@ -434,17 +760,20 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, `No lifecycle run exists. Start with /spec <idea> or /lifecycle <task>.`, "error");
       return;
     }
-    if (loaded.state.phase !== expected) {
+    const expectedPhases = Array.isArray(expected) ? expected : [expected];
+    if (!expectedPhases.includes(loaded.state.phase)) {
       notify(ctx, `Run ${loaded.state.runId} is at ${loaded.state.phase}; next command is ${nextCommand(loaded.state.phase)}.`, "error");
       return;
     }
     const resolved = loadPiResolvedConfig(ctx.cwd);
     const config = resolved.config;
-    if (!loaded.state.originalModel) loaded.state.originalModel = currentModelState(ctx);
-    writeState(loaded.paths, loaded.state);
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, false, stage, currentModelState(ctx));
-    appendJournal(loaded.paths, `Standalone ${stage.toUpperCase()} started`);
-    persistMirror(loaded.state);
+    if (!runtime.state.originalModel) {
+      runtime.state.originalModel = currentModelState(ctx);
+      writeState(runtime.paths, runtime.state);
+    }
+    appendJournal(runtime.paths, `Standalone ${stage.toUpperCase()} started`);
+    persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
 
@@ -458,23 +787,36 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     standalone: StandaloneStage | undefined,
     invocationOriginal: LifecycleState["originalModel"],
   ): Runtime {
+    const leaseOwner = randomUUID();
+    acquireRunLease(paths, leaseOwner);
+    const active = currentRun(cwd, config.lifecycle.artifactsDir);
+    const freshState = readState(paths);
+    if (active?.runId !== state.runId || active.paths.root !== paths.root || !freshState || freshState.runId !== state.runId) {
+      releaseRunLease(paths, leaseOwner);
+      throw new Error("Lifecycle state changed before execution lease acquisition; retry from the active run");
+    }
     return {
       config,
       provenance,
       cwd,
       paths,
-      state,
+      state: freshState,
       automatic,
       standalone,
       toolsBeforeRun: pi.getActiveTools().filter((name) => !VERDICT_TOOLS.has(name)),
       invocationOriginal,
       attemptedModels: [],
+      leaseOwner,
     };
   }
 
   async function runCurrentPhase(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
-    runtime.pendingVerdict = undefined;
+    assertRunPathsSafe(runtime.paths);
+    const persistedVerdict = runtime.state.pendingCheckerVerdict;
+    runtime.pendingVerdict = persistedVerdict?.phase === runtime.state.phase
+      ? { kind: persistedVerdict.kind, verdict: persistedVerdict.verdict, reasons: persistedVerdict.reasons, requiredFixes: persistedVerdict.requiredFixes }
+      : undefined;
     runtime.pendingDiagnosis = undefined;
     runtime.remindedPhase = undefined;
     switch (runtime.state.phase) {
@@ -487,30 +829,46 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       case "awaiting_spec_approval":
         await requestArtifactApproval(ctx, "spec");
         break;
-      case "planning":
+      case "planning": {
+        const spec = readRequired(runtime.paths.spec, "spec");
         if (!(await enterRoutedStage("plan", "planner", ctx))) return;
         activateArtifactTools();
         updateUi(ctx);
-        sendPrompt(taskPlanPrompt(readRequired(runtime.paths.spec, "spec"), rel(runtime.paths.plan), runtime.planRevisionFeedback ?? replanFeedback()));
+        sendPrompt(taskPlanPrompt(spec, rel(runtime.paths.plan), runtime.planRevisionFeedback ?? replanFeedback()));
         break;
+      }
       case "awaiting_plan_approval":
         await requestArtifactApproval(ctx, "plan");
         break;
       case "building":
         await enterBuild(ctx);
         break;
-      case "verifying":
+      case "verifying": {
+        if (runtime.pendingVerdict?.kind === "verify") {
+          await checkerStageEnded(ctx, "verify");
+          break;
+        }
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("verify", "verifier", ctx))) return;
         activateReadOnlyTools("verify_verdict");
         updateUi(ctx);
-        sendPrompt(verifyPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
+        sendPrompt(verifyPrompt(spec, plan, runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
         break;
-      case "reviewing":
+      }
+      case "reviewing": {
+        if (runtime.pendingVerdict?.kind === "review") {
+          await checkerStageEnded(ctx, "review");
+          break;
+        }
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("review", "reviewer", ctx))) return;
         activateReadOnlyTools("review_verdict");
         updateUi(ctx);
-        sendPrompt(reviewPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan")));
+        sendPrompt(reviewPrompt(spec, plan));
         break;
+      }
       case "debugging": {
         const rejectionIndex = latestRejectionIndex();
         if (runtime.state.debugDiagnosisVerdictIndex === rejectionIndex && isNonEmpty(runtime.paths.debug)) {
@@ -521,26 +879,36 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           else await continueOrPause(ctx, nextStandaloneForPhase(recoveredPhase));
           break;
         }
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         runtime.state.debugDiagnosisVerdictIndex = undefined;
         writeState(runtime.paths, runtime.state);
+        assertRunPathsSafe(runtime.paths);
         writeFileSync(runtime.paths.debug, "");
         if (!(await enterRoutedStage("debug", "debugger", ctx))) return;
         activateReadOnlyTools("debug_diagnosis");
         updateUi(ctx);
         sendPrompt(debugPrompt(
-          readRequired(runtime.paths.spec, "spec"),
-          readRequired(runtime.paths.plan, "plan"),
+          spec,
+          plan,
           latestRejection(),
           rel(runtime.paths.debug),
         ));
         break;
       }
-      case "shipping":
+      case "shipping": {
+        if (runtime.pendingVerdict?.kind === "ship") {
+          await checkerStageEnded(ctx, "ship");
+          break;
+        }
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("ship", "shipper", ctx))) return;
         activateReadOnlyTools("ship_decision");
         updateUi(ctx);
-        sendPrompt(shipPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.state.verdicts));
+        sendPrompt(shipPrompt(spec, plan, runtime.state.verdicts));
         break;
+      }
       case "awaiting_ship_approval":
         await requestShipApproval(ctx);
         break;
@@ -561,10 +929,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const breaker = convergenceBreakerReason(runtime.state, runtime.config);
+    if (breaker) {
+      await interruptRun(ctx, `Lifecycle BUILD paused by convergence circuit breaker: ${breaker}`);
+      return;
+    }
+    const plan = readRequired(runtime.paths.plan, "plan");
     restoreBuildTools();
     if (!(await enterModelStage("build", "coder", ctx))) return;
     updateUi(ctx);
-    sendPrompt(buildPrompt(readRequired(runtime.paths.plan, "plan"), buildFeedback(), runtime.config.build.commitPerTask));
+    sendPrompt(buildPrompt(plan, buildFeedback(), runtime.config.build.commitPerTask));
   }
 
   async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<boolean> {
@@ -573,14 +947,28 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function enterModelStage(stage: LifecycleRoutedStage | "build", role: RoleName, ctx: ExtensionContext): Promise<boolean> {
     if (!runtime) return false;
+    const runPolicyVersion = piRoutingRunVersion(runtime.config, runtime.provenance);
+    if (runtime.state.routingPolicyVersion && runtime.state.routingPolicyVersion !== runPolicyVersion) {
+      await interruptRun(ctx, `Lifecycle routing policy changed from ${runtime.state.routingPolicyVersion} to ${runPolicyVersion}. Restore the saved policy or explicitly migrate the run before resuming.`);
+      return false;
+    }
+    if (!runtime.state.routingPolicyVersion) {
+      runtime.state.routingPolicyVersion = runPolicyVersion;
+      writeState(runtime.paths, runtime.state);
+      appendJournal(runtime.paths, `Routing policy frozen for run: ${runPolicyVersion}`);
+    }
     const available = ctx.modelRegistry.getAvailable();
+    const expectedRunId = runtime.state.runId;
+    const expectedPhase = runtime.state.phase;
+    const evidence = await routingEvidence(ctx);
+    if (!ownsRun(expectedRunId, expectedPhase)) return false;
     const plan = createPiRoutingPlan({
       config: runtime.config,
       provenance: runtime.provenance,
       stage,
       role,
       available,
-      evidence: routingEvidence(),
+      evidence,
       priorSelections: runtime.state.modelSelections.map((selection) => ({
         stage: selection.stage,
         provider: selection.provider,
@@ -588,7 +976,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         ...(selection.family ? { family: selection.family } : {}),
       })),
     });
-    const saved = [...runtime.state.modelSelections].reverse().find((selection) => selection.stage === stage && selection.routing);
+    const phaseEntryKey = currentPhaseEntryKey(runtime.state);
+    const saved = [...runtime.state.modelSelections].reverse().find((selection) =>
+      selection.stage === stage && selection.routing?.phaseEntryKey === phaseEntryKey
+      && !selection.routing.failureCategories.some((category) => category === "provider-error" || category === "policy-migrated"));
     if (saved) {
       if (saved.routing!.policyVersion !== plan.policyVersion || saved.routing!.engine !== plan.engine) {
         await modelFailure(ctx, stage, [`saved decision ${saved.routing!.decisionId} uses a different routing policy`]);
@@ -596,10 +987,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       const eligible = plan.candidates.some((candidate) => candidate.provider === saved.provider && candidate.model === saved.model);
       const model = eligible ? ctx.modelRegistry.find(saved.provider, saved.model) : undefined;
+      const expectedRunId = runtime.state.runId;
+      const expectedPhase = runtime.state.phase;
       if (!model || !(await pi.setModel(model))) {
+        if (!ownsRun(expectedRunId, expectedPhase)) return false;
         await modelFailure(ctx, stage, [`saved selection ${saved.provider}/${saved.model} is unavailable or ineligible`]);
         return false;
       }
+      if (!ownsRun(expectedRunId, expectedPhase)) return false;
       pi.setThinkingLevel(saved.thinking);
       runtime.state.modelRestored = false;
       writeState(runtime.paths, runtime.state);
@@ -608,8 +1003,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
 
     runtime.attemptedModels = [];
+    const providerFailed = new Set(runtime.state.modelSelections
+      .filter((selection) => selection.stage === stage && selection.routing?.failureCategories.includes("provider-error"))
+      .map((selection) => `${selection.provider}/${selection.model}`));
     const attempts: { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[] = [];
     for (const candidate of plan.candidates) {
+      if (providerFailed.has(`${candidate.provider}/${candidate.model}`)) continue;
       const label = `${candidate.provider}/${candidate.model}`;
       if (breakerBlocksCandidate(stage, candidate, attempts)) {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
@@ -628,11 +1027,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       const expectedRunId = runtime.state.runId;
       const expectedPhase = runtime.state.phase;
-      if (!(await pi.setModel(model))) {
+      const activated = await pi.setModel(model);
+      if (!runtime || !ownsRun(expectedRunId, expectedPhase)) return false;
+      if (!activated) {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
         continue;
       }
-      if (!runtime || runtime.state.runId !== expectedRunId || runtime.state.phase !== expectedPhase) return false;
       attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "selected" });
       pi.setThinkingLevel(candidate.thinking);
       recordModelSelection(stage, candidate, plan, attempts);
@@ -657,6 +1057,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const fallbackCount = attempts.filter((attempt) => attempt.outcome !== "selected").length;
     const reason = `${candidate.reason}${fallbackCount > 0 ? `; fallback count ${fallbackCount}` : ""}`;
     runtime.state.modelRestored = false;
+    runtime.lastUsage = undefined;
     runtime.state.modelSelections.push({
       stage,
       provider: candidate.provider,
@@ -669,7 +1070,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         decisionId,
         engine: plan.engine,
         policyVersion: plan.policyVersion,
+        ...(candidate.profileVersion ? { profileVersion: candidate.profileVersion } : {}),
         taskFeaturesHash: plan.taskFeaturesHash,
+        phaseEntryKey: currentPhaseEntryKey(runtime.state),
         selectedRank: candidate.rank,
         ...(candidate.score === undefined ? {} : { score: candidate.score }),
         separation,
@@ -716,11 +1119,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       estimate,
       budgets: runtime.config.routing.budgets,
       snapshot: routingBudgetSnapshot(),
-      unattended: runtime.automatic || !ctx.hasUI,
+      unattended: !ctx.hasUI,
     });
     if (decision.allowed === true) return true;
     if (decision.allowed === "ask") {
+      const expectedRunId = runtime.state.runId;
+      const expectedPhase = runtime.state.phase;
       const confirmed = ctx.hasUI && await ctx.ui.confirm("Routing budget warning", `${decision.reason}\n\nContinue with ${candidate.provider}/${candidate.model}?`);
+      if (!ownsRun(expectedRunId, expectedPhase)) return false;
       if (confirmed) return true;
     }
     await interruptRun(ctx, `Lifecycle ${stage} paused by routing budget: ${decision.reason}`);
@@ -746,24 +1152,22 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) {
       return { estimatedRunUsd: 0, observedRunUsd: 0, estimatedDayUsd: 0, observedDayUsd: 0, paidFallbacks: 0, attemptsByStage: {} };
     }
-    const events = readRoutingEvidenceEvents(runtime.paths.evidence).events;
+    const userRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    const ledger = readRoutingBudgetLedger(join(userRoot, "budget.jsonl"));
+    const runEvents = ledger.filter((event) => event.runId === runtime!.state.runId);
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyEvents = ledger.filter((event) => event.recordedAt.startsWith(today));
     const snapshot: RoutingBudgetSnapshot = {
       estimatedRunUsd: 0,
       observedRunUsd: 0,
-      estimatedDayUsd: 0,
-      observedDayUsd: 0,
+      estimatedDayUsd: dailyEvents.reduce((sum, event) => sum + (event.outcome === "stage-started" ? event.estimatedUsd ?? 0 : 0), 0),
+      observedDayUsd: dailyEvents.reduce((sum, event) => sum + (event.outcome === "stage-ended" ? event.observedUsd ?? 0 : 0), 0),
       paidFallbacks: runtime.state.modelSelections.reduce((sum, selection) => sum + (selection.routing?.fallbackCount ?? 0), 0),
       attemptsByStage: {},
     };
-    for (const event of events) {
-      if (typeof event.cost.estimatedUsd === "number") {
-        snapshot.estimatedRunUsd += event.cost.estimatedUsd;
-        snapshot.estimatedDayUsd += event.cost.estimatedUsd;
-      }
-      if (typeof event.cost.observedUsd === "number") {
-        snapshot.observedRunUsd += event.cost.observedUsd;
-        snapshot.observedDayUsd += event.cost.observedUsd;
-      }
+    for (const event of runEvents) {
+      if (event.outcome === "stage-started") snapshot.estimatedRunUsd += event.estimatedUsd ?? 0;
+      if (event.outcome === "stage-ended") snapshot.observedRunUsd += event.observedUsd ?? 0;
     }
     for (const selection of runtime.state.modelSelections) {
       snapshot.attemptsByStage[selection.stage] = (snapshot.attemptsByStage[selection.stage] ?? 0) + 1;
@@ -777,9 +1181,20 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     plan: PiRoutingPlan,
     decisionId: string,
   ): void {
-    if (!runtime || !runtime.config.routing.evidence.enabled) return;
+    if (!runtime) return;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    appendRoutingBudgetLedgerEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${decisionId}:budget:stage-started`,
+      runId: runtime.state.runId,
+      recordedAt: new Date().toISOString(),
+      outcome: "stage-started",
+      ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedUsd: candidate.estimatedCostUsd }),
+    });
+    if (!runtime.config.routing.evidence.enabled) return;
     appendRoutingEvidenceEvent({
       runPaths: runtime.paths,
+      userStoreRoot,
       event: {
         version: 1,
         eventId: `${decisionId}:stage-started`,
@@ -788,7 +1203,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         stage,
         recordedAt: new Date().toISOString(),
         policyVersion: plan.policyVersion,
-        profileVersion: plan.policyVersion,
+        profileVersion: candidate.profileVersion ?? "legacy-role",
         task: {
           workKind: plan.taskFeatures.workKind,
           risk: plan.taskFeatures.risk,
@@ -800,6 +1215,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           model: candidate.model,
           ...(candidate.family ? { family: candidate.family } : {}),
         },
+        durationMs: "unknown",
+        fallbackCount: runtime.state.modelSelections.at(-1)?.routing?.fallbackCount ?? 0,
         usage: {
           inputTokens: "unknown",
           outputTokens: "unknown",
@@ -820,19 +1237,212 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     });
   }
 
+  function persistRoutingStageOutcome(
+    stage: LifecycleRoutedStage | "build",
+    outcome: { type?: "stage-ended" | "final-status"; structuredToolCompliance: boolean | "unknown"; verdict: "approve" | "reject" | "unknown"; finalRunStatus?: "done" | "failed" | "cancelled" },
+  ): void {
+    if (!runtime) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing) return;
+    const usage = outcome.type === "final-status" ? undefined : runtime.lastUsage;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    if (outcome.type !== "final-status") {
+      appendRoutingBudgetLedgerEvent(userStoreRoot, {
+        version: 1,
+        eventId: `${selection.routing.decisionId}:budget:stage-ended:${runtime.state.buildIterations}:${runtime.state.verdicts.length}`,
+        runId: runtime.state.runId,
+        recordedAt: new Date().toISOString(),
+        outcome: "stage-ended",
+        ...(usage ? { observedUsd: usage.observedUsd } : {}),
+      });
+    }
+    if (!runtime.config.routing.evidence.enabled) {
+      if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+      return;
+    }
+    const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
+      event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      userStoreRoot,
+      event: {
+        version: 1,
+        eventId: `${selection.routing.decisionId}:${outcome.type ?? "stage-ended"}:${runtime.state.buildIterations}:${runtime.state.verdicts.length}`,
+        runId: runtime.state.runId,
+        decisionId: selection.routing.decisionId,
+        stage,
+        recordedAt: new Date().toISOString(),
+        policyVersion: selection.routing.policyVersion,
+        profileVersion: selection.routing.profileVersion ?? "legacy-role",
+        task: started?.task ?? { workKind: "unknown", risk: "medium", languages: [], fileCount: 0 },
+        selected: {
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.family ? { family: selection.family } : {}),
+        },
+        durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+        fallbackCount: selection.routing.fallbackCount,
+        ...(outcome.verdict === "reject" ? { rejectionCategory: `${stage}-reject` } : {}),
+        usage: {
+          inputTokens: usage?.inputTokens ?? "unknown",
+          outputTokens: usage?.outputTokens ?? "unknown",
+          cacheReadTokens: usage?.cacheReadTokens ?? "unknown",
+          cacheWriteTokens: usage?.cacheWriteTokens ?? "unknown",
+        },
+        cost: {
+          estimatedUsd: started?.cost.estimatedUsd ?? "unknown",
+          observedUsd: usage?.observedUsd ?? "unknown",
+        },
+        outcome: {
+          type: outcome.type ?? "stage-ended",
+          structuredToolCompliance: outcome.structuredToolCompliance,
+          verdict: outcome.verdict,
+          buildIteration: runtime.state.buildIterations,
+          ...(outcome.finalRunStatus ? { finalRunStatus: outcome.finalRunStatus } : {}),
+        },
+      },
+    });
+    if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+  }
+
+  async function recordBuildEvidenceFingerprint(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    const active = runtime;
+    const runId = active.state.runId;
+    const [diff, untracked] = await Promise.all([
+      pi.exec("git", ["diff", "--no-ext-diff", "--binary", "HEAD"], { timeout: 20_000, signal: ctx.signal }),
+      pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    if (runtime !== active || !ownsRun(runId, "building")) return;
+    const evidence = `${diff.code}:${diff.stdout}\n${diff.stderr}\n${untracked.code}:${untracked.stdout}\n${untracked.stderr}`;
+    active.state.buildEvidenceFingerprints.push(convergenceFingerprint(evidence));
+    writeState(active.paths, active.state);
+    appendJournal(active.paths, `BUILD convergence fingerprint recorded for pass ${active.state.buildIterations + 1}`);
+  }
+
+  function convergenceBreakerReason(state: LifecycleState, config: OrchestratorConfig): string | undefined {
+    const repeatedRejections = trailingEqualCount(state.rejectionFingerprints);
+    if (repeatedRejections >= config.routing.circuitBreakers.repeatedRejectionFingerprintLimit) {
+      return `${repeatedRejections} identical checker rejections reached the configured limit; inspect debug.md and re-plan with new evidence.`;
+    }
+    const unchangedBuilds = Math.max(0, trailingEqualCount(state.buildEvidenceFingerprints) - 1);
+    if (unchangedBuilds >= config.routing.circuitBreakers.maxBuildPassesWithoutImprovement) {
+      return `${unchangedBuilds} consecutive BUILD passes produced unchanged evidence; inspect the diff and re-plan before spending another pass.`;
+    }
+    return undefined;
+  }
+
+  function trailingEqualCount(values: readonly string[]): number {
+    const latest = values.at(-1);
+    if (!latest) return 0;
+    let count = 0;
+    for (let index = values.length - 1; index >= 0 && values[index] === latest; index -= 1) count += 1;
+    return count;
+  }
+
+  function convergenceFingerprint(value: string): string {
+    return createHash("sha256").update(value.trim().replace(/\s+/g, " ").toLowerCase()).digest("hex").slice(0, 16);
+  }
+
+  function persistHumanOverride(stage: "define" | "plan"): void {
+    if (!runtime?.config.routing.evidence.enabled) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing) return;
+    const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
+      event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
+    if (!started) return;
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
+      event: {
+        ...started,
+        eventId: `${selection.routing.decisionId}:human-override:${runtime.state.verdicts.length}`,
+        recordedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+        rejectionCategory: "human-override",
+        usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+        cost: { estimatedUsd: started.cost.estimatedUsd, observedUsd: "unknown" },
+        outcome: { type: "human-override", humanOverride: true, verdict: "reject", buildIteration: runtime.state.buildIterations },
+      },
+    });
+  }
+
+  function persistDownstreamReversal(stage: "verify" | "review", reason: string): void {
+    if (!runtime?.config.routing.evidence.enabled) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing) return;
+    const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
+      event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
+    if (!started) return;
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
+      event: {
+        ...started,
+        eventId: `${selection.routing.decisionId}:downstream-reversal:${runtime.state.verdicts.length}`,
+        recordedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+        rejectionCategory: "downstream-reversal",
+        usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+        cost: { estimatedUsd: started.cost.estimatedUsd, observedUsd: "unknown" },
+        outcome: {
+          type: "stage-ended",
+          structuredToolCompliance: true,
+          verdict: "reject",
+          laterReversal: true,
+          buildIteration: runtime.state.buildIterations,
+        },
+      },
+    });
+    appendJournal(runtime.paths, `${stage.toUpperCase()} downstream outcome reversed: ${truncate(reason, 120)}`);
+  }
+
+  function isBlockedBuildCommand(command: string, artifactsDir: string, artifactsRoot: string): boolean {
+    const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
+    return PUBLICATION_COMMAND.test(normalized) || DESTRUCTIVE_GIT_COMMAND.test(normalized) ||
+      normalized.includes(artifactsDir) || normalized.includes(artifactsRoot) || normalized.includes(".ai-orchestrator") ||
+      /\brm\b[\s\S]*?(?:\s\.\/?(?:\s|$)|\s\*|\/\*)/i.test(normalized) ||
+      /\bfind\b[\s\S]*?\s-delete\b/i.test(normalized);
+  }
+
+  function currentPhaseEntryKey(state: LifecycleState): string {
+    return `${state.phase}:${state.buildIterations}:${state.verdicts.length}:${state.debugDiagnosisVerdictIndex ?? "none"}`;
+  }
+
+  function routingStageForPhase(phase: LifecyclePhase): LifecycleRoutedStage | "build" | undefined {
+    return ({
+      defining: "define",
+      planning: "plan",
+      building: "build",
+      verifying: "verify",
+      reviewing: "review",
+      debugging: "debug",
+      shipping: "ship",
+    } as Partial<Record<LifecyclePhase, LifecycleRoutedStage | "build">>)[phase];
+  }
+
   function isCheckerRoutingStage(stage: LifecycleRoutedStage | "build"): boolean {
     return stage === "verify" || stage === "debug" || stage === "review" || stage === "ship";
   }
 
-  function routingEvidence() {
+  async function routingEvidence(ctx: ExtensionContext) {
     if (!runtime) return {};
+    const status = await workingTreeStatus(ctx);
+    const changedPaths = status?.paths ?? runtime.state.baselinePaths ?? [];
     return {
       task: runtime.state.task,
-      spec: existsSync(runtime.paths.spec) ? readFileSync(runtime.paths.spec, "utf8") : undefined,
-      plan: existsSync(runtime.paths.plan) ? readFileSync(runtime.paths.plan, "utf8") : undefined,
-      changedPaths: runtime.state.baselinePaths,
+      spec: existsSync(runtime.paths.spec) ? readFileSync(runtime.paths.spec, "utf8").slice(0, 256_000) : undefined,
+      plan: existsSync(runtime.paths.plan) ? readFileSync(runtime.paths.plan, "utf8").slice(0, 256_000) : undefined,
+      changedPaths,
+      languages: [...new Set(changedPaths.map(languageForPath).filter((value): value is string => Boolean(value)))],
+      testCommand: detectTestCommand(runtime.cwd),
       verdictCategory: runtime.state.verdicts.at(-1)?.reasons,
     };
+  }
+
+  function languageForPath(path: string): string | undefined {
+    const extension = path.split(".").at(-1)?.toLowerCase();
+    return ({ ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", py: "python", rb: "ruby", rs: "rust", go: "go", swift: "swift", kt: "kotlin", java: "java", cs: "csharp" } as Record<string, string>)[extension ?? ""];
   }
 
   async function artifactStageEnded(ctx: ExtensionContext, artifact: "spec" | "plan"): Promise<void> {
@@ -848,6 +1458,19 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
 
+    persistRoutingStageOutcome(artifact === "spec" ? "define" : "plan", {
+      structuredToolCompliance: true,
+      verdict: "unknown",
+    });
+    if (artifact === "plan") {
+      const nextPlanFingerprint = convergenceFingerprint(readFileSync(path, "utf8"));
+      if (runtime.state.planFingerprint && runtime.state.planFingerprint !== nextPlanFingerprint) {
+        runtime.state.rejectionFingerprints = [];
+        runtime.state.buildEvidenceFingerprints = [];
+      }
+      runtime.state.planFingerprint = nextPlanFingerprint;
+      writeState(runtime.paths, runtime.state);
+    }
     await transition(
       artifact === "spec"
         ? { type: "spec_produced", specPath: rel(path) }
@@ -886,6 +1509,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       if (artifact === "spec") runtime.specRevisionFeedback = feedback.trim();
       else runtime.planRevisionFeedback = feedback.trim();
+      persistHumanOverride(artifact === "spec" ? "define" : "plan");
       await transition({ type: artifact === "spec" ? "spec_rejected_by_user" : "plan_rejected_by_user" }, `${artifact.toUpperCase()} revision requested`, ctx);
       await runCurrentPhase(ctx);
       return;
@@ -895,6 +1519,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function checkerStageEnded(ctx: ExtensionContext, stage: "verify" | "review" | "ship"): Promise<void> {
     if (!runtime) return;
+    const structuredToolCompliance = Boolean(runtime.pendingVerdict && runtime.pendingVerdict.kind === stage);
     if (!runtime.pendingVerdict || runtime.pendingVerdict.kind !== stage) {
       if (runtime.remindedPhase !== runtime.state.phase) {
         runtime.remindedPhase = runtime.state.phase;
@@ -912,6 +1537,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const verdict = runtime.pendingVerdict;
     if (!verdict) throw new Error(`${stage} verdict was not available after recovery`);
     runtime.pendingVerdict = undefined;
+    if (verdict.verdict === "reject") {
+      runtime.state.rejectionFingerprints.push(convergenceFingerprint(`${verdict.reasons}\n${verdict.requiredFixes ?? ""}`));
+      writeState(runtime.paths, runtime.state);
+    }
+    persistRoutingStageOutcome(stage, { structuredToolCompliance, verdict: verdict.verdict });
+    if (verdict.verdict === "reject" && stage === "review") persistDownstreamReversal("verify", verdict.reasons);
+    if (verdict.verdict === "reject" && stage === "ship") {
+      persistDownstreamReversal("review", verdict.reasons);
+      persistDownstreamReversal("verify", verdict.reasons);
+    }
     await transition({
       type: "verdict",
       stage,
@@ -921,6 +1556,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }, `${stage.toUpperCase()} ${verdict.verdict}: ${truncate(verdict.reasons, 160)}`, ctx);
 
     if (!runtime) return;
+    runtime.state.pendingCheckerVerdict = undefined;
+    writeState(runtime.paths, runtime.state);
     if (runtime.state.phase === "awaiting_ship_approval") {
       await requestShipApproval(ctx);
     } else if (runtime.state.phase === "finalizing") {
@@ -934,6 +1571,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function debugStageEnded(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const structuredToolCompliance = Boolean(runtime.pendingDiagnosis && isNonEmpty(runtime.paths.debug));
     if (!runtime.pendingDiagnosis || !isNonEmpty(runtime.paths.debug)) {
       if (runtime.remindedPhase !== "debugging") {
         runtime.remindedPhase = "debugging";
@@ -952,10 +1590,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       runtime.pendingDiagnosis = synthesized;
       runtime.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
       writeState(runtime.paths, runtime.state);
+      assertRunPathsSafe(runtime.paths);
       writeFileSync(runtime.paths.debug, formatDiagnosis(synthesized));
       appendJournal(runtime.paths, "Synthesized DEBUG diagnosis after missing structured output");
     }
     runtime.pendingDiagnosis = undefined;
+    persistRoutingStageOutcome("debug", { structuredToolCompliance, verdict: "unknown" });
     await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "DEBUG diagnosis produced", ctx);
     if (!runtime) return;
     if (runtime.state.phase === "failed") await finishRun(ctx);
@@ -1005,12 +1645,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const runId = runtime.state.runId;
     if (runtime.state.finalization?.commitSha) return "committed";
     if (runtime.config.ship.commit === "never") return "skipped";
-    let shouldCommit = runtime.config.ship.commit === "auto";
-    if (runtime.config.ship.commit === "ask") {
-      shouldCommit = ctx.hasUI && await ctx.ui.confirm("Commit changes", "Commit the lifecycle changes now?");
-      if (!ownsRun(runId, "finalizing")) return "failed";
+    const checkpointed = Boolean(runtime.state.finalization?.commitBaseSha && runtime.state.finalization.commitMessage);
+    if (checkpointed) {
+      const recovered = await reconcilePendingCommit(ctx);
+      if (recovered !== "pending") return recovered;
     }
-    if (!shouldCommit) return "skipped";
     if (!runtime.state.baselinePaths || !runtime.state.baselineStagedPaths) {
       notify(ctx, "Cannot safely attribute files for this older run; commit skipped.", "error");
       return "failed";
@@ -1027,24 +1666,59 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, `Could not collect lifecycle changes: ${errorMessage(error)}`, "error");
       return "failed";
     }
+    if (!ownsRun(runId, "finalizing")) return "failed";
     if (files.length === 0) {
       notify(ctx, "No lifecycle-attributable source files were available to commit.", "info");
       return "skipped";
     }
+    const shouldCommit = ctx.hasUI && await ctx.ui.confirm(
+      "Commit lifecycle changes",
+      `${runtime.config.ship.commit === "auto" ? "Commit policy is auto, but explicit confirmation is still required.\n\n" : ""}Files:\n${files.map((file) => `- ${file}`).join("\n")}\n\nCommit now?`,
+    );
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!shouldCommit) return "skipped";
+    const revalidated = await changedFiles(ctx);
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!sameStringSet(files, revalidated)) {
+      notify(ctx, "Working-tree manifest changed after confirmation; commit was not attempted.", "error");
+      return "failed";
+    }
+    if (!checkpointed) {
+      const base = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+      if (!ownsRun(runId, "finalizing")) return "failed";
+      if (base.code !== 0 || !base.stdout.trim()) {
+        notify(ctx, `Could not checkpoint pre-commit HEAD: ${base.stderr || base.stdout}`, "error");
+        return "failed";
+      }
+      const message = `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
+      runtime.state.finalization = { ...runtime.state.finalization, commitBaseSha: base.stdout.trim(), commitMessage: message };
+      writeState(runtime.paths, runtime.state);
+      appendJournal(runtime.paths, `Commit intent checkpointed at ${base.stdout.trim()} for: ${files.join(", ")}`);
+      persistMirror(runtime.state);
+    }
     for (const file of files) {
       const result = await pi.exec("git", ["add", "--", file], { timeout: 10_000, signal: ctx.signal });
+      if (!ownsRun(runId, "finalizing")) return "failed";
       if (result.code !== 0) {
         notify(ctx, `git add failed for ${file}: ${result.stderr || result.stdout}`, "error");
         return "failed";
       }
     }
-    const message = `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
+    const staged = await workingTreeStatus(ctx);
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (!staged || !sameStringSet(files, staged.stagedPaths)) {
+      notify(ctx, "Refusing to commit because the staged index does not exactly match the confirmed lifecycle manifest.", "error");
+      return "failed";
+    }
+    const message = runtime.state.finalization?.commitMessage ?? `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
     const commit = await pi.exec("git", ["commit", "-m", message], { timeout: 30_000, signal: ctx.signal });
+    if (!ownsRun(runId, "finalizing")) return "failed";
     if (commit.code !== 0) {
       notify(ctx, `git commit failed: ${commit.stderr || commit.stdout}`, "error");
       return "failed";
     }
     const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    if (!ownsRun(runId, "finalizing")) return "failed";
     if (head.code !== 0 || !head.stdout.trim()) {
       notify(ctx, `Commit created but its SHA could not be recorded: ${head.stderr || head.stdout}`, "error");
       return "failed";
@@ -1056,15 +1730,74 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     return "committed";
   }
 
+  async function reconcilePendingCommit(ctx: ExtensionContext): Promise<"committed" | "pending" | "failed"> {
+    if (!runtime?.state.finalization?.commitBaseSha || !runtime.state.finalization.commitMessage) return "pending";
+    const runId = runtime.state.runId;
+    const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (head.code !== 0 || !head.stdout.trim()) return "failed";
+    const currentHead = head.stdout.trim();
+    if (currentHead === runtime.state.finalization.commitBaseSha) return "pending";
+    const [parent, subject] = await Promise.all([
+      pi.exec("git", ["rev-parse", "HEAD^"], { timeout: 10_000, signal: ctx.signal }),
+      pi.exec("git", ["log", "-1", "--format=%s"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (parent.code !== 0 || subject.code !== 0 ||
+      parent.stdout.trim() !== runtime.state.finalization.commitBaseSha ||
+      subject.stdout.trim() !== runtime.state.finalization.commitMessage) {
+      notify(ctx, "HEAD changed after the saved commit checkpoint but does not match the lifecycle commit; explicit recovery is required.", "error");
+      return "failed";
+    }
+    runtime.state.finalization = { ...runtime.state.finalization, commitSha: currentHead };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Recovered committed SHA ${currentHead} from saved finalization intent`);
+    persistMirror(runtime.state);
+    return "committed";
+  }
+
+  function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+    if (left.length !== right.length) return false;
+    const sortedRight = [...right].sort();
+    return [...left].sort().every((value, index) => value === sortedRight[index]);
+  }
+
   async function maybeOpenPr(ctx: ExtensionContext): Promise<"opened" | "skipped" | "failed"> {
     if (!runtime) return "failed";
     const runId = runtime.state.runId;
     if (runtime.state.finalization?.prUrl) return "opened";
     if (runtime.config.ship.openPr === "never") return "skipped";
+    const checkpointedHead = runtime.state.finalization?.prHead;
+    if (checkpointedHead) {
+      const existing = await pi.exec("gh", ["pr", "view", checkpointedHead, "--json", "url", "--jq", ".url"], { timeout: 30_000, signal: ctx.signal });
+      if (!ownsRun(runId, "finalizing")) return "failed";
+      if (existing.code === 0 && existing.stdout.trim()) {
+        runtime.state.finalization = { ...runtime.state.finalization, prUrl: existing.stdout.trim() };
+        writeState(runtime.paths, runtime.state);
+        appendJournal(runtime.paths, `Recovered pull request: ${existing.stdout.trim()}`);
+        persistMirror(runtime.state);
+        return "opened";
+      }
+    }
     const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
     if (!ownsRun(runId, "finalizing")) return "failed";
     if (!confirmed) return "skipped";
-    const result = await pi.exec("gh", ["pr", "create", "--fill"], { timeout: 60_000, signal: ctx.signal });
+    const branch = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    const localHead = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+    const upstreamHead = await pi.exec("git", ["rev-parse", "@{upstream}"], { timeout: 10_000, signal: ctx.signal });
+    if (!ownsRun(runId, "finalizing")) return "failed";
+    if (branch.code !== 0 || !branch.stdout.trim() || branch.stdout.trim() === "HEAD" ||
+      (checkpointedHead !== undefined && branch.stdout.trim() !== checkpointedHead) ||
+      localHead.code !== 0 || upstreamHead.code !== 0 || localHead.stdout.trim() !== upstreamHead.stdout.trim()) {
+      notify(ctx, "Refusing to open a PR until the current branch is explicitly pushed and its upstream matches HEAD.", "error");
+      return "failed";
+    }
+    runtime.state.finalization = { ...runtime.state.finalization, prHead: branch.stdout.trim() };
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Pull-request intent checkpointed for ${branch.stdout.trim()}`);
+    persistMirror(runtime.state);
+    const result = await pi.exec("gh", ["pr", "create", "--fill", "--head", branch.stdout.trim()], { timeout: 60_000, signal: ctx.signal });
+    if (!ownsRun(runId, "finalizing")) return "failed";
     if (result.code !== 0) {
       notify(ctx, `gh pr create failed: ${result.stderr || result.stdout}`, "error");
       return "failed";
@@ -1110,10 +1843,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const state = runtime.state;
     restoreTools();
-    await restoreRuntimeModel(ctx);
+    const restored = await restoreRuntimeModel(ctx);
     clearUi(ctx);
-    notify(ctx, message, "info");
+    notify(ctx, restored ? message : `${message} Original-model restoration is still pending; use /lifecycle resume to retry.`, restored ? "info" : "warning");
     persistMirror(state);
+    releaseRuntimeLease();
     runtime = undefined;
     deactivateVerdictTools();
   }
@@ -1122,12 +1856,27 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const finished = runtime.state;
     const summary = finalSummary(finished, runtime.paths);
+    const lastStage = finished.modelSelections.at(-1)?.stage;
+    if (lastStage) {
+      persistRoutingStageOutcome(lastStage, {
+        type: "final-status",
+        structuredToolCompliance: true,
+        verdict: finished.verdicts.at(-1)?.verdict ?? "unknown",
+        finalRunStatus: finished.phase === "failed" ? "failed" : "done",
+      });
+    }
     restoreTools();
-    await restoreRuntimeModel(ctx);
-    releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
+    const restored = await restoreRuntimeModel(ctx);
+    if (restored) {
+      releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
+    } else {
+      appendJournal(runtime.paths, "Run finished but original-model restoration is pending; current ownership retained");
+    }
     clearUi(ctx);
     pi.sendMessage({ customType: ENTRY_TYPE, content: summary, display: true, details: finished }, { triggerTurn: false });
     persistMirror(finished);
+    if (!restored) notify(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /lifecycle resume.", "warning");
+    releaseRuntimeLease();
     runtime = undefined;
     deactivateVerdictTools();
   }
@@ -1138,7 +1887,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     try {
       if (!runtime) {
         const loaded = loadCurrent(ctx.cwd);
-        if (!loaded || !isActivePhase(loaded.state.phase)) {
+        if (!loaded || (!isActivePhase(loaded.state.phase) && loaded.state.modelRestored !== false)) {
           notify(ctx, "No active lifecycle run.", "info");
           return;
         }
@@ -1149,10 +1898,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       if (!ctx.isIdle()) ctx.abort();
       await transition({ type: "cancelled" }, "Lifecycle cancelled", ctx);
       restoreTools();
-      await restoreRuntimeModel(ctx);
-      releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
+      const restored = await restoreRuntimeModel(ctx);
+      if (restored) {
+        releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
+      } else {
+        appendJournal(runtime.paths, "Lifecycle cancelled but original-model restoration is pending; current ownership retained");
+      }
       clearUi(ctx);
       pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: stopped }, { triggerTurn: false });
+      if (!restored) notify(ctx, "Original-model restoration is pending. Fix model availability and run /lifecycle-stop again.", "warning");
+      releaseRuntimeLease();
       runtime = undefined;
       deactivateVerdictTools();
     } finally {
@@ -1170,13 +1925,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     appendJournal(runtime.paths, message);
     persistMirror(state);
     pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: state }, { triggerTurn: false });
+    releaseRuntimeLease();
     runtime = undefined;
     deactivateVerdictTools();
   }
 
   async function transition(event: LifecycleEvent, journal: string, ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const runId = runtime.state.runId;
     const before = runtime.state.phase;
+    if (!ownsRun(runId, before)) throw new Error(`Lifecycle ownership changed before ${before} transition`);
     const next = nextStage(runtime.state, event, loopConfigFrom(runtime.config));
     if (next.phase === before && JSON.stringify(next) === JSON.stringify(runtime.state)) return;
     runtime.state = next;
@@ -1199,7 +1957,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function restoreBuildTools(): void {
     if (!runtime) return;
-    pi.setActiveTools(runtime.toolsBeforeRun);
+    pi.setActiveTools(runtime.toolsBeforeRun.filter((tool) => BUILD_TOOL_ALLOWLIST.has(tool)));
   }
 
   function restoreTools(): void {
@@ -1223,7 +1981,25 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime || runtime.state.runId !== runId || (phase && runtime.state.phase !== phase)) return false;
     const active = currentRun(runtime.cwd, runtime.config.lifecycle.artifactsDir);
     const disk = active && readState(active.paths);
-    return active?.runId === runId && disk?.runId === runId && (!phase || disk.phase === phase);
+    return active?.runId === runId && disk?.runId === runId && ownsRunLease(runtime.paths, runtime.leaseOwner) && (!phase || disk.phase === phase);
+  }
+
+  function releaseRuntimeLease(): void {
+    if (runtime) releaseRunLease(runtime.paths, runtime.leaseOwner);
+  }
+
+  function recordProviderFailure(): void {
+    if (!runtime) return;
+    const stage = routingStageForPhase(runtime.state.phase);
+    if (!stage) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing || selection.routing.failureCategories.includes("provider-error")) return;
+    persistRoutingStageOutcome(stage, { structuredToolCompliance: false, verdict: "unknown" });
+    selection.routing.failureCategories.push("provider-error");
+    selection.routing.fallbackCount += 1;
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Model ${stage}: ${selection.provider}/${selection.model} failed during provider execution; fallback required`);
+    persistMirror(runtime.state);
   }
 
   function latestRejectionIndex(): number {
@@ -1297,35 +2073,40 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       : undefined;
   }
 
-  async function restoreRuntimeModel(ctx: ExtensionContext): Promise<void> {
-    if (!runtime) return;
+  async function restoreRuntimeModel(ctx: ExtensionContext): Promise<boolean> {
+    if (!runtime) return true;
     const originalModel = runtime.automatic ? runtime.state.originalModel : runtime.invocationOriginal;
-    await restoreOriginalModel(ctx, runtime.state, originalModel);
+    return restoreOriginalModel(ctx, runtime.state, originalModel);
   }
 
   async function restoreOriginalModel(
     ctx: ExtensionContext,
     state: LifecycleState,
     originalModel: LifecycleState["originalModel"] = state.originalModel,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const original = originalModel;
     if (!original) {
       state.modelRestored = true;
       persistRestoredState(state);
-      return;
+      return true;
     }
     const model = ctx.modelRegistry.find(original.provider, original.id);
     if (!model) {
+      state.modelRestored = false;
+      persistRestoredState(state);
       notify(ctx, `Could not restore original model ${original.provider}/${original.id}: model not found.`, "warning");
-      return;
+      return false;
     }
     if (!(await pi.setModel(model))) {
+      state.modelRestored = false;
+      persistRestoredState(state);
       notify(ctx, `Could not restore original model ${original.provider}/${original.id}: authentication unavailable.`, "warning");
-      return;
+      return false;
     }
     pi.setThinkingLevel(original.thinking);
     state.modelRestored = true;
     persistRestoredState(state);
+    return true;
   }
 
   function persistRestoredState(state: LifecycleState): void {

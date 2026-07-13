@@ -68,6 +68,25 @@ describe("routing budgets", () => {
     expect(decision).toMatchObject({ allowed: false, reason: expect.stringContaining("run estimated budget") });
   });
 
+  it("fails closed when observed run or daily spend has reached its ceiling", () => {
+    const runSpent = { ...emptySnapshot(), observedRunUsd: 2 };
+    const daySpent = { ...emptySnapshot(), observedDayUsd: 5 };
+    expect(enforceRoutingBudget({
+      stage: "review",
+      estimate: { status: "known", estimatedUsd: 0.01 },
+      budgets: { ...DEFAULT_ROUTING_BUDGETS, maxObservedUsdPerRun: 2 },
+      snapshot: runSpent,
+      unattended: false,
+    })).toMatchObject({ allowed: false, reason: expect.stringContaining("run observed budget") });
+    expect(enforceRoutingBudget({
+      stage: "review",
+      estimate: { status: "unknown", reason: "missing" },
+      budgets: { ...DEFAULT_ROUTING_BUDGETS, maxObservedUsdPerDay: 5 },
+      snapshot: daySpent,
+      unattended: false,
+    })).toMatchObject({ allowed: false, reason: expect.stringContaining("daily observed budget") });
+  });
+
   it("asks in UI mode but fails closed in unattended mode for unknown cost when configured", () => {
     const budgets = { ...DEFAULT_ROUTING_BUDGETS, allowUnknownCost: false };
     const estimate = { status: "unknown" as const, reason: "missing" };

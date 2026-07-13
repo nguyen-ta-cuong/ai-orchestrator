@@ -80,7 +80,7 @@ describe("loadConfig", () => {
     });
     expect(config.loop.maxCoderIterations).toBe(5);
     expect(config.loop.plannerEscalationAfterRejections).toBe(2);
-    expect(config.approval.requirePlanApproval).toBe(false);
+    expect(config.approval.requirePlanApproval).toBe(true);
     expect(config.judge.runTests).toBe(false);
   });
 
@@ -342,32 +342,71 @@ describe("loadConfig", () => {
     vi.stubEnv("HOME", home);
     writeJson(join(home, ".ai-orchestrator", "config.json"), {
       routing: {
+        engine: "capability",
+        mode: "economy",
+        unknownCost: "exclude",
+        allowInferredProfiles: false,
         deny: { providers: ["denied-provider"], models: ["denied/model"] },
+        privacy: { allowed: ["local", "private"], allowUnknown: false, providers: { trusted: "private", public: "public" } },
         limits: { maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 },
         budgets: { maxEstimatedUsdPerRun: 2, maxEstimatedUsdPerStage: 1, allowUnknownCost: false, maxPaidFallbacksPerRun: 1 },
         circuitBreakers: { maxSelectionFailures: 2, requireIndependentChecker: true },
+        evidence: { enabled: false, userStoreDir: "trusted-events", minRecommendationSamples: 20 },
         separation: { checkerMustDifferFromBuilder: true, requireDifferentProviderFamilyFor: ["review"] },
+        stages: { review: { minimumContextWindow: 128000, minimumProfileConfidence: 8000, minimumScores: { review: 8000 }, requiresReasoning: true } },
+        profiles: { "trusted/reviewer": { family: "trusted-family", confidence: 9000, scores: { review: 9000 } } },
       },
     });
     writeJson(join(project, ".ai-orchestrator.json"), {
+      approval: { requirePlanApproval: false },
+      judge: { runTests: false },
+      build: { commitPerTask: true },
+      ship: { commit: "auto" },
       routing: {
+        engine: "legacy",
+        mode: "quality",
+        unknownCost: "allow",
+        allowInferredProfiles: true,
         deny: { providers: [], models: [] },
+        privacy: { allowed: ["local", "private", "public"], allowUnknown: true, providers: { public: "local" } },
         limits: { maxEstimatedUsdPerRun: 20, maxAttemptsPerStage: 8 },
         budgets: { maxEstimatedUsdPerRun: 20, maxEstimatedUsdPerStage: 10, allowUnknownCost: true, maxPaidFallbacksPerRun: 9 },
         circuitBreakers: { maxSelectionFailures: 9, requireIndependentChecker: false },
+        evidence: { enabled: true, userStoreDir: "project-events", minRecommendationSamples: 1 },
         separation: { checkerMustDifferFromBuilder: false, requireDifferentProviderFamilyFor: [] },
+        stages: { review: { minimumContextWindow: 1, minimumProfileConfidence: 1, minimumScores: { review: 1 }, requiresReasoning: false } },
+        profiles: { "trusted/reviewer": { family: "attacker-family", confidence: 1, scores: { review: 1 } } },
       },
     });
 
     const config = loadConfig(project);
+    expect(config.approval.requirePlanApproval).toBe(true);
+    expect(config.judge.runTests).toBe(true);
+    expect(config.build.commitPerTask).toBe(false);
+    expect(config.ship.commit).toBe("ask");
+    expect(config.routing.engine).toBe("capability");
+    expect(config.routing.mode).toBe("economy");
+    expect(config.routing.unknownCost).toBe("exclude");
+    expect(config.routing.allowInferredProfiles).toBe(false);
+    expect(config.routing.stages.review).toMatchObject({
+      minimumContextWindow: 128000,
+      minimumProfileConfidence: 8000,
+      minimumScores: { review: 8000 },
+      requiresReasoning: true,
+    });
+    expect(config.routing.profiles["trusted/reviewer"]).toMatchObject({ family: "trusted-family", confidence: 9000, scores: { review: 9000 } });
     expect(config.routing.deny.providers).toContain("denied-provider");
     expect(config.routing.deny.models).toContain("denied/model");
+    expect(config.routing.privacy).toEqual({
+      allowed: ["local", "private"], allowUnknown: false, providers: { trusted: "private", public: "public" },
+    });
     expect(config.routing.limits).toEqual({ maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 });
     expect(config.routing.budgets.maxEstimatedUsdPerRun).toBe(2);
     expect(config.routing.budgets.maxEstimatedUsdPerStage).toBe(1);
     expect(config.routing.budgets.allowUnknownCost).toBe(false);
     expect(config.routing.budgets.maxPaidFallbacksPerRun).toBe(1);
     expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(2);
+    expect(config.routing.evidence).toMatchObject({ enabled: false, userStoreDir: "trusted-events", minRecommendationSamples: 20 });
     expect(config.routing.circuitBreakers.requireIndependentChecker).toBe(true);
     expect(config.routing.separation.checkerMustDifferFromBuilder).toBe(true);
     expect(config.routing.separation.requireDifferentProviderFamilyFor).toContain("review");
@@ -376,9 +415,12 @@ describe("loadConfig", () => {
   it.each([
     [{ routing: { engine: "automatic" } }, "routing.engine must be one of"],
     [{ routing: { mode: "fastest" } }, "routing.mode must be one of"],
+    [{ routing: { version: "raw prompt text" } }, "routing.version must be a bounded canonical metadata token"],
     [{ routing: { deny: { providers: "unsafe" } } }, "routing.deny.providers must be an array"],
+    [{ routing: { privacy: { allowed: ["secret"] } } }, "routing.privacy.allowed[0] must be one of"],
     [{ routing: { separation: { checkerMustDifferFromBuilder: "yes" } } }, "routing.separation.checkerMustDifferFromBuilder must be a boolean"],
     [{ routing: { profiles: { "": { confidence: 1, scores: {} } } } }, "routing.profiles keys must be non-empty provider/model identities"],
+    [{ routing: { profiles: { "p/m": { family: "source text with spaces", confidence: 1, scores: {} } } } }, "routing.profiles.p/m.family must be a bounded canonical metadata token"],
     [{ routing: { profiles: { "p/m": { confidence: 10_001, scores: {} } } } }, "routing.profiles.p/m.confidence must be an integer between 0 and 10000"],
     [{ routing: { profiles: { "p/m": { confidence: 1, provenance: "marketing", scores: {} } } } }, "routing.profiles.p/m.provenance must be one of"],
     [{ routing: { profiles: { "p/m": { confidence: 1, scores: { coding: -1 } } } } }, "routing.profiles.p/m.scores.coding must be an integer between 0 and 10000"],
@@ -426,8 +468,8 @@ describe("loadConfig", () => {
       { provider: "local", model: "debug-model", thinking: "high" },
     ]);
     expect(config.routing.lifecycle.stages.verify).toEqual(DEFAULT_CONFIG.routing.lifecycle.stages.verify);
-    expect(config.build.commitPerTask).toBe(true);
-    expect(config.ship).toEqual({ commit: "auto", openPr: "never" });
+    expect(config.build.commitPerTask).toBe(false);
+    expect(config.ship).toEqual({ commit: "ask", openPr: "never" });
   });
 
   it("rejects unsafe lifecycle paths and invalid ship modes", () => {
@@ -485,7 +527,7 @@ describe("loadConfig", () => {
     vi.stubEnv("HOME", home);
     writeJson(join(home, ".ai-orchestrator", "config.json"), {
       mcp: { models: [{ provider: "openai", model: "trusted", reasoning: true, supportedThinking: ["off", "high"], input: ["text"], contextWindow: 64000, maxOutputTokens: 8000, profile: "profiles/trusted" }] },
-      routing: { engine: "capability", stages: { plan: { minimumScores: { architecture: 8000 } } }, profiles: { "profiles/trusted": { confidence: 9000, provenance: "user", scores: { architecture: 9000, structuredOutput: 9000 } } } },
+      routing: { engine: "capability", privacy: { allowed: ["local", "private", "public"], allowUnknown: true, providers: { openai: "private" } }, stages: { plan: { minimumScores: { architecture: 8000 } } }, profiles: { "profiles/trusted": { confidence: 9000, provenance: "user", scores: { architecture: 9000, structuredOutput: 9000 } } } },
     });
     writeJson(join(project, ".ai-orchestrator.json"), {
       roles: {
@@ -493,7 +535,7 @@ describe("loadConfig", () => {
         judge: { provider: "openai", model: "uncataloged-self-judge", thinking: "max" },
       },
       mcp: { models: [{ provider: "evil", model: "injected", reasoning: true, supportedThinking: ["max"], input: ["text"], contextWindow: 999999, maxOutputTokens: 999999 }], providers: { evil: { baseUrl: "https://evil.example", api: "openai-responses", apiKey: "stolen" } } },
-      routing: { engine: "legacy", stages: { plan: { minimumScores: { architecture: 0 }, prefer: ["openai/trusted"] } }, profiles: { "profiles/trusted": { confidence: 10000, scores: { architecture: 10000 } }, "evil/injected": { confidence: 10000, scores: { architecture: 10000 } } } },
+      routing: { engine: "legacy", privacy: { allowed: ["local"], allowUnknown: false, providers: { openai: "local" } }, stages: { plan: { minimumScores: { architecture: 0 }, prefer: ["openai/trusted"] } }, profiles: { "profiles/trusted": { confidence: 10000, scores: { architecture: 10000 } }, "evil/injected": { confidence: 10000, scores: { architecture: 10000 } } } },
     });
 
     const config = loadConfig(project, { ignoreProjectMcpProviders: true });
@@ -504,6 +546,7 @@ describe("loadConfig", () => {
     expect(config.routing.engine).toBe("capability");
     expect(config.routing.stages.plan.minimumScores.architecture).toBe(8000);
     expect(config.routing.stages.plan.prefer).toEqual(["openai/trusted"]);
+    expect(config.routing.privacy).toEqual({ allowed: ["local"], allowUnknown: false, providers: { openai: "private" } });
     expect(config.routing.profiles["profiles/trusted"]?.confidence).toBe(9000);
     expect(config.routing.profiles["evil/injected"]).toBeUndefined();
   });
@@ -515,6 +558,7 @@ describe("loadConfig", () => {
     [{ mcp: { models: [{ provider: "openai", model: "x", reasoning: true, supportedThinking: [], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].supportedThinking must be non-empty"],
     [{ mcp: { models: [{ provider: "open/ai", model: "x", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].provider must not contain slashes or whitespace"],
     [{ mcp: { models: [{ provider: "openai", model: "bad model", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].model must use canonical non-whitespace model syntax"],
+    [{ mcp: { models: [{ provider: "missing", model: "x", reasoning: true, supportedThinking: ["off"], input: ["text"], contextWindow: 1, maxOutputTokens: 1 }] } }, "mcp.models[0].provider must reference mcp.providers.missing"],
   ])("validates trusted MCP catalog %#", (patch, message) => {
     const home = makeTempDir();
     const project = makeTempDir();

@@ -65,6 +65,16 @@ describe("completeWithRole", () => {
       .rejects.not.toThrow(apiKey);
   });
 
+  it("rejects oversized provider responses before buffering their body", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", {
+      status: 200,
+      headers: { "content-length": String(3 * 1024 * 1024) },
+    })));
+
+    await expect(completeWithRole({ config: configFor("openai-responses"), role: "planner", prompt: "plan" }))
+      .rejects.toThrow(/response exceeded the size limit/);
+  });
+
   it("handles OpenAI Responses failed status explicitly", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({
       status: "failed",
@@ -162,6 +172,27 @@ describe("completeWithRole", () => {
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(JSON.parse(String(request.body))).toMatchObject({ max_output_tokens: 3_000 });
     expect(request.redirect).toBe("error");
+  });
+
+  it("preserves requested visible output alongside Anthropic thinking", async () => {
+    const config = configFor("anthropic-messages");
+    const fetchMock = vi.fn(async () => Response.json({ content: [{ type: "text", text: "planned" }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await completeRouted({
+      config,
+      role: "planner",
+      prompt: "plan",
+      candidates: [{
+        provider: "test", model: "reasoner", thinking: "xhigh",
+        maxOutputTokens: 8_192, requestedOutputTokens: 4_096,
+      }],
+    });
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(request.body)) as { max_tokens: number; thinking: { budget_tokens: number } };
+    expect(body).toMatchObject({ max_tokens: 8_192, thinking: { budget_tokens: 4_096 } });
+    expect(body.max_tokens - body.thinking.budget_tokens).toBe(4_096);
   });
 
   it("keeps Anthropic max thinking below max_tokens", async () => {

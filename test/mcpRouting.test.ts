@@ -36,6 +36,32 @@ describe("MCP capability routing", () => {
     });
   });
 
+  it("enforces deny, privacy, and cost policy on exact shadow routes", () => {
+    const config = routedConfig();
+    config.routing.engine = "capability-shadow";
+    config.roles.planner = { provider: "p1", model: "maker", thinking: "high" };
+    config.routing.deny.models = ["p1/maker"];
+    expect(() => resolveMcpRoute({ config, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") })).toThrow(/denied by hard routing policy/);
+
+    config.routing.deny.models = [];
+    config.mcp.models[0]!.cost = { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 };
+    config.routing.budgets.maxEstimatedUsdPerStage = 0.001;
+    expect(() => resolveMcpRoute({ config, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") })).toThrow(/estimated cost/);
+  });
+
+  it("applies trusted MCP catalog privacy as a hard eligibility gate", () => {
+    const config = routedConfig();
+    config.mcp.models[0]!.privacy = "public";
+    config.mcp.models[1]!.privacy = "private";
+    config.routing.privacy = { allowed: ["private"], allowUnknown: false, providers: {} };
+
+    const route = resolveMcpRoute({ config, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") });
+    expect(route.candidates.map((candidate) => candidate.model)).toEqual(["checker"]);
+    expect(route.excluded).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identity: expect.objectContaining({ model: "maker" }), code: "privacy-not-allowed" }),
+    ]));
+  });
+
   it("enforces MCP stage budget and fallback-attempt ceilings", () => {
     const config = routedConfig();
     config.mcp.models = config.mcp.models.map((model) => ({
@@ -113,6 +139,8 @@ describe("MCP capability routing", () => {
     emptyCatalog.mcp.models = [];
     expect(() => resolveMcpRoute({ config: emptyCatalog, stage: "fast-judge", role: "judge", task: defaultTaskFeatures("judge") }))
       .toThrow(/requires coderIdentity/);
+    expect(() => resolveMcpRoute({ config: emptyCatalog, stage: "plan", role: "planner", task: defaultTaskFeatures("plan") }))
+      .toThrow(/No trusted MCP model catalog/);
   });
 
   it("excludes the coder and selects an independent checker", () => {

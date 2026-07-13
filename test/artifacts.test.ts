@@ -1,15 +1,18 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  acquireRunLease,
   appendJournal,
   appendRoutingTrace,
   createRun,
   currentRun,
+  ownsRunLease,
   readState,
   releaseRun,
+  releaseRunLease,
   writeState,
 } from "../src/lifecycle/artifacts.js";
 import { createIdleLifecycleState } from "../src/core/lifecycle.js";
@@ -109,6 +112,13 @@ describe("lifecycle artifacts", () => {
     expect(readState(run.paths)).toBeUndefined();
     writeFileSync(run.paths.state, JSON.stringify({ phase: "defining" }));
     expect(readState(run.paths)).toBeUndefined();
+    for (const counters of [{ buildIterations: -1 }, { consecutiveRejections: 1.5 }]) {
+      writeFileSync(run.paths.state, JSON.stringify({
+        ...createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task" }),
+        ...counters,
+      }));
+      expect(readState(run.paths)).toBeUndefined();
+    }
     writeFileSync(run.paths.state, JSON.stringify(createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task", verdicts: [{ stage: "bad", verdict: "approve", reasons: "x" } as never] })));
     expect(readState(run.paths)).toBeUndefined();
     writeFileSync(run.paths.state, JSON.stringify(createIdleLifecycleState({
@@ -147,15 +157,40 @@ describe("lifecycle artifacts", () => {
     expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/already active/);
   });
 
+  it("prevents concurrent execution and reclaims a dead-process lease", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    acquireRunLease(run.paths, "owner-a");
+    expect(ownsRunLease(run.paths, "owner-a")).toBe(true);
+    expect(() => acquireRunLease(run.paths, "owner-b")).toThrow(/already executing/);
+    expect(releaseRunLease(run.paths, "owner-b")).toBe(false);
+    expect(releaseRunLease(run.paths, "owner-a")).toBe(true);
+
+    writeFileSync(run.paths.executionLease, `${JSON.stringify({ owner: "dead", pid: 99_999_999, createdAt: new Date().toISOString() })}\n`);
+    acquireRunLease(run.paths, "owner-b");
+    expect(ownsRunLease(run.paths, "owner-b")).toBe(true);
+    expect(releaseRunLease(run.paths, "owner-b")).toBe(true);
+  });
+
+  it("reclaims a current-run lock owned by a dead process", () => {
+    const cwd = makeTempDir();
+    const lock = join(cwd, ".ai-orchestrator", "current.lock");
+    mkdirSync(join(lock, ".."), { recursive: true });
+    writeFileSync(lock, `${JSON.stringify({ owner: "dead", pid: 99_999_999, createdAt: new Date().toISOString() })}\n`);
+
+    expect(createRun(cwd, artifactsDir, "recovered").runId).toMatch(/^\d{8}-\d{4}-[a-f0-9]{6}$/);
+    expect(existsSync(lock)).toBe(false);
+  });
+
   it("blocks creating a run while another process holds the current-run lock", () => {
     const cwd = makeTempDir();
-    mkdirSync(join(cwd, ".ai-orchestrator", "runs", "current.lock"), { recursive: true });
+    mkdirSync(join(cwd, ".ai-orchestrator", "current.lock"), { recursive: true });
 
     expect(() => createRun(cwd, artifactsDir, "second")).toThrow(/active or starting/);
     expect(existsSync(join(cwd, ".ai-orchestrator", "runs", "current"))).toBe(false);
   });
 
-  it("allows a new run when current state is terminal or corrupt", () => {
+  it("allows terminal replacement but fails closed on corrupt current state", () => {
     const cwd = makeTempDir();
     const first = createRun(cwd, artifactsDir, "first");
     writeState(first.paths, createIdleLifecycleState({ runId: first.runId, phase: "done", task: "first" }));
@@ -164,12 +199,10 @@ describe("lifecycle artifacts", () => {
     expect(second.runId).not.toBe(first.runId);
 
     writeFileSync(second.paths.state, "not json");
-    const third = createRun(cwd, artifactsDir, "third");
-    expect(third.runId).not.toBe(second.runId);
+    expect(() => createRun(cwd, artifactsDir, "third")).toThrow(/corrupt state/);
 
-    writeFileSync(third.paths.state, JSON.stringify({ ...createIdleLifecycleState({ runId: third.runId, task: "third" }), phase: "unknown" }));
-    const fourth = createRun(cwd, artifactsDir, "fourth");
-    expect(fourth.runId).not.toBe(third.runId);
+    writeFileSync(second.paths.state, JSON.stringify({ ...createIdleLifecycleState({ runId: second.runId, task: "second" }), phase: "unknown" }));
+    expect(() => createRun(cwd, artifactsDir, "third")).toThrow(/corrupt state/);
   });
 
   it("ignores invalid current run ids instead of joining untrusted path text", () => {
@@ -178,6 +211,7 @@ describe("lifecycle artifacts", () => {
     writeFileSync(join(cwd, ".ai-orchestrator", "runs", "current"), "../../outside\n");
 
     expect(currentRun(cwd, artifactsDir)).toBeUndefined();
+    expect(() => createRun(cwd, artifactsDir, "task")).toThrow(/current pointer is invalid/);
   });
 
   it("keeps the current pointer inside the artifact directory for non-default artifact directories", () => {
@@ -204,11 +238,28 @@ describe("lifecycle artifacts", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, ".orch\\runs", "task");
 
-    expect(run.paths.root).toBe(join(cwd, ".orch", "runs", run.runId));
+    expect(run.paths.root).toBe(join(realpathSync(cwd), ".orch", "runs", run.runId));
     expect(readFileSync(join(cwd, ".orch", "runs", "current"), "utf8").trim()).toBe(run.runId);
     expect(existsSync(join(cwd, ".orch", "current"))).toBe(false);
     expect(existsSync(join(cwd, "current"))).toBe(false);
     expect(existsSync(join(cwd, ".orch\\runs"))).toBe(false);
+  });
+
+  it("rejects symlinked artifact ancestors and artifact files", () => {
+    const cwd = makeTempDir();
+    const outside = makeTempDir();
+    symlinkSync(outside, join(cwd, ".ai-orchestrator"), "dir");
+    expect(() => createRun(cwd, artifactsDir, "task")).toThrow(/must not contain symlinks/);
+    expect(existsSync(join(outside, "runs"))).toBe(false);
+
+    unlinkSync(join(cwd, ".ai-orchestrator"));
+    const run = createRun(cwd, artifactsDir, "task");
+    const outsideJournal = join(outside, "journal.md");
+    writeFileSync(outsideJournal, "outside\n");
+    unlinkSync(run.paths.journal);
+    symlinkSync(outsideJournal, run.paths.journal);
+    expect(() => appendJournal(run.paths, "must not escape")).toThrow(/must not contain symlinks/);
+    expect(readFileSync(outsideJournal, "utf8")).toBe("outside\n");
   });
 
   it("rejects artifact directories that collide with current coordination names", () => {
@@ -281,6 +332,39 @@ describe("lifecycle artifacts", () => {
     expect(exclude).toContain("/.orch/runs/");
     expect(exclude).not.toContain("/.orch/current");
     expect(exclude).not.toContain("/.orch/current.lock/");
+  });
+
+  it("coordinates one active run across worktree subdirectories", () => {
+    const root = makeTempDir();
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    const firstCwd = join(root, "packages", "one");
+    const secondCwd = join(root, "packages", "two");
+    mkdirSync(firstCwd, { recursive: true });
+    mkdirSync(secondCwd, { recursive: true });
+    const first = createRun(firstCwd, ".orch/runs", "first");
+
+    expect(currentRun(secondCwd, ".orch/runs")?.paths.root).toBe(first.paths.root);
+    expect(() => createRun(secondCwd, ".orch/runs", "second")).toThrow(/already active/);
+  });
+
+  it("fails closed when the repository active-run registry is corrupt", () => {
+    const cwd = makeTempDir();
+    const registry = join(cwd, ".ai-orchestrator", "active-run.json");
+    mkdirSync(join(registry, ".."), { recursive: true });
+    writeFileSync(registry, "not-json\n");
+
+    expect(() => currentRun(cwd, artifactsDir)).toThrow(/registry is corrupt/);
+    expect(() => createRun(cwd, artifactsDir, "blocked")).toThrow(/registry is corrupt/);
+  });
+
+  it("keeps repository ownership visible after artifactsDir changes", () => {
+    const cwd = makeTempDir();
+    const first = createRun(cwd, ".one/runs", "first");
+
+    expect(currentRun(cwd, ".two/runs")?.paths.root).toBe(first.paths.root);
+    expect(() => createRun(cwd, ".two/runs", "second")).toThrow(/already active/);
+    expect(releaseRun(cwd, ".two/runs", first.runId)).toBe(true);
+    expect(currentRun(cwd, ".two/runs")).toBeUndefined();
   });
 
   it("appends journal entries and releases the current run pointer", () => {

@@ -40,6 +40,19 @@ describe("Pi capability routing plan", () => {
     expect(verify.decision?.excluded).toContainEqual(expect.objectContaining({ code: "same-builder-model" }));
   });
 
+  it("keeps thinking clamp rationale in the selected candidate explanation", () => {
+    const config = capableConfig();
+    const plan = createPiRoutingPlan({
+      config,
+      provenance: builtin,
+      stage: "build",
+      role: "coder",
+      available: [{ ...available("invented", "coder"), thinkingLevelMap: { medium: null, low: "low", high: null } }],
+      evidence: "build a feature",
+    });
+    expect(plan.candidates[0]).toMatchObject({ thinking: "low", reason: expect.stringContaining("clamped to low") });
+  });
+
   it("turns an explicit role override into an exact pin", () => {
     const config = capableConfig();
     config.roles.coder = { provider: "invented", model: "checker", thinking: "high" };
@@ -54,6 +67,7 @@ describe("Pi capability routing plan", () => {
       evidence: "build a feature",
     });
     expect(plan.candidates.map((candidate) => candidate.model)).toEqual(["checker"]);
+    expect(plan.candidates[0]?.thinking).toBe("high");
   });
 
   it("honors an explicit callable pin even when it has no capability profile", () => {
@@ -73,11 +87,44 @@ describe("Pi capability routing plan", () => {
     expect(plan.candidates[0]).toMatchObject({ provider: "private", model: "trusted-coder" });
   });
 
-  it("keeps legacy and shadow engines on exact legacy selection", () => {
+  it("retains known cost and fails closed on strict legacy family separation", () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.routing.engine = "capability-shadow";
+    config.roles.coder = { provider: "p", model: "maker", thinking: "high" };
+    config.roles.judge = { provider: "p", model: "checker", thinking: "high" };
+    config.routing.profiles = {
+      "p/maker": { family: "same", confidence: 9000, scores: {} },
+      "p/checker": { family: "same", confidence: 9000, scores: {} },
+    };
+    config.routing.separation.requireDifferentProviderFamilyFor = ["fast-judge"];
+    const models = ["maker", "checker"].map((id) => ({
+      ...available("p", id), cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+    }));
+    const build = createPiRoutingPlan({ config, provenance: builtin, stage: "build", role: "coder", available: models, evidence: "task" });
+    expect(build.candidates[0]?.estimatedCostUsd).toBeGreaterThan(0);
+    const judge = createPiRoutingPlan({
+      config, provenance: builtin, stage: "fast-judge", role: "judge", available: models, evidence: "task",
+      priorSelections: [{ stage: "build", provider: "p", model: "maker", family: "same" }],
+    });
+    expect(judge.candidates).toEqual([]);
+  });
+
+  it("enforces privacy before exact shadow model activation", () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.routing.engine = "capability-shadow";
+    config.routing.privacy = { allowed: ["private"], allowUnknown: false, providers: { "openai-codex": "public" } };
+    const plan = createPiRoutingPlan({
+      config, provenance: builtin, stage: "build", role: "coder",
+      available: [available("openai-codex", "gpt-5.5")], evidence: "task",
+    });
+    expect(plan.candidates).toEqual([]);
+  });
+
+  it("keeps legacy and shadow engines on exact legacy selection without allowing self-review", () => {
     for (const engine of ["legacy", "capability-shadow"] as const) {
       const config = structuredClone(DEFAULT_CONFIG);
       config.routing.engine = engine;
-      const plan = createPiRoutingPlan({
+      const build = createPiRoutingPlan({
         config,
         provenance: builtin,
         stage: "build",
@@ -85,7 +132,22 @@ describe("Pi capability routing plan", () => {
         available: [available("openai-codex", "gpt-5.5")],
         evidence: "task",
       });
-      expect(plan.candidates[0]).toMatchObject({ provider: "openai-codex", model: "gpt-5.5" });
+      expect(build.candidates[0]).toMatchObject({ provider: "openai-codex", model: "gpt-5.5" });
+
+      config.roles.judge = { ...config.roles.coder };
+      const judge = createPiRoutingPlan({
+        config,
+        provenance: builtin,
+        stage: "fast-judge",
+        role: "judge",
+        available: [available("openai-codex", "gpt-5.5")],
+        evidence: "task",
+        priorSelections: [
+          { stage: "build", provider: "old", model: "builder" },
+          { stage: "build", provider: "openai-codex", model: "gpt-5.5" },
+        ],
+      });
+      expect(judge.candidates).toEqual([]);
     }
   });
 });

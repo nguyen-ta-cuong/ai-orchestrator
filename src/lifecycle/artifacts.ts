@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, parse, relative, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
 
@@ -13,6 +13,7 @@ export interface RunPaths {
   journal: string;
   routing: string;
   evidence: string;
+  executionLease: string;
 }
 
 export interface RoutingTraceRecord {
@@ -25,25 +26,34 @@ export interface RoutingTraceRecord {
 }
 
 export function createRun(cwd: string, artifactsDir: string, task: string, yolo = false): { runId: string; paths: RunPaths } {
+  assertArtifactRootSafe(cwd, artifactsDir);
   ensureArtifactsExcludedFromGit(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => {
     const currentPath = currentRunPath(cwd, artifactsDir);
+    const registryPath = repositoryActiveRunPath(cwd);
+    const activeRegistry = readActiveRunRegistry(cwd);
     const active = currentRun(cwd, artifactsDir);
     if (active) {
       const activeState = readState(active.paths);
-      if (activeState && isActivePhase(activeState.phase)) {
+      if (!activeState) {
+        throw new Error(`Lifecycle run ${active.runId} has missing or corrupt state; explicit recovery is required`);
+      }
+      if (isActivePhase(activeState.phase)) {
         throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
       }
-      rmSync(currentPath, { force: true });
-    } else if (existsSync(currentPath)) {
-      rmSync(currentPath, { force: true });
+      rmSync(currentRunPath(activeRegistry?.runCwd ?? cwd, activeRegistry?.artifactsDir ?? artifactsDir), { force: true });
+      rmSync(registryPath, { force: true });
+    } else if (existsSync(currentPath) || existsSync(registryPath)) {
+      throw new Error("Lifecycle current pointer is invalid; explicit recovery is required");
     }
 
     const runId = createRunId();
     const paths = pathsForRun(cwd, artifactsDir, runId);
     let currentPointerWritten = false;
+    let registryWritten = false;
     try {
       mkdirSync(paths.root, { recursive: true });
+      assertRunPathsSafe(paths);
       writeFileSync(paths.spec, "");
       writeFileSync(paths.plan, "");
       writeFileSync(paths.debug, "");
@@ -51,11 +61,16 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeFileSync(paths.routing, "");
       writeFileSync(paths.evidence, "");
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
+      mkdirSync(join(registryPath, ".."), { recursive: true });
+      assertNoSymlinkComponents(registryPath);
+      writeFileSync(registryPath, `${JSON.stringify({ runId, artifactsDir: normalizeArtifactsDir(artifactsDir), runCwd: realpathSync(cwd) })}\n`, { flag: "wx" });
+      registryWritten = true;
       writeFileSync(currentPath, `${runId}\n`, { flag: "wx" });
       currentPointerWritten = true;
       return { runId, paths };
     } finally {
       if (!currentPointerWritten) {
+        if (registryWritten) rmSync(registryPath, { force: true });
         rmSync(paths.root, { recursive: true, force: true });
       }
     }
@@ -63,7 +78,17 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
 }
 
 export function currentRun(cwd: string, artifactsDir: string): { runId: string; paths: RunPaths } | undefined {
+  assertArtifactRootSafe(cwd, artifactsDir);
+  const registry = readActiveRunRegistry(cwd);
+  if (!registry && existsSync(repositoryActiveRunPath(cwd))) {
+    throw new Error("Lifecycle repository active-run registry is corrupt; explicit recovery is required");
+  }
+  if (registry) {
+    assertArtifactRootSafe(registry.runCwd, registry.artifactsDir);
+    return { runId: registry.runId, paths: pathsForRun(registry.runCwd, registry.artifactsDir, registry.runId) };
+  }
   const currentPath = currentRunPath(cwd, artifactsDir);
+  assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath)) return undefined;
   const runId = readFileSync(currentPath, "utf8").trim();
   if (!isRunId(runId)) return undefined;
@@ -71,12 +96,15 @@ export function currentRun(cwd: string, artifactsDir: string): { runId: string; 
 }
 
 export function readState(paths: RunPaths): LifecycleState | undefined {
+  assertRunPathsSafe(paths);
   if (!existsSync(paths.state)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(paths.state, "utf8")) as unknown;
     if (!isLifecycleState(parsed)) return undefined;
     return {
       ...parsed,
+      rejectionFingerprints: parsed.rejectionFingerprints ? [...parsed.rejectionFingerprints] : [],
+      buildEvidenceFingerprints: parsed.buildEvidenceFingerprints ? [...parsed.buildEvidenceFingerprints] : [],
       modelSelections: parsed.modelSelections?.map((selection) => ({
         ...selection,
         routing: selection.routing ? {
@@ -92,7 +120,9 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
 }
 
 export function writeState(paths: RunPaths, state: LifecycleState): void {
+  assertRunPathsSafe(paths);
   mkdirSync(paths.root, { recursive: true });
+  assertRunPathsSafe(paths);
   const tempPath = `${paths.state}.${process.pid}.${Date.now()}.tmp`;
   let completed = false;
   try {
@@ -107,12 +137,15 @@ export function writeState(paths: RunPaths, state: LifecycleState): void {
 }
 
 export function appendJournal(paths: RunPaths, line: string): void {
+  assertRunPathsSafe(paths);
   mkdirSync(paths.root, { recursive: true });
+  assertRunPathsSafe(paths);
   const timestamp = new Date().toISOString();
   writeFileSync(paths.journal, `- ${timestamp} ${line}\n`, { flag: "a" });
 }
 
 export function appendRoutingTrace(paths: RunPaths, record: RoutingTraceRecord): void {
+  assertRunPathsSafe(paths);
   if (!isRoutingTraceRecord(record)) throw new Error("routing trace record is invalid");
   const line = JSON.stringify(record);
   if (Buffer.byteLength(line, "utf8") > 256 * 1024) throw new Error("routing trace record exceeds 256 KiB");
@@ -120,12 +153,46 @@ export function appendRoutingTrace(paths: RunPaths, record: RoutingTraceRecord):
   writeFileSync(paths.routing, `${line}\n`, { flag: "a" });
 }
 
+export function acquireRunLease(paths: RunPaths, owner: string): void {
+  assertRunPathsSafe(paths);
+  const record = { owner, pid: process.pid, createdAt: new Date().toISOString() };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(paths.executionLease, `${JSON.stringify(record)}\n`, { flag: "wx" });
+      return;
+    } catch (error) {
+      if (!isNodeErrorWithCode(error, "EEXIST")) throw error;
+      const existing = readExecutionLease(paths.executionLease);
+      if (existing?.owner === owner) return;
+      if (!existing || isProcessAlive(existing.pid)) {
+        throw new Error(`Lifecycle run is already executing under lease ${existing?.owner ?? "unknown"}`);
+      }
+      rmSync(paths.executionLease, { force: true });
+    }
+  }
+  throw new Error("Lifecycle execution lease could not be acquired");
+}
+
+export function ownsRunLease(paths: RunPaths, owner: string): boolean {
+  assertRunPathsSafe(paths);
+  return readExecutionLease(paths.executionLease)?.owner === owner;
+}
+
+export function releaseRunLease(paths: RunPaths, owner: string): boolean {
+  assertRunPathsSafe(paths);
+  if (readExecutionLease(paths.executionLease)?.owner !== owner) return false;
+  rmSync(paths.executionLease, { force: true });
+  return true;
+}
+
 export function releaseRun(cwd: string, artifactsDir: string, runId: string): boolean {
+  assertArtifactRootSafe(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => releaseCurrentPointerIfMatches(cwd, artifactsDir, runId));
 }
 
 export function pathsForRun(cwd: string, artifactsDir: string, runId: string): RunPaths {
-  const root = join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), runId);
+  if (!isRunId(runId)) throw new Error("lifecycle run id is invalid");
+  const root = join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), runId);
   return {
     root,
     spec: join(root, "spec.md"),
@@ -135,23 +202,54 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
     journal: join(root, "journal.md"),
     routing: join(root, "routing.jsonl"),
     evidence: join(root, "evidence.jsonl"),
+    executionLease: join(root, "execution.lock"),
   };
 }
 
 function currentRunPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), "current");
+  return join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), "current");
 }
 
-function currentRunLockPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), "current.lock");
+function currentRunLockPath(cwd: string, _artifactsDir: string): string {
+  return join(coordinationRoot(cwd), ".ai-orchestrator", "current.lock");
+}
+
+function repositoryActiveRunPath(cwd: string): string {
+  return join(coordinationRoot(cwd), ".ai-orchestrator", "active-run.json");
+}
+
+function coordinationRoot(cwd: string): string {
+  return resolveGitContext(cwd)?.worktreeRoot ?? realpathSync(cwd);
+}
+
+function readActiveRunRegistry(cwd: string): { runId: string; artifactsDir: string; runCwd: string } | undefined {
+  const path = repositoryActiveRunPath(cwd);
+  assertNoSymlinkComponents(path);
+  if (!existsSync(path)) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as { runId?: unknown; artifactsDir?: unknown; runCwd?: unknown };
+    if (typeof value.runId !== "string" || !isRunId(value.runId) || typeof value.artifactsDir !== "string") return undefined;
+    const root = coordinationRoot(cwd);
+    const runCwd = typeof value.runCwd === "string" ? realpathSync(value.runCwd) : root;
+    const contained = relative(root, runCwd);
+    if (contained.startsWith("..") || isAbsolute(contained)) return undefined;
+    return { runId: value.runId, artifactsDir: normalizeArtifactsDir(value.artifactsDir), runCwd };
+  } catch {
+    return undefined;
+  }
 }
 
 function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId: string): boolean {
-  const currentPath = currentRunPath(cwd, artifactsDir);
+  const registry = readActiveRunRegistry(cwd);
+  if (registry && registry.runId !== runId) return false;
+  const currentPath = currentRunPath(registry?.runCwd ?? cwd, registry?.artifactsDir ?? artifactsDir);
+  assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath) || readFileSync(currentPath, "utf8").trim() !== runId) {
     return false;
   }
   rmSync(currentPath, { force: true });
+  const registryPath = repositoryActiveRunPath(cwd);
+  if (registry?.runId === runId) rmSync(registryPath, { force: true });
   return true;
 }
 
@@ -176,10 +274,14 @@ function gitExcludePatterns(cwd: string, worktreeRoot: string, artifactsDir: str
   const realWorktreeRoot = realpathSync(worktreeRoot);
   const artifactRoot = join(realCwd, ...normalized.split("/"));
   const relativeArtifactRoot = relative(realWorktreeRoot, artifactRoot);
+  const coordinatorRoot = relative(realWorktreeRoot, join(coordinationRoot(cwd), ".ai-orchestrator"));
+  const coordinatorPatterns = coordinatorRoot.length > 0 && !coordinatorRoot.startsWith("..") && !isAbsolute(coordinatorRoot)
+    ? ["active-run.json", "current.lock"].map((name) => `/${gitIgnorePath([...coordinatorRoot.split(/[\\/]+/), name])}`)
+    : [];
   if (relativeArtifactRoot.length === 0 || relativeArtifactRoot.startsWith("..") || isAbsolute(relativeArtifactRoot)) {
-    return [`/${gitIgnorePath(normalized.split("/"))}/`];
+    return [`/${gitIgnorePath(normalized.split("/"))}/`, ...coordinatorPatterns];
   }
-  return [`/${gitIgnorePath(relativeArtifactRoot.split(/[\\/]+/))}/`];
+  return [`/${gitIgnorePath(relativeArtifactRoot.split(/[\\/]+/))}/`, ...coordinatorPatterns];
 }
 
 function gitIgnorePath(segments: string[]): string {
@@ -205,7 +307,7 @@ function resolveGitContext(cwd: string): { excludePath: string; worktreeRoot: st
     if (gitPath.length > 0 && worktreeRoot.length > 0) {
       return {
         excludePath: isAbsolute(gitPath) ? gitPath : join(cwd, gitPath),
-        worktreeRoot,
+        worktreeRoot: realpathSync(worktreeRoot),
       };
     }
   } catch {
@@ -213,7 +315,7 @@ function resolveGitContext(cwd: string): { excludePath: string; worktreeRoot: st
   }
 
   const gitDir = resolveGitDir(cwd);
-  return gitDir ? { excludePath: join(gitDir, "info", "exclude"), worktreeRoot: cwd } : undefined;
+  return gitDir ? { excludePath: join(gitDir, "info", "exclude"), worktreeRoot: realpathSync(cwd) } : undefined;
 }
 
 function resolveGitDir(cwd: string): string | undefined {
@@ -236,21 +338,60 @@ function resolveGitDir(cwd: string): string | undefined {
 }
 
 function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () => T): T {
+  assertArtifactRootSafe(cwd, artifactsDir);
   const lockPath = currentRunLockPath(cwd, artifactsDir);
+  assertNoSymlinkComponents(lockPath);
   mkdirSync(join(lockPath, ".."), { recursive: true });
-  let locked = false;
-  try {
-    mkdirSync(lockPath);
-    locked = true;
-    return operation();
-  } catch (error) {
-    if (isNodeErrorWithCode(error, "EEXIST")) {
-      throw new Error("An ai-orchestrator lifecycle run is already active or starting");
-    }
-    throw error;
-  } finally {
-    if (locked) {
+  assertNoSymlinkComponents(lockPath);
+  assertArtifactRootSafe(cwd, artifactsDir);
+  const owner = `current-${process.pid}-${randomBytes(6).toString("hex")}`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let locked = false;
+    try {
+      writeFileSync(lockPath, `${JSON.stringify({ owner, pid: process.pid, createdAt: new Date().toISOString() })}\n`, { flag: "wx" });
+      locked = true;
+      return operation();
+    } catch (error) {
+      if (!isNodeErrorWithCode(error, "EEXIST")) throw error;
+      const existing = readExecutionLease(lockPath);
+      if (!existing || isProcessAlive(existing.pid)) {
+        throw new Error("An ai-orchestrator lifecycle run is already active or starting");
+      }
       rmSync(lockPath, { recursive: true, force: true });
+    } finally {
+      if (locked) rmSync(lockPath, { force: true });
+    }
+  }
+  throw new Error("Lifecycle current-run lock could not be acquired");
+}
+
+function assertArtifactRootSafe(cwd: string, artifactsDir: string): void {
+  const projectRoot = realpathSync(cwd);
+  const artifactRoot = resolve(projectRoot, ...normalizeArtifactsDir(artifactsDir).split("/"));
+  const contained = relative(projectRoot, artifactRoot);
+  if (!contained || contained.startsWith("..") || isAbsolute(contained)) {
+    throw new Error("Lifecycle artifact root must remain inside the project");
+  }
+  assertNoSymlinkComponents(artifactRoot);
+}
+
+export function assertRunPathsSafe(paths: RunPaths): void {
+  for (const path of Object.values(paths)) assertNoSymlinkComponents(path);
+}
+
+function assertNoSymlinkComponents(target: string): void {
+  const absolute = resolve(target);
+  const root = parse(absolute).root;
+  let current = root;
+  for (const part of absolute.slice(root.length).split(/[\\/]+/).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new Error(`Lifecycle artifact path must not contain symlinks: ${current}`);
+      }
+    } catch (error) {
+      if (isNodeErrorWithCode(error, "ENOENT")) return;
+      throw error;
     }
   }
 }
@@ -285,6 +426,27 @@ function normalizeArtifactsDir(artifactsDir: string): string {
     throw new Error("artifactsDir basename is reserved for lifecycle run coordination");
   }
   return stack.join("/");
+}
+
+function readExecutionLease(path: string): { owner: string; pid: number } | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as { owner?: unknown; pid?: unknown };
+    return typeof value.owner === "string" && value.owner.length > 0 && Number.isInteger(value.pid) && (value.pid as number) > 0
+      ? { owner: value.owner, pid: value.pid as number }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeErrorWithCode(error, "ESRCH");
+  }
 }
 
 function isNodeErrorWithCode(error: unknown, code: string): boolean {
@@ -340,12 +502,17 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     typeof candidate.phase === "string" &&
     LIFECYCLE_PHASES.has(candidate.phase as LifecyclePhase) &&
     typeof candidate.task === "string" &&
-    typeof candidate.buildIterations === "number" &&
-    typeof candidate.consecutiveRejections === "number" &&
+    typeof candidate.buildIterations === "number" && Number.isSafeInteger(candidate.buildIterations) && candidate.buildIterations >= 0 &&
+    typeof candidate.consecutiveRejections === "number" && Number.isSafeInteger(candidate.consecutiveRejections) && candidate.consecutiveRejections >= 0 &&
     Array.isArray(candidate.verdicts) &&
     candidate.verdicts.every(isLifecycleVerdict) &&
+    (candidate.rejectionFingerprints === undefined || (Array.isArray(candidate.rejectionFingerprints) && candidate.rejectionFingerprints.every(isFingerprint))) &&
+    (candidate.buildEvidenceFingerprints === undefined || (Array.isArray(candidate.buildEvidenceFingerprints) && candidate.buildEvidenceFingerprints.every(isFingerprint))) &&
+    (candidate.planFingerprint === undefined || isFingerprint(candidate.planFingerprint)) &&
+    isPendingCheckerVerdict(candidate.pendingCheckerVerdict) &&
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
+    (candidate.routingPolicyVersion === undefined || (typeof candidate.routingPolicyVersion === "string" && candidate.routingPolicyVersion.length > 0)) &&
     (candidate.debugPath === undefined || typeof candidate.debugPath === "string") &&
     (candidate.debugDiagnosisVerdictIndex === undefined ||
       (Number.isInteger(candidate.debugDiagnosisVerdictIndex) && candidate.debugDiagnosisVerdictIndex >= 0)) &&
@@ -360,6 +527,22 @@ function isLifecycleState(value: unknown): value is LifecycleState {
   );
 }
 
+function isPendingCheckerVerdict(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  const phaseMatchesKind = (candidate.phase === "verifying" && candidate.kind === "verify") ||
+    (candidate.phase === "reviewing" && candidate.kind === "review") ||
+    (candidate.phase === "shipping" && candidate.kind === "ship");
+  return phaseMatchesKind && (candidate.verdict === "approve" || candidate.verdict === "reject") &&
+    typeof candidate.reasons === "string" && candidate.reasons.trim().length > 0 &&
+    (candidate.requiredFixes === undefined || (typeof candidate.requiredFixes === "string" && candidate.requiredFixes.trim().length > 0));
+}
+
+function isFingerprint(value: unknown): boolean {
+  return typeof value === "string" && /^[a-f0-9]{16}$/.test(value);
+}
+
 function isLifecycleOriginalModel(value: unknown): boolean {
   if (value === undefined) return true;
   if (!value || typeof value !== "object") return false;
@@ -372,8 +555,24 @@ function isLifecycleFinalization(value: unknown): boolean {
   if (value === undefined) return true;
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
-  return (candidate.commitSha === undefined || typeof candidate.commitSha === "string") &&
-    (candidate.prUrl === undefined || typeof candidate.prUrl === "string");
+  return (candidate.commitSha === undefined || isGitSha(candidate.commitSha)) &&
+    (candidate.commitBaseSha === undefined || isGitSha(candidate.commitBaseSha)) &&
+    (candidate.commitMessage === undefined || (typeof candidate.commitMessage === "string" && candidate.commitMessage.trim().length > 0 && candidate.commitMessage.length <= 200 && !/[\r\n]/.test(candidate.commitMessage))) &&
+    (candidate.prUrl === undefined || isHttpsUrl(candidate.prUrl)) &&
+    (candidate.prHead === undefined || (typeof candidate.prHead === "string" && /^[A-Za-z0-9._/-]{1,255}$/.test(candidate.prHead) && !candidate.prHead.includes("..") && !candidate.prHead.startsWith("-")));
+}
+
+function isGitSha(value: unknown): boolean {
+  return typeof value === "string" && /^[a-f0-9]{7,64}$/i.test(value);
+}
+
+function isHttpsUrl(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function isThinkingLevel(value: unknown): boolean {
@@ -403,7 +602,10 @@ function isRoutingSummary(value: unknown): boolean {
   const candidate = value as Record<string, unknown>;
   return typeof candidate.decisionId === "string" && candidate.decisionId.length > 0 &&
     (candidate.engine === "legacy" || candidate.engine === "capability-shadow" || candidate.engine === "capability") &&
-    typeof candidate.policyVersion === "string" && typeof candidate.taskFeaturesHash === "string" &&
+    typeof candidate.policyVersion === "string" &&
+    (candidate.profileVersion === undefined || typeof candidate.profileVersion === "string") &&
+    typeof candidate.taskFeaturesHash === "string" &&
+    (candidate.phaseEntryKey === undefined || typeof candidate.phaseEntryKey === "string") &&
     Number.isInteger(candidate.selectedRank) && (candidate.selectedRank as number) > 0 &&
     (candidate.score === undefined || typeof candidate.score === "number") &&
     (candidate.separation === "not-applicable" || candidate.separation === "different-model" || candidate.separation === "different-family") &&

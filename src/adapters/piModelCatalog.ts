@@ -11,6 +11,7 @@ export interface PiModelLike {
   contextWindow?: unknown;
   maxTokens?: unknown;
   cost?: unknown;
+  privacy?: unknown;
   thinkingLevelMap?: unknown;
 }
 
@@ -33,6 +34,7 @@ function normalizePiModel(model: PiModelLike): DiscoveredModel {
     input: normalizeInput(model.input),
     contextWindow: nonNegativeInteger(model.contextWindow),
     maxOutputTokens: nonNegativeInteger(model.maxTokens),
+    ...(normalizePrivacy(model.privacy) ? { privacy: normalizePrivacy(model.privacy) } : {}),
   };
   const cost = normalizeCost(model.cost);
   return cost ? { ...normalized, cost } : normalized;
@@ -51,6 +53,10 @@ function normalizeInput(value: unknown): ("text" | "image")[] {
   if (!Array.isArray(value)) return ["text"];
   const result = value.filter((item): item is "text" | "image" => item === "text" || item === "image");
   return [...new Set(result.length > 0 ? result : ["text"] as const)];
+}
+
+function normalizePrivacy(value: unknown): DiscoveredModel["privacy"] {
+  return value === "local" || value === "private" || value === "public" || value === "unknown" ? value : undefined;
 }
 
 function normalizeCost(value: unknown): ModelCost | undefined {

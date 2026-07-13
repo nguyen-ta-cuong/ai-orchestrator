@@ -4,6 +4,7 @@ export type RoutingStage = "define" | "plan" | "build" | "verify" | "debug" | "r
 export type TaskRisk = "low" | "medium" | "high";
 export type ProfileProvenance = "user" | "project" | "builtin" | "observed" | "inferred";
 export type RoutingMode = "quality" | "balanced" | "economy" | "pinned" | "custom";
+export type ModelPrivacy = "local" | "private" | "public" | "unknown";
 
 export interface ModelCost {
   input: number;
@@ -25,6 +26,7 @@ export interface DiscoveredModel {
   contextWindow: number;
   maxOutputTokens: number;
   cost?: ModelCost;
+  privacy?: ModelPrivacy;
 }
 
 export interface ModelCapabilityScores {
@@ -98,6 +100,11 @@ export interface RoutingPolicy {
   unknownCostPenaltyBasisPoints: number;
   confidenceBonusBasisPoints: number;
   costPenaltyBasisPointsPerUsd: number;
+  privacy: {
+    allowed: readonly Exclude<ModelPrivacy, "unknown">[];
+    allowUnknown: boolean;
+    providers: Readonly<Record<string, ModelPrivacy>>;
+  };
   deny: {
     providers: readonly string[];
     models: readonly string[];
@@ -132,7 +139,7 @@ export interface RoutingRequest {
 }
 
 export interface ScoreComponent {
-  name: "capability-fit" | "profile-confidence" | "provider-diversity" | "estimated-cost" | "unknown-cost";
+  name: "capability-fit" | "task-feature-fit" | "profile-confidence" | "provider-diversity" | "estimated-cost" | "unknown-cost";
   value: number;
   detail: string;
 }
@@ -140,6 +147,8 @@ export interface ScoreComponent {
 export interface RankedModelCandidate {
   identity: ModelSelectionIdentity;
   thinking: ThinkingLevel;
+  requestedThinking: ThinkingLevel;
+  thinkingReason: string;
   score: number;
   scoreBreakdown: readonly ScoreComponent[];
   profile: Pick<ResolvedModelProfile, "confidence" | "provenance" | "version">;
@@ -161,6 +170,7 @@ export type ExclusionCode =
   | "reasoning-required"
   | "cost-unknown"
   | "cost-limit-exceeded"
+  | "privacy-not-allowed"
   | "same-builder-model"
   | "same-builder-family";
 
@@ -240,6 +250,7 @@ export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   unknownCostPenaltyBasisPoints: 750,
   confidenceBonusBasisPoints: 500,
   costPenaltyBasisPointsPerUsd: 100,
+  privacy: { allowed: ["local", "private", "public"], allowUnknown: true, providers: {} },
   deny: { providers: [], models: [], families: [] },
   separation: {
     checkerMustDifferFromBuilder: true,
@@ -307,6 +318,8 @@ export function rankModels(request: RoutingRequest): RoutingDecision {
     eligible.push({
       identity: rankedIdentity,
       thinking: thinking.selected,
+      requestedThinking: thinking.requested,
+      thinkingReason: thinking.reason,
       score: scoreBreakdown.reduce((sum, component) => sum + component.value, 0),
       scoreBreakdown,
       profile: { confidence: profile.confidence, provenance: profile.provenance, version: profile.version },
@@ -314,7 +327,7 @@ export function rankModels(request: RoutingRequest): RoutingDecision {
     });
   }
 
-  eligible.sort((left, right) => compareCandidates(left, right, request.policy.stages[request.stage].prefer));
+  eligible.sort((left, right) => compareCandidates(left, right, request.policy, request.stage));
   return {
     stage: request.stage,
     policyVersion: request.policy.version,
@@ -381,12 +394,21 @@ function exclusionFor(
   const identityText = `${model.provider}/${model.model}`;
 
   if (!model.callable) return excluded("not-callable", `${identityText} is not callable on this surface`);
+  const privacy = model.privacy ?? policy.privacy.providers[model.provider] ?? "unknown";
+  if ((privacy === "unknown" && !policy.privacy.allowUnknown) ||
+    (privacy !== "unknown" && !policy.privacy.allowed.includes(privacy))) {
+    return excluded("privacy-not-allowed", `${identityText} privacy class ${privacy} is not allowed by policy`);
+  }
   if (policy.deny.providers.includes(model.provider)) return excluded("denied-provider", `provider ${model.provider} is denied by policy`);
   if (policy.deny.models.includes(identityText)) return excluded("denied-model", `${identityText} is denied by policy`);
   const family = profile?.family ?? model.family;
   if (family && policy.deny.families.includes(family)) return excluded("denied-family", `family ${family} is denied by policy`);
-  if ((policy.mode === "pinned" || stage.pins.length > 0) && !stage.pins.includes(identityText)) {
-    return excluded("pinned-only", `${identityText} is not pinned for ${request.stage}`);
+  const builder = latestBuildSelection(request.priorSelections);
+  if (builder && CHECKER_STAGES.has(request.stage) && modelIdentityKey(builder) === modelIdentityKey(model)) {
+    return excluded("same-builder-model", `${identityText} is the BUILD model and cannot check its own work`);
+  }
+  if ((policy.mode === "pinned" || stage.pins.length > 0) && !stage.pins.some((selector) => selectorMatches(selector, identityText, family))) {
+    return excluded("pinned-only", `${identityText}${family ? ` (family ${family})` : ""} is not pinned for ${request.stage}`);
   }
   if (!profile) return excluded("profile-unknown", `${identityText} has no explicit profile and inferred profiles are disabled`);
   if (profile.confidence < stage.minimumProfileConfidence) {
@@ -411,11 +433,7 @@ function exclusionFor(
     return excluded("cost-limit-exceeded", `${identityText} estimated cost $${estimatedCost.toFixed(4)} exceeds $${policy.limits.maxEstimatedUsdPerRun}`);
   }
 
-  const builder = request.priorSelections.find((selection) => selection.stage === "build");
   if (builder && CHECKER_STAGES.has(request.stage)) {
-    if (policy.separation.checkerMustDifferFromBuilder && modelIdentityKey(builder) === modelIdentityKey(model)) {
-      return excluded("same-builder-model", `${identityText} is the BUILD model and cannot check its own work`);
-    }
     if (policy.separation.requireDifferentProviderFamilyFor.includes(request.stage)) {
       if (!family || !builder.family || family === builder.family) {
         return excluded("same-builder-family", `${identityText} does not prove a family distinct from BUILD`);
@@ -436,16 +454,19 @@ function scoreModel(
   const capabilityFit = totalWeight === 0
     ? 0
     : Math.round(weights.reduce((sum, [name, weight]) => sum + profile.scores[name] * weight, 0) / totalWeight);
+  const taskFeatureFit = scoreTaskFeatureFit(profile.scores, request.task);
   const confidence = Math.round(profile.confidence * request.policy.confidenceBonusBasisPoints / 10_000);
-  const builder = request.priorSelections.find((selection) => selection.stage === "build");
+  const builder = latestBuildSelection(request.priorSelections);
   const family = profile.family ?? model.family;
   const diversity = builder && request.policy.separation.preferDifferentProviderFamily && family && builder.family && family !== builder.family ? 250 : 0;
+  const modeCostMultiplier = request.policy.mode === "quality" ? 0.25 : 1;
   const cost = estimatedCostUsd === undefined
-    ? request.policy.unknownCost === "penalize" ? -request.policy.unknownCostPenaltyBasisPoints : 0
-    : -Math.round(estimatedCostUsd * request.policy.costPenaltyBasisPointsPerUsd);
+    ? request.policy.unknownCost === "penalize" ? -Math.round(request.policy.unknownCostPenaltyBasisPoints * modeCostMultiplier) : 0
+    : -Math.round(estimatedCostUsd * request.policy.costPenaltyBasisPointsPerUsd * modeCostMultiplier);
 
   return [
     { name: "capability-fit", value: capabilityFit, detail: `weighted ${request.stage} capability fit` },
+    { name: "task-feature-fit", value: taskFeatureFit, detail: `fit for ${request.task.workKind}, risk, scale, and failure signals` },
     { name: "profile-confidence", value: confidence, detail: `profile confidence ${profile.confidence}` },
     { name: "provider-diversity", value: diversity, detail: diversity > 0 ? "different family from BUILD" : "no diversity bonus" },
     {
@@ -456,15 +477,56 @@ function scoreModel(
   ];
 }
 
+function scoreTaskFeatureFit(scores: ModelCapabilityScores, task: TaskFeatures): number {
+  const relevant: number[] = [];
+  const byWorkKind: Record<TaskFeatures["workKind"], readonly CapabilityName[]> = {
+    feature: ["architecture", "coding"],
+    "bug-fix": ["debugging", "coding"],
+    refactor: ["architecture", "coding", "review"],
+    migration: ["architecture", "longContext", "review"],
+    "test-only": ["verification", "structuredOutput"],
+    documentation: ["requirements", "longContext"],
+    configuration: ["architecture", "review"],
+    release: ["release", "review"],
+    unknown: [],
+  };
+  for (const capability of byWorkKind[task.workKind]) relevant.push(scores[capability]);
+  if (task.risk === "high" || task.riskSignals.length > 0) relevant.push(scores.review, scores.verification);
+  if (task.failureSignals.length > 0) relevant.push(scores.debugging, scores.verification);
+  if (task.fileCount >= 10 || task.contextTokens >= 64_000) relevant.push(scores.longContext, scores.architecture);
+  if (task.languages.length > 1) relevant.push(scores.longContext);
+  return relevant.length === 0 ? 0 : Math.round(relevant.reduce((sum, value) => sum + value, 0) / relevant.length / 5);
+}
+
+function latestBuildSelection(selections: readonly ModelSelectionIdentity[]): ModelSelectionIdentity | undefined {
+  return [...selections].reverse().find((selection) => selection.stage === "build");
+}
+
 function estimateCost(model: DiscoveredModel, task: TaskFeatures): number | undefined {
   if (!model.cost) return undefined;
   return (task.contextTokens * model.cost.input + task.expectedOutputTokens * model.cost.output) / 1_000_000;
 }
 
-function compareCandidates(left: RankedModelCandidate, right: RankedModelCandidate, prefer: readonly string[]): number {
+function compareCandidates(
+  left: RankedModelCandidate,
+  right: RankedModelCandidate,
+  policy: RoutingPolicy,
+  stage: RoutingStage,
+): number {
+  const stagePolicy = policy.stages[stage];
+  if (stagePolicy.pins.length > 0) {
+    const leftPinned = selectorIndex(left.identity, stagePolicy.pins);
+    const rightPinned = selectorIndex(right.identity, stagePolicy.pins);
+    if (leftPinned !== rightPinned) return leftPinned - rightPinned;
+  }
+  if (policy.mode === "economy") {
+    const leftCost = left.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
+    const rightCost = right.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
+    if (leftCost !== rightCost) return leftCost - rightCost;
+  }
   if (right.score !== left.score) return right.score - left.score;
-  const leftPreferred = preferIndex(left.identity, prefer);
-  const rightPreferred = preferIndex(right.identity, prefer);
+  const leftPreferred = selectorIndex(left.identity, stagePolicy.prefer);
+  const rightPreferred = selectorIndex(right.identity, stagePolicy.prefer);
   if (leftPreferred !== rightPreferred) return leftPreferred - rightPreferred;
   if (right.profile.confidence !== left.profile.confidence) return right.profile.confidence - left.profile.confidence;
   const leftCost = left.estimatedCostUsd ?? Number.POSITIVE_INFINITY;
@@ -475,9 +537,14 @@ function compareCandidates(left: RankedModelCandidate, right: RankedModelCandida
   return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
 }
 
-function preferIndex(identity: ModelSelectionIdentity, prefer: readonly string[]): number {
-  const index = prefer.indexOf(`${identity.provider}/${identity.model}`);
+function selectorIndex(identity: ModelSelectionIdentity, selectors: readonly string[]): number {
+  const identityText = `${identity.provider}/${identity.model}`;
+  const index = selectors.findIndex((selector) => selectorMatches(selector, identityText, identity.family));
   return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+}
+
+function selectorMatches(selector: string, identity: string, family: string | undefined): boolean {
+  return selector === identity || (family !== undefined && selector === `family:${family}`);
 }
 
 function identityFor(stage: RoutingStage | undefined, model: DiscoveredModel): ModelSelectionIdentity {

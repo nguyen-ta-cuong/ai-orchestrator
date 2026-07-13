@@ -22,6 +22,9 @@ export interface RoutingEvidenceEvent {
   profileVersion: string;
   task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
   selected: EvidenceModelIdentity;
+  durationMs?: EvidenceNumber;
+  fallbackCount?: number;
+  rejectionCategory?: string;
   fallback?: {
     from: EvidenceModelIdentity;
     reason: "unavailable" | "unconfigured" | "selection-failed" | "policy-mismatch";
@@ -126,6 +129,8 @@ export function validateRoutingEvidenceEvent(value: unknown): RoutingEvidenceVal
   const forbidden = findDisallowedKey(value);
   if (forbidden) return { ok: false, error: `routing evidence contains disallowed field ${forbidden}` };
   if (!isRecord(value)) return { ok: false, error: "routing evidence event must be an object" };
+  const unexpected = unexpectedEvidenceField(value);
+  if (unexpected) return { ok: false, error: `routing evidence contains unexpected field ${unexpected}` };
   if (value.version !== 1) return { ok: false, error: "routing evidence event version must be 1" };
   for (const key of ["eventId", "runId", "decisionId", "recordedAt", "policyVersion", "profileVersion"] as const) {
     if (typeof value[key] !== "string" || value[key].length === 0) return { ok: false, error: `${key} must be a non-empty string` };
@@ -134,6 +139,9 @@ export function validateRoutingEvidenceEvent(value: unknown): RoutingEvidenceVal
     return { ok: false, error: "stage must be a routing stage" };
   }
   if (!isModelIdentity(value.selected)) return { ok: false, error: "selected model identity is invalid" };
+  if (value.durationMs !== undefined && !isEvidenceNumber(value.durationMs)) return { ok: false, error: "durationMs is invalid" };
+  if (value.fallbackCount !== undefined && (!Number.isInteger(value.fallbackCount) || (value.fallbackCount as number) < 0)) return { ok: false, error: "fallbackCount is invalid" };
+  if (value.rejectionCategory !== undefined && (typeof value.rejectionCategory !== "string" || value.rejectionCategory.length === 0)) return { ok: false, error: "rejectionCategory is invalid" };
   if (!isUsage(value.usage)) return { ok: false, error: "usage is invalid" };
   if (!isCost(value.cost)) return { ok: false, error: "cost is invalid" };
   if (!isTaskSummary(value.task)) return { ok: false, error: "task summary is invalid" };
@@ -157,10 +165,23 @@ export function recommendRoutingPolicyChanges(
   options: { minimumSamples?: number } = {},
 ): RoutingPolicyRecommendation[] {
   const minimumSamples = options.minimumSamples ?? 10;
-  const groups = new Map<string, RoutingEvidenceEvent[]>();
+  const finalStatusByRun = new Map<string, RoutingEvidenceFinalStatus>();
   for (const event of events) {
-    if (event.outcome.type !== "stage-ended") continue;
-    const key = `${event.stage}\u0000${event.task.workKind}\u0000${event.task.risk}`;
+    if (event.outcome.type === "final-status" && event.outcome.finalRunStatus) {
+      finalStatusByRun.set(event.runId, event.outcome.finalRunStatus);
+    }
+  }
+  const latestByDecision = new Map<string, RoutingEvidenceEvent>();
+  for (const event of events) {
+    if (event.outcome.type !== "stage-ended" && event.outcome.type !== "human-override") continue;
+    const previous = latestByDecision.get(event.decisionId);
+    if (!previous || event.recordedAt >= previous.recordedAt || event.outcome.laterReversal || event.outcome.humanOverride) {
+      latestByDecision.set(event.decisionId, event);
+    }
+  }
+  const groups = new Map<string, RoutingEvidenceEvent[]>();
+  for (const event of latestByDecision.values()) {
+    const key = `${event.stage}\u0000${event.task.workKind}\u0000${event.task.risk}\u0000${event.policyVersion}\u0000${event.profileVersion}`;
     const group = groups.get(key) ?? [];
     group.push(event);
     groups.set(key, group);
@@ -169,34 +190,37 @@ export function recommendRoutingPolicyChanges(
   const recommendations: RoutingPolicyRecommendation[] = [];
   for (const [key, group] of groups) {
     if (group.length < minimumSamples) continue;
-    const [stage, workKind, risk] = key.split("\u0000") as [RoutingStage, string, string];
-    const modelStats = new Map<string, { model: EvidenceModelIdentity; count: number; approvals: number; cost: number }>();
+    const [stage, workKind, risk] = key.split("\u0000") as [RoutingStage, string, string, string, string];
+    const modelStats = new Map<string, { model: EvidenceModelIdentity; count: number; successes: number; reversals: number; overrides: number; cost: number }>();
     for (const event of group) {
       const identity = identityKey(event.selected);
-      const stats = modelStats.get(identity) ?? { model: event.selected, count: 0, approvals: 0, cost: 0 };
+      const stats = modelStats.get(identity) ?? { model: event.selected, count: 0, successes: 0, reversals: 0, overrides: 0, cost: 0 };
       stats.count += 1;
-      if (event.outcome.verdict === "approve" || event.outcome.finalRunStatus === "done") stats.approvals += 1;
+      if (event.outcome.laterReversal) stats.reversals += 1;
+      if (event.outcome.humanOverride) stats.overrides += 1;
+      const initiallySuccessful = event.outcome.verdict === "approve" || event.outcome.finalRunStatus === "done" || finalStatusByRun.get(event.runId) === "done";
+      if (initiallySuccessful && !event.outcome.laterReversal && !event.outcome.humanOverride) stats.successes += 1;
       if (typeof event.cost.observedUsd === "number") stats.cost += event.cost.observedUsd;
       modelStats.set(identity, stats);
     }
     const ranked = [...modelStats.values()].sort((left, right) => {
-      const leftRate = left.approvals / left.count;
-      const rightRate = right.approvals / right.count;
+      const leftRate = left.successes / left.count;
+      const rightRate = right.successes / right.count;
       if (rightRate !== leftRate) return rightRate - leftRate;
       return left.cost / left.count - right.cost / right.count;
     });
     const best = ranked[0];
     const second = ranked[1];
     if (!best || !second) continue;
-    const bestRate = best.approvals / best.count;
-    const secondRate = second.approvals / second.count;
+    const bestRate = best.successes / best.count;
+    const secondRate = second.successes / second.count;
     if (bestRate - secondRate < 0.15) continue;
     recommendations.push({
       stage,
       taskCategory: `${workKind}/${risk}`,
       sampleCount: group.length,
       uncertainty: `simple approval-rate band: ${Math.round(bestRate * 100)}% vs ${Math.round(secondRate * 100)}% across ${group.length} samples`,
-      downstreamEvidence: `${best.approvals}/${best.count} downstream approvals or completions for ${identityKey(best.model)}`,
+      downstreamEvidence: `${best.successes}/${best.count} non-reversed, non-overridden downstream successes for ${identityKey(best.model)}; ${best.reversals} reversals; ${best.overrides} human overrides`,
       expectedTradeoff: `Prefer ${identityKey(best.model)}; average observed cost $${averageCost(best).toFixed(4)} versus $${averageCost(second).toFixed(4)} for next ranked observed model.`,
       recommendedChange: { kind: "prefer-model", provider: best.model.provider, model: best.model.model },
       rollback: `Remove ${identityKey(best.model)} from routing.stages.${stage}.prefer or restore the previous user config version.`,
@@ -303,6 +327,34 @@ function isOutcome(value: unknown): boolean {
 
 function isEvidenceNumber(value: unknown): value is EvidenceNumber {
   return value === "unknown" || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
+function unexpectedEvidenceField(value: Record<string, unknown>): string | undefined {
+  const top = unexpectedKey(value, ["version", "eventId", "runId", "decisionId", "stage", "recordedAt", "policyVersion", "profileVersion", "task", "selected", "durationMs", "fallbackCount", "rejectionCategory", "fallback", "usage", "cost", "outcome"]);
+  if (top) return top;
+  const nested: Array<[unknown, readonly string[], string]> = [
+    [value.task, ["workKind", "risk", "languages", "fileCount"], "task"],
+    [value.selected, ["provider", "model", "family"], "selected"],
+    [value.usage, ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"], "usage"],
+    [value.cost, ["estimatedUsd", "observedUsd"], "cost"],
+    [value.outcome, ["type", "structuredToolCompliance", "verdict", "laterReversal", "buildIteration", "humanOverride", "finalRunStatus"], "outcome"],
+  ];
+  if (value.fallback !== undefined) nested.push([value.fallback, ["from", "reason"], "fallback"]);
+  for (const [candidate, keys, prefix] of nested) {
+    if (!isRecord(candidate)) continue;
+    const extra = unexpectedKey(candidate, keys);
+    if (extra) return `${prefix}.${extra}`;
+  }
+  if (isRecord(value.fallback) && isRecord(value.fallback.from)) {
+    const extra = unexpectedKey(value.fallback.from, ["provider", "model", "family"]);
+    if (extra) return `fallback.from.${extra}`;
+  }
+  return undefined;
+}
+
+function unexpectedKey(value: Record<string, unknown>, allowed: readonly string[]): string | undefined {
+  const allowedSet = new Set(allowed);
+  return Object.keys(value).find((key) => !allowedSet.has(key));
 }
 
 function identityKey(identity: EvidenceModelIdentity): string {

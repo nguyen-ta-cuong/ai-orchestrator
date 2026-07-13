@@ -1,4 +1,5 @@
 import type { OrchestratorConfig, RoleConfig } from "../src/core/config.js";
+import { estimateRoutingStageCost } from "../src/core/routingBudget.js";
 import {
   rankModels,
   type DiscoveredModel,
@@ -92,13 +93,7 @@ export function resolveMcpRoute(input: {
   const { config, stage, role } = input;
   const familySeparationRequired = stage === "fast-judge"
     && config.routing.separation.requireDifferentProviderFamilyFor.includes("fast-judge");
-  const strict = stage === "fast-judge"
-    && config.routing.engine === "capability"
-    && (
-      config.routing.circuitBreakers.requireIndependentChecker
-      || config.routing.separation.checkerMustDifferFromBuilder
-      || familySeparationRequired
-    );
+  const strict = stage === "fast-judge";
   const builder = input.coderIdentity ? resolveBuilderIdentity(config, parseIdentity(input.coderIdentity)) : undefined;
   if (strict && !builder && !input.preview) {
     throw new Error("Strict maker/checker separation requires coderIdentity for orchestrator_judge");
@@ -106,8 +101,12 @@ export function resolveMcpRoute(input: {
 
   // Capability-shadow is observational on every surface. Active planner/judge
   // calls keep the exact legacy role while orchestrator_models exposes ranking.
+  if (!input.preview && config.routing.engine === "capability" && config.mcp.models.length === 0) {
+    throw new Error(`No trusted MCP model catalog is configured for active capability routing at ${stage}`);
+  }
   if ((!input.preview && config.routing.engine !== "capability") || config.mcp.models.length === 0) {
     const exact = completionCandidateForRole(config, config.roles[role], input.task.expectedOutputTokens);
+    enforceExactRouteSafety(config, exact, input.task, input.preview === true);
     const separation = separationFor(strict, familySeparationRequired, builder, exact);
     if (!input.preview && !separation.satisfied) {
       throw new Error(`Strict maker/checker separation failed: ${separation.reason}`);
@@ -191,6 +190,7 @@ function normalizeCatalog(
       contextWindow: entry.contextWindow,
       maxOutputTokens: Math.min(entry.maxOutputTokens, providerOutputLimit(provider?.api)),
       ...(entry.cost ? { cost: entry.cost } : {}),
+      ...(entry.privacy ? { privacy: entry.privacy } : {}),
     };
   });
 }
@@ -221,6 +221,41 @@ function boundedFallbackPrefix(
     cumulativeKnownCost = nextKnownCost;
   }
   return result;
+}
+
+function enforceExactRouteSafety(
+  config: OrchestratorConfig,
+  candidate: McpCompletionCandidate,
+  task: TaskFeatures,
+  preview: boolean,
+): void {
+  const identity = `${candidate.provider}/${candidate.model}`;
+  const provider = config.mcp.providers[candidate.provider];
+  const catalog = config.mcp.models.find((entry) => entry.provider === candidate.provider && entry.model === candidate.model);
+  const privacy = catalog?.privacy ?? config.routing.privacy.providers[candidate.provider] ?? "unknown";
+  const denied = !provider || !SUPPORTED_APIS.has(provider.api) || (!preview && !provider.apiKey) ||
+    config.routing.deny.providers.includes(candidate.provider) || config.routing.deny.models.includes(identity) ||
+    (candidate.family !== undefined && config.routing.deny.families.includes(candidate.family)) ||
+    (privacy === "unknown" ? !config.routing.privacy.allowUnknown : !config.routing.privacy.allowed.includes(privacy));
+  if (denied) throw new Error(`Exact MCP route ${identity} is unavailable or denied by hard routing policy`);
+
+  const estimate = estimateRoutingStageCost({ task, model: { cost: catalog?.cost }, thinking: candidate.thinking });
+  if (estimate.status === "unknown") {
+    if (!config.routing.budgets.allowUnknownCost || config.routing.unknownCost === "exclude") {
+      throw new Error(`Exact MCP route ${identity} has unknown cost and policy fails closed`);
+    }
+    return;
+  }
+  const ceiling = Math.min(
+    config.routing.limits.maxEstimatedUsdPerRun,
+    config.routing.budgets.maxEstimatedUsdPerStage,
+    config.routing.budgets.maxEstimatedUsdPerRun,
+    config.routing.budgets.maxEstimatedUsdPerDay,
+  );
+  if (estimate.estimatedUsd > ceiling) {
+    throw new Error(`Exact MCP route ${identity} estimated cost $${estimate.estimatedUsd.toFixed(4)} exceeds $${ceiling.toFixed(4)}`);
+  }
+  candidate.estimatedCostUsd = estimate.estimatedUsd;
 }
 
 function completionCandidateForRanked(

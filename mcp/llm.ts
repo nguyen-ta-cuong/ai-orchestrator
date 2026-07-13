@@ -23,6 +23,7 @@ export interface RoutedCompletionResult {
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+const MAX_LLM_RESPONSE_BYTES = 2 * 1024 * 1024;
 const ANTHROPIC_DEFAULT_MAX_TOKENS = 8192;
 const ANTHROPIC_MAX_THINKING_MAX_TOKENS = 16384;
 let fakeLlmWarningPrinted = false;
@@ -106,6 +107,7 @@ function sanitizeError(error: unknown, secrets: string[]): string {
   if (message.startsWith("Missing API key")) return "MCP provider API key is missing";
   if (message.startsWith("Unsupported MCP provider API")) return "MCP provider API is unsupported";
   if (message.includes("returned an empty completion")) return "LLM provider returned an empty completion";
+  if (message.includes("response exceeded")) return "LLM response exceeded the size limit";
   return "MCP candidate failed";
 }
 
@@ -126,15 +128,16 @@ function fakeCompletion(role: ModelRole): string {
 }
 
 async function anthropicMessages(baseUrl: string, apiKey: string, role: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
+  const allocation = anthropicTokenAllocation(role);
   const json = await postJson(endpoint(baseUrl, "/messages"), {
     "content-type": "application/json",
     "x-api-key": apiKey,
     "anthropic-version": "2023-06-01",
   }, {
     model: role.model,
-    max_tokens: completionTokenLimit(role, anthropicMaxTokens(role.thinking)),
+    max_tokens: allocation.maxTokens,
     messages: [{ role: "user", content: prompt }],
-    ...anthropicThinking(role.thinking, completionTokenLimit(role, anthropicMaxTokens(role.thinking))),
+    ...(allocation.thinkingBudget > 0 ? { thinking: { type: "enabled", budget_tokens: allocation.thinkingBudget } } : {}),
   }, signal, [apiKey]);
   const response = json as { content?: Array<{ type?: string; text?: string }>; stop_reason?: string };
   if (response.stop_reason === "max_tokens") {
@@ -205,7 +208,7 @@ async function postJson(
   const timeout = withTimeout(signal, DEFAULT_LLM_TIMEOUT_MS);
   try {
     const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: timeout.signal, redirect: "error" });
-    const text = await response.text();
+    const text = await readBoundedResponseText(response);
     if (!response.ok) {
       throw new Error(
         `LLM request failed (${response.status} ${response.statusText}): ${redactSecrets(text, secrets).slice(0, 1000)}`,
@@ -228,6 +231,31 @@ async function postJson(
   } finally {
     timeout.cleanup();
   }
+}
+
+async function readBoundedResponseText(response: Response): Promise<string> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_LLM_RESPONSE_BYTES) {
+    await response.body?.cancel();
+    throw new Error(`LLM response exceeded ${MAX_LLM_RESPONSE_BYTES} bytes`);
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_LLM_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new Error(`LLM response exceeded ${MAX_LLM_RESPONSE_BYTES} bytes`);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
 }
 
 function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): {
@@ -290,9 +318,11 @@ function openaiEffort(thinking: ThinkingLevel): "minimal" | "low" | "medium" | "
   return thinking === "minimal" ? "minimal" : thinking === "low" ? "low" : thinking === "medium" ? "medium" : "high";
 }
 
-function anthropicThinking(thinking: ThinkingLevel, maxTokens: number): Record<string, unknown> {
-  if (thinking === "off" || thinking === "minimal" || thinking === "low") {
-    return {};
+function anthropicTokenAllocation(role: McpCompletionCandidate): { maxTokens: number; thinkingBudget: number } {
+  const totalLimit = Math.max(1, Math.min(role.maxOutputTokens ?? anthropicMaxTokens(role.thinking), anthropicMaxTokens(role.thinking)));
+  const requestedVisible = Math.max(1, Math.min(role.requestedOutputTokens ?? Math.min(4_096, totalLimit), totalLimit));
+  if (role.thinking === "off" || role.thinking === "minimal" || role.thinking === "low") {
+    return { maxTokens: requestedVisible, thinkingBudget: 0 };
   }
   const budgetByLevel: Record<ThinkingLevel, number> = {
     off: 0,
@@ -303,7 +333,9 @@ function anthropicThinking(thinking: ThinkingLevel, maxTokens: number): Record<s
     xhigh: 4096,
     max: 8192,
   };
-  return { thinking: { type: "enabled", budget_tokens: Math.min(budgetByLevel[thinking], Math.max(1, maxTokens - 1)) } };
+  const availableThinking = Math.max(0, totalLimit - requestedVisible);
+  const thinkingBudget = availableThinking >= 1_024 ? Math.min(budgetByLevel[role.thinking], availableThinking) : 0;
+  return { maxTokens: requestedVisible + thinkingBudget, thinkingBudget };
 }
 
 function completionTokenLimit(role: McpCompletionCandidate, apiLimit: number): number {

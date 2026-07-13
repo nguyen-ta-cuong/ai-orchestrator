@@ -42,6 +42,7 @@ export interface McpModelConfig {
   contextWindow: number;
   maxOutputTokens: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  privacy?: "local" | "private" | "public" | "unknown";
   /** Key in routing.profiles. Defaults to provider/model. */
   profile?: string;
 }
@@ -113,6 +114,7 @@ type ConfigPatch = Partial<{
   routing: Partial<CapabilityRoutingConfig> & {
     lifecycle?: Partial<{ enabled: boolean; stages: Partial<Record<LifecycleRoutedStage, ModelCandidate[]>> }>;
     deny?: Partial<RoutingPolicy["deny"]>;
+    privacy?: Partial<RoutingPolicy["privacy"]>;
     separation?: Partial<RoutingPolicy["separation"]>;
     limits?: Partial<RoutingPolicy["limits"]>;
     evidence?: Partial<RoutingEvidenceConfig>;
@@ -257,11 +259,13 @@ export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions
   const userMerged = deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders));
   validateConfig(cloneConfig(userMerged));
   const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
+  validateConfig(deepMerge(cloneConfig(userMerged), cloneConfig(projectPatch)));
+  constrainProjectExecutionSafetyPatch(projectPatch, userMerged);
   if (options.ignoreProjectMcpProviders) {
     constrainProjectMcpRoles(projectPatch);
     if (projectPatch.routing) constrainProjectMcpRoutingPatch(projectPatch.routing);
   }
-  const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing));
+  const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing, userConfig.routing));
 
   return {
     config: interpolateMcpApiKeys(validateConfig(merged)),
@@ -389,6 +393,11 @@ function validateConfig(value: unknown): OrchestratorConfig {
       throw new Error(`mcp.providers.${providerName}.apiKey must be a string when provided`);
     }
   }
+  for (const [index, model] of (mcp.models as McpModelConfig[]).entries()) {
+    if (!Object.hasOwn(providers, model.provider)) {
+      throw new Error(`mcp.models[${index}].provider must reference mcp.providers.${model.provider}`);
+    }
+  }
 
   return config as unknown as OrchestratorConfig;
 }
@@ -396,12 +405,21 @@ function validateConfig(value: unknown): OrchestratorConfig {
 function validateCapabilityRouting(routing: Record<string, unknown>): void {
   requireStringEnum(routing.engine, "routing.engine", ["legacy", "capability-shadow", "capability"] as const);
   requireStringEnum(routing.mode, "routing.mode", ["quality", "balanced", "economy", "pinned", "custom"] as const);
-  requireNonEmptyString(routing.version, "routing.version");
+  requireMetadataToken(routing.version, "routing.version");
   requireBoolean(routing.allowInferredProfiles, "routing.allowInferredProfiles");
   requireStringEnum(routing.unknownCost, "routing.unknownCost", ["exclude", "penalize", "allow"] as const);
   requireNonNegativeInteger(routing.unknownCostPenaltyBasisPoints, "routing.unknownCostPenaltyBasisPoints");
   requireNonNegativeInteger(routing.confidenceBonusBasisPoints, "routing.confidenceBonusBasisPoints");
   requireNonNegativeNumber(routing.costPenaltyBasisPointsPerUsd, "routing.costPenaltyBasisPointsPerUsd");
+
+  const privacy = requirePlainObject(routing.privacy, "routing.privacy");
+  requireEnumArray(privacy.allowed, "routing.privacy.allowed", ["local", "private", "public"] as const);
+  requireBoolean(privacy.allowUnknown, "routing.privacy.allowUnknown");
+  const privacyProviders = requirePlainObject(privacy.providers, "routing.privacy.providers");
+  for (const [provider, value] of Object.entries(privacyProviders)) {
+    requireNonEmptyString(provider, "routing.privacy.providers key");
+    requireStringEnum(value, `routing.privacy.providers.${provider}`, ["local", "private", "public", "unknown"] as const);
+  }
 
   const deny = requirePlainObject(routing.deny, "routing.deny");
   requireStringArray(deny.providers, "routing.deny.providers");
@@ -451,12 +469,12 @@ function validateCapabilityRouting(routing: Record<string, unknown>): void {
       throw new Error("routing.profiles keys must be non-empty provider/model identities");
     }
     const profile = requirePlainObject(value, `routing.profiles.${identity}`);
-    if (profile.family !== undefined) requireNonEmptyString(profile.family, `routing.profiles.${identity}.family`);
+    if (profile.family !== undefined) requireMetadataToken(profile.family, `routing.profiles.${identity}.family`);
     requireBasisPoints(profile.confidence, `routing.profiles.${identity}.confidence`);
     if (profile.provenance !== undefined) {
       requireStringEnum(profile.provenance, `routing.profiles.${identity}.provenance`, ["user", "project", "builtin", "observed", "inferred"] as const);
     }
-    if (profile.version !== undefined) requireNonEmptyString(profile.version, `routing.profiles.${identity}.version`);
+    if (profile.version !== undefined) requireMetadataToken(profile.version, `routing.profiles.${identity}.version`);
     validateCapabilityValues(profile.scores, `routing.profiles.${identity}.scores`, true);
   }
 }
@@ -510,6 +528,7 @@ function validateMcpModel(value: unknown, path: string): void {
   requirePositiveInteger(model.contextWindow, `${path}.contextWindow`);
   requirePositiveInteger(model.maxOutputTokens, `${path}.maxOutputTokens`);
   if (model.profile !== undefined) requireNonEmptyString(model.profile, `${path}.profile`);
+  if (model.privacy !== undefined) requireStringEnum(model.privacy, `${path}.privacy`, ["local", "private", "public", "unknown"] as const);
   if (model.cost !== undefined) {
     const cost = requirePlainObject(model.cost, `${path}.cost`);
     for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) requireNonNegativeNumber(cost[key], `${path}.cost.${key}`);
@@ -528,6 +547,12 @@ function validateRoleConfig(value: unknown, path: string): void {
 function requireNonEmptyString(value: unknown, path: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+function requireMetadataToken(value: unknown, path: string): void {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:@/-]{1,128}$/.test(value)) {
+    throw new Error(`${path} must be a bounded canonical metadata token`);
   }
 }
 
@@ -633,6 +658,35 @@ function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): 
   return rest;
 }
 
+function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: OrchestratorConfig): void {
+  if (patch.approval) {
+    patch.approval.requirePlanApproval = protectedBoolean(
+      trusted.approval.requirePlanApproval,
+      patch.approval.requirePlanApproval,
+    ) as boolean;
+  }
+  if (patch.judge) {
+    patch.judge.runTests = protectedBoolean(trusted.judge.runTests, patch.judge.runTests) as boolean;
+  }
+  if (patch.loop) {
+    patch.loop.maxCoderIterations = protectedMinimum(trusted.loop.maxCoderIterations, patch.loop.maxCoderIterations) as number;
+    patch.loop.plannerEscalationAfterRejections = protectedMinimum(
+      trusted.loop.plannerEscalationAfterRejections,
+      patch.loop.plannerEscalationAfterRejections,
+    ) as number;
+  }
+  if (patch.build) {
+    patch.build.commitPerTask = protectedPermission(
+      trusted.build.commitPerTask,
+      patch.build.commitPerTask,
+    ) as boolean;
+  }
+  if (patch.ship) {
+    patch.ship.commit = stricterMode<ShipCommitMode>(trusted.ship.commit, patch.ship.commit, ["never", "ask", "auto"]);
+    patch.ship.openPr = stricterMode<ShipOpenPrMode>(trusted.ship.openPr, patch.ship.openPr, ["never", "ask"]);
+  }
+}
+
 function constrainProjectMcpRoles(patch: ConfigPatch): void {
   // Repository config is not trusted to select models that receive user
   // credentials. MCP planner/judge exact routes therefore come only from
@@ -647,7 +701,7 @@ function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routi
   // On MCP the repository may rank/pin within the trusted user catalog and tighten
   // deny/separation/ceilings. It cannot select the engine, invent profiles, relax
   // capability requirements, or alter scoring/cost treatment.
-  const allowed = new Set(["stages", "deny", "separation", "limits", "budgets", "circuitBreakers"]);
+  const allowed = new Set(["stages", "privacy", "deny", "separation", "limits", "budgets", "circuitBreakers"]);
   for (const key of Object.keys(routing)) {
     if (!allowed.has(key)) delete (routing as Record<string, unknown>)[key];
   }
@@ -660,15 +714,76 @@ function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routi
   }
 }
 
-function constrainProjectRoutingPatch(patch: ConfigPatch, userRouting: CapabilityRoutingConfig): ConfigPatch {
+function constrainProjectRoutingPatch(
+  patch: ConfigPatch,
+  userRouting: CapabilityRoutingConfig,
+  explicitUserRouting?: ConfigPatch["routing"],
+): ConfigPatch {
   if (!patch.routing) return patch;
   const routing = cloneConfig(patch.routing) as unknown as Record<string, unknown>;
+  if (explicitUserRouting?.engine !== undefined) routing.engine = userRouting.engine;
+  if (explicitUserRouting?.mode !== undefined) routing.mode = userRouting.mode;
+  routing.allowInferredProfiles = protectedPermission(userRouting.allowInferredProfiles, routing.allowInferredProfiles);
+  routing.unknownCost = stricterMode(userRouting.unknownCost, routing.unknownCost, ["exclude", "penalize", "allow"]);
+  protectStageRequirements(routing, userRouting);
+  protectProfiles(routing, userRouting);
+  protectPrivacy(routing, userRouting);
   protectDenyRules(routing, userRouting);
   protectLimits(routing, userRouting);
   protectBudgets(routing, userRouting);
+  protectEvidence(routing, userRouting);
   protectCircuitBreakers(routing, userRouting);
   protectSeparation(routing, userRouting);
   return { ...patch, routing: routing as unknown as ConfigPatch["routing"] };
+}
+
+function protectStageRequirements(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.stages === undefined) {
+    routing.stages = cloneConfig(userRouting.stages);
+    return;
+  }
+  if (!isPlainObject(routing.stages)) return;
+  for (const stageName of ROUTING_STAGES) {
+    const trusted = userRouting.stages[stageName];
+    const patch = routing.stages[stageName];
+    if (patch === undefined) {
+      routing.stages[stageName] = cloneConfig(trusted);
+      continue;
+    }
+    if (!isPlainObject(patch)) continue;
+    patch.requiredInput = protectedUnion(trusted.requiredInput, patch.requiredInput);
+    patch.minimumContextWindow = protectedMaximum(trusted.minimumContextWindow, patch.minimumContextWindow);
+    patch.minimumOutputTokens = protectedMaximum(trusted.minimumOutputTokens, patch.minimumOutputTokens);
+    patch.requiresReasoning = protectedBoolean(trusted.requiresReasoning, patch.requiresReasoning);
+    patch.minimumProfileConfidence = protectedMaximum(trusted.minimumProfileConfidence, patch.minimumProfileConfidence);
+    patch.thinking = stricterMode(trusted.thinking, patch.thinking, THINKING_LEVELS);
+    patch.minimumScores = protectedCapabilityMinimums(trusted.minimumScores, patch.minimumScores);
+  }
+}
+
+function protectProfiles(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.profiles === undefined) {
+    routing.profiles = cloneConfig(userRouting.profiles);
+    return;
+  }
+  if (!isPlainObject(routing.profiles)) return;
+  for (const [identity, profile] of Object.entries(userRouting.profiles)) {
+    routing.profiles[identity] = cloneConfig(profile);
+  }
+}
+
+function protectPrivacy(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.privacy === undefined) {
+    routing.privacy = cloneConfig(userRouting.privacy);
+    return;
+  }
+  if (!isPlainObject(routing.privacy)) return;
+  const projectAllowed = routing.privacy.allowed;
+  routing.privacy.allowed = Array.isArray(projectAllowed)
+    ? userRouting.privacy.allowed.filter((value) => projectAllowed.includes(value))
+    : projectAllowed ?? [...userRouting.privacy.allowed];
+  routing.privacy.allowUnknown = protectedPermission(userRouting.privacy.allowUnknown, routing.privacy.allowUnknown);
+  routing.privacy.providers = cloneConfig(userRouting.privacy.providers);
 }
 
 function protectDenyRules(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
@@ -720,6 +835,24 @@ function protectBudgets(routing: Record<string, unknown>, userRouting: Capabilit
   }
 }
 
+function protectEvidence(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.evidence === undefined) {
+    routing.evidence = cloneConfig(userRouting.evidence);
+    return;
+  }
+  if (!isPlainObject(routing.evidence)) return;
+  routing.evidence.enabled = protectedPermission(userRouting.evidence.enabled, routing.evidence.enabled);
+  routing.evidence.shadowComparisons = protectedPermission(
+    userRouting.evidence.shadowComparisons,
+    routing.evidence.shadowComparisons,
+  );
+  routing.evidence.minRecommendationSamples = protectedMaximum(
+    userRouting.evidence.minRecommendationSamples,
+    routing.evidence.minRecommendationSamples,
+  );
+  routing.evidence.userStoreDir = userRouting.evidence.userStoreDir;
+}
+
 function protectCircuitBreakers(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
   if (routing.circuitBreakers === undefined) {
     routing.circuitBreakers = cloneConfig(userRouting.circuitBreakers);
@@ -750,10 +883,7 @@ function protectSeparation(routing: Record<string, unknown>, userRouting: Capabi
     return;
   }
   if (!isPlainObject(routing.separation)) return;
-  routing.separation.checkerMustDifferFromBuilder = protectedBoolean(
-    userRouting.separation.checkerMustDifferFromBuilder,
-    routing.separation.checkerMustDifferFromBuilder,
-  );
+  routing.separation.checkerMustDifferFromBuilder = true;
   routing.separation.preferDifferentProviderFamily = protectedBoolean(
     userRouting.separation.preferDifferentProviderFamily,
     routing.separation.preferDifferentProviderFamily,
@@ -770,6 +900,30 @@ function protectedUnion(base: readonly string[], patch: unknown): unknown {
 
 function protectedMinimum(base: number, patch: unknown): unknown {
   return patch === undefined ? base : typeof patch === "number" ? Math.min(base, patch) : patch;
+}
+
+function protectedMaximum(base: number, patch: unknown): unknown {
+  return patch === undefined ? base : typeof patch === "number" ? Math.max(base, patch) : patch;
+}
+
+function protectedCapabilityMinimums(base: Partial<Record<string, number>>, patch: unknown): unknown {
+  if (patch === undefined) return cloneConfig(base);
+  if (!isPlainObject(patch)) return patch;
+  const result = { ...patch };
+  for (const [capability, minimum] of Object.entries(base)) {
+    if (minimum !== undefined) result[capability] = protectedMaximum(minimum, result[capability]);
+  }
+  return result;
+}
+
+function protectedPermission(base: boolean, patch: unknown): unknown {
+  return patch === undefined ? base : typeof patch === "boolean" ? base && patch : patch;
+}
+
+function stricterMode<T extends string>(base: T, patch: unknown, order: readonly T[]): T {
+  if (patch === undefined) return base;
+  if (typeof patch !== "string" || !order.includes(patch as T)) return patch as T;
+  return order[Math.min(order.indexOf(base), order.indexOf(patch as T))]!;
 }
 
 function protectedBoolean(base: boolean, patch: unknown): unknown {

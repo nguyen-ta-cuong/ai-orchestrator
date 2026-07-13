@@ -1,10 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRun } from "../src/lifecycle/artifacts.js";
 import {
+  appendRoutingBudgetLedgerEvent,
   appendRoutingEvidenceEvent,
+  readRoutingBudgetLedger,
   readRoutingEvidenceEvents,
   resolveUserEvidenceRoot,
 } from "../src/lifecycle/routingEvidenceStore.js";
@@ -30,6 +32,7 @@ describe("routing evidence store", () => {
     const event = eventFor(run.runId);
 
     appendRoutingEvidenceEvent({ runPaths: run.paths, event });
+    appendRoutingEvidenceEvent({ runPaths: run.paths, event });
 
     expect(readRoutingEvidenceEvents(run.paths.evidence).events).toEqual([event]);
   });
@@ -46,10 +49,22 @@ describe("routing evidence store", () => {
     expect(existsSync(`${run.paths.evidence}.quarantine`)).toBe(true);
   });
 
+  it("keeps the independent budget ledger strict and idempotent", () => {
+    const home = makeTempDir();
+    const root = resolveUserEvidenceRoot(home, "routing-evidence");
+    const event = { version: 1 as const, eventId: "budget-1", runId: "run-1", recordedAt: new Date().toISOString(), outcome: "stage-started" as const, estimatedUsd: 0.1 };
+    appendRoutingBudgetLedgerEvent(root, event);
+    appendRoutingBudgetLedgerEvent(root, event);
+    expect(readRoutingBudgetLedger(join(root, "budget.jsonl"))).toEqual([event]);
+
+    writeFileSync(join(root, "budget.jsonl"), `${JSON.stringify({ ...event, rawPrompt: "SECRET" })}\n`);
+    expect(() => readRoutingBudgetLedger(join(root, "budget.jsonl"))).toThrow(/corrupt/);
+  });
+
   it("keeps user evidence storage inside the trusted user root", () => {
     const home = makeTempDir();
     const root = resolveUserEvidenceRoot(home, "routing-evidence");
-    expect(root).toBe(join(home, ".ai-orchestrator", "routing-evidence"));
+    expect(root).toBe(join(realpathSync(home), ".ai-orchestrator", "routing-evidence"));
     expect(() => resolveUserEvidenceRoot(home, "../outside")).toThrow(/inside the user ai-orchestrator directory/);
   });
 
@@ -59,7 +74,20 @@ describe("routing evidence store", () => {
     mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
     symlinkSync(outside, join(home, ".ai-orchestrator", "routing-evidence"));
 
-    expect(() => resolveUserEvidenceRoot(home, "routing-evidence")).toThrow(/inside the user ai-orchestrator directory/);
+    expect(() => resolveUserEvidenceRoot(home, "routing-evidence")).toThrow(/must not contain symlinks/);
+  });
+
+  it("rejects a symlinked per-run evidence file", () => {
+    const cwd = makeTempDir();
+    const outside = makeTempDir();
+    const run = createRun(cwd, ".ai-orchestrator/runs", "task");
+    const outsideFile = join(outside, "events.jsonl");
+    writeFileSync(outsideFile, "outside\n");
+    unlinkSync(run.paths.evidence);
+    symlinkSync(outsideFile, run.paths.evidence);
+
+    expect(() => appendRoutingEvidenceEvent({ runPaths: run.paths, event: eventFor(run.runId) })).toThrow(/must not contain symlinks/);
+    expect(readFileSync(outsideFile, "utf8")).toBe("outside\n");
   });
 });
 

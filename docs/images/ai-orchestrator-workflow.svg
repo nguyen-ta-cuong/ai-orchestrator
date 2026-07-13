@@ -1,0 +1,228 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1135" role="img" aria-labelledby="workflow-title workflow-desc">
+  <title id="workflow-title">AI Orchestrator workflow and feature map</title>
+  <desc id="workflow-desc">A visual overview of the Pi and Cursor entry points, the fast Plan Code Judge loop, the durable Define Plan Build Verify Review Ship lifecycle with read-only Debug rejection handling, and the product's routing, separation, recovery, budget, evidence, and publication safety features.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="1" stop-color="#0b1830"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#123555"/>
+      <stop offset="0.5" stop-color="#232b59"/>
+      <stop offset="1" stop-color="#123555"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020617" flood-opacity="0.42"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8fa7c2"/>
+    </marker>
+    <marker id="arrow-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-rose" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb7185"/>
+    </marker>
+    <style>
+      .title { fill: #f8fafc; font: 700 42px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -0.8px; }
+      .subtitle { fill: #9fb0c3; font: 400 20px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .eyebrow { fill: #7dd3fc; font: 700 14px Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: 2.4px; }
+      .section { fill: #f8fafc; font: 700 22px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .card-title { fill: #f8fafc; font: 700 18px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .card-copy { fill: #aab9ca; font: 400 16px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .stage { fill: #f8fafc; font: 700 16px Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.5px; }
+      .stage-copy { fill: #aab9ca; font: 400 15px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .label { fill: #9fb0c3; font: 600 15px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .feature-title { fill: #f8fafc; font: 700 16px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .feature-scope { fill: #7dd3fc; font: 700 15px Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: 1px; }
+      .feature-copy { fill: #aab9ca; font: 400 16px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .footer { fill: #cbd5e1; font: 600 16px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .panel { fill: #0d1c2e; stroke: #29435f; stroke-width: 1.5; }
+      .line { fill: none; stroke: #8fa7c2; stroke-width: 2.5; marker-end: url(#arrow); }
+      .line-cyan { fill: none; stroke: #38bdf8; stroke-width: 2.5; marker-end: url(#arrow-cyan); }
+      .line-rose { fill: none; stroke: #fb7185; stroke-width: 2.5; marker-end: url(#arrow-rose); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1135" rx="28" fill="url(#background)"/>
+  <circle cx="1470" cy="70" r="180" fill="#38bdf8" opacity="0.035"/>
+  <circle cx="120" cy="1050" r="210" fill="#a78bfa" opacity="0.035"/>
+
+  <text x="60" y="66" class="eyebrow">AI ORCHESTRATOR</text>
+  <text x="60" y="112" class="title">From task to independently checked change</text>
+  <text x="60" y="143" class="subtitle">Choose a host. The orchestrator coordinates models, gates, evidence, and recovery—while the user keeps approval and publication control.</text>
+
+  <!-- Entry surfaces -->
+  <g filter="url(#shadow)">
+    <rect x="60" y="175" width="350" height="100" rx="16" class="panel"/>
+    <rect x="60" y="175" width="7" height="100" rx="3" fill="#38bdf8"/>
+    <circle cx="98" cy="211" r="18" fill="#0c4a6e"/><text x="98" y="217" text-anchor="middle" class="stage">P</text>
+    <text x="128" y="211" class="card-title">Pi fast path</text>
+    <text x="128" y="236" class="card-copy">/orchestrate · session-visible</text>
+    <text x="128" y="257" class="card-copy">Plan → Code → Judge</text>
+
+    <rect x="430" y="175" width="350" height="100" rx="16" class="panel"/>
+    <rect x="430" y="175" width="7" height="100" rx="3" fill="#a78bfa"/>
+    <circle cx="468" cy="211" r="18" fill="#4c1d95"/><text x="468" y="217" text-anchor="middle" class="stage">L</text>
+    <text x="498" y="211" class="card-title">Pi lifecycle</text>
+    <text x="498" y="236" class="card-copy">/lifecycle · durable + resumable</text>
+    <text x="498" y="257" class="card-copy">DEFINE → SHIP with DEBUG</text>
+
+    <rect x="800" y="175" width="350" height="100" rx="16" class="panel"/>
+    <rect x="800" y="175" width="7" height="100" rx="3" fill="#34d399"/>
+    <circle cx="838" cy="211" r="18" fill="#064e3b"/><text x="838" y="217" text-anchor="middle" class="stage">M</text>
+    <text x="868" y="211" class="card-title">Cursor + MCP</text>
+    <text x="868" y="236" class="card-copy">Server routes planner + checker</text>
+    <text x="868" y="257" class="card-copy">Cursor stays the recorded coder</text>
+
+    <rect x="1170" y="175" width="350" height="100" rx="16" class="panel"/>
+    <rect x="1170" y="175" width="7" height="100" rx="3" fill="#f59e0b"/>
+    <circle cx="1208" cy="211" r="18" fill="#78350f"/><text x="1208" y="217" text-anchor="middle" class="stage">C</text>
+    <text x="1238" y="211" class="card-title">Cursor manual</text>
+    <text x="1238" y="236" class="card-copy">No MCP · installed instructions</text>
+    <text x="1238" y="257" class="card-copy">User performs model handoffs</text>
+  </g>
+
+  <!-- Orchestrator core -->
+  <rect x="60" y="305" width="1460" height="72" rx="18" fill="url(#core)" stroke="#496b91" stroke-width="1.5"/>
+  <text x="90" y="336" class="section">ORCHESTRATOR CORE</text>
+  <text x="90" y="359" class="card-copy">Stage-aware routing · approvals · loop caps · durable state · typed verdicts · tool boundaries · Git policy</text>
+  <rect x="1262" y="323" width="226" height="36" rx="18" fill="#07111f" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="1375" y="346" text-anchor="middle" fill="#fde68a" style="font: 700 14px Inter, ui-sans-serif, system-ui, sans-serif;">USER OWNS THE GATES</text>
+
+  <!-- Fast workflow -->
+  <rect x="60" y="405" width="1460" height="180" rx="20" class="panel"/>
+  <rect x="60" y="405" width="8" height="180" rx="4" fill="#38bdf8"/>
+  <text x="88" y="439" class="section">Fast workflow</text>
+  <text x="88" y="463" class="card-copy">Focused work with approval, independent judgment, and bounded retries</text>
+
+  <g filter="url(#shadow)">
+    <rect x="228" y="478" width="128" height="67" rx="13" fill="#11263b" stroke="#3d5b78"/>
+    <text x="292" y="505" text-anchor="middle" class="stage">TASK</text>
+    <text x="292" y="527" text-anchor="middle" class="stage-copy">user request</text>
+
+    <rect x="398" y="478" width="148" height="67" rx="13" fill="#0c334a" stroke="#38bdf8"/>
+    <text x="472" y="505" text-anchor="middle" class="stage">PLAN</text>
+    <text x="472" y="527" text-anchor="middle" class="stage-copy">planner route</text>
+
+    <rect x="588" y="478" width="180" height="67" rx="13" fill="#3a321a" stroke="#fbbf24"/>
+    <text x="678" y="505" text-anchor="middle" class="stage">APPROVE</text>
+    <text x="678" y="527" text-anchor="middle" class="stage-copy">explicit user gate</text>
+
+    <rect x="810" y="478" width="148" height="67" rx="13" fill="#3b2914" stroke="#f59e0b"/>
+    <text x="884" y="505" text-anchor="middle" class="stage">BUILD</text>
+    <text x="884" y="527" text-anchor="middle" class="stage-copy">maker edits</text>
+
+    <rect x="1000" y="478" width="148" height="67" rx="13" fill="#10362f" stroke="#34d399"/>
+    <text x="1074" y="505" text-anchor="middle" class="stage">JUDGE</text>
+    <text x="1074" y="527" text-anchor="middle" class="stage-copy">checker verdict</text>
+
+    <rect x="1190" y="478" width="142" height="67" rx="13" fill="#153524" stroke="#4ade80"/>
+    <text x="1261" y="505" text-anchor="middle" class="stage">DONE</text>
+    <text x="1261" y="527" text-anchor="middle" class="stage-copy">approved result</text>
+  </g>
+
+  <path d="M356 511 H398" class="line"/><path d="M546 511 H588" class="line"/>
+  <path d="M768 511 H810" class="line"/><path d="M958 511 H1000" class="line"/>
+  <path d="M1148 511 H1190" class="line"/>
+  <path d="M1074 545 C1074 573 884 573 884 547" class="line-rose"/>
+  <text x="979" y="575" text-anchor="middle" fill="#fda4af" style="font: 600 12px Inter, ui-sans-serif, system-ui, sans-serif;">reject → fix · repeated rejection → re-plan · default max 3 builds</text>
+
+  <!-- Lifecycle workflow -->
+  <rect x="60" y="615" width="1460" height="270" rx="20" class="panel"/>
+  <rect x="60" y="615" width="8" height="270" rx="4" fill="#a78bfa"/>
+  <text x="88" y="649" class="section">Durable lifecycle</text>
+  <text x="88" y="673" class="card-copy">Repository-backed phases survive restart; default 3 builds and re-plan after 2 consecutive rejections</text>
+
+  <g filter="url(#shadow)">
+    <rect x="145" y="700" width="142" height="67" rx="13" fill="#262044" stroke="#a78bfa"/>
+    <text x="216" y="727" text-anchor="middle" class="stage">DEFINE</text>
+    <text x="216" y="749" text-anchor="middle" class="stage-copy">spec + criteria</text>
+
+    <rect x="332" y="700" width="142" height="67" rx="13" fill="#0c334a" stroke="#38bdf8"/>
+    <text x="403" y="727" text-anchor="middle" class="stage">PLAN</text>
+    <text x="403" y="749" text-anchor="middle" class="stage-copy">approved tasks</text>
+
+    <rect x="519" y="700" width="142" height="67" rx="13" fill="#3b2914" stroke="#f59e0b"/>
+    <text x="590" y="727" text-anchor="middle" class="stage">BUILD</text>
+    <text x="590" y="749" text-anchor="middle" class="stage-copy">source editor</text>
+
+    <rect x="706" y="700" width="142" height="67" rx="13" fill="#10362f" stroke="#34d399"/>
+    <text x="777" y="727" text-anchor="middle" class="stage">VERIFY</text>
+    <text x="777" y="749" text-anchor="middle" class="stage-copy">tests + criteria</text>
+
+    <rect x="893" y="700" width="142" height="67" rx="13" fill="#10362f" stroke="#34d399"/>
+    <text x="964" y="727" text-anchor="middle" class="stage">REVIEW</text>
+    <text x="964" y="749" text-anchor="middle" class="stage-copy">quality + risk</text>
+
+    <rect x="1080" y="700" width="142" height="67" rx="13" fill="#24334a" stroke="#7dd3fc"/>
+    <text x="1151" y="727" text-anchor="middle" class="stage">SHIP</text>
+    <text x="1151" y="749" text-anchor="middle" class="stage-copy">GO / NO-GO</text>
+
+    <rect x="1280" y="700" width="142" height="67" rx="13" fill="#153524" stroke="#4ade80"/>
+    <text x="1351" y="727" text-anchor="middle" class="stage">READY</text>
+    <text x="1351" y="749" text-anchor="middle" class="stage-copy">user decides Git</text>
+
+    <rect x="706" y="803" width="190" height="58" rx="13" fill="#3a1f35" stroke="#fb7185"/>
+    <text x="801" y="828" text-anchor="middle" class="stage">DEBUG</text>
+    <text x="801" y="848" text-anchor="middle" class="stage-copy">read-only diagnosis</text>
+
+    <rect x="1060" y="803" width="270" height="58" rx="13" fill="#2f2534" stroke="#fb7185"/>
+    <text x="1195" y="828" text-anchor="middle" class="stage">BUILD / PLAN / FAILED</text>
+    <text x="1195" y="848" text-anchor="middle" class="stage-copy">loop policy decides</text>
+  </g>
+
+  <path d="M287 733 H332" class="line"/><path d="M474 733 H519" class="line"/>
+  <path d="M661 733 H706" class="line"/><path d="M848 733 H893" class="line"/>
+  <path d="M1035 733 H1080" class="line"/><path d="M1222 733 H1280" class="line"/>
+  <text x="309" y="693" text-anchor="middle" fill="#fde68a" class="label">USER APPROVES</text>
+  <text x="496" y="693" text-anchor="middle" fill="#fde68a" class="label">USER APPROVES</text>
+  <text x="801" y="792" text-anchor="middle" fill="#fda4af" class="label">CHECKER REJECTS</text>
+  <text x="1195" y="792" text-anchor="middle" fill="#fda4af" class="label">SHIP NO-GO</text>
+  <path d="M777 767 V803" class="line-rose"/>
+  <path d="M964 767 C964 790 896 788 867 805" class="line-rose"/>
+  <path d="M896 832 H1060" class="line-cyan"/>
+  <path d="M1151 767 V803" class="line-rose"/>
+  <path d="M1060 850 C930 878 590 878 590 769" class="line-cyan"/>
+
+  <!-- Feature cards -->
+  <text x="60" y="928" class="eyebrow">WHAT THE APP ADDS</text>
+  <g filter="url(#shadow)">
+    <rect x="60" y="950" width="280" height="130" rx="16" class="panel"/>
+    <circle cx="91" cy="981" r="16" fill="#0c4a6e"/><text x="91" y="986" text-anchor="middle" class="stage">1</text>
+    <text x="117" y="986" class="feature-title">Capability routing</text>
+    <text x="82" y="1010" class="feature-scope">PI + MCP</text>
+    <text x="82" y="1035" class="feature-copy">Stage/task scoring, privacy,</text>
+    <text x="82" y="1058" class="feature-copy">cost, fallback + versions.</text>
+
+    <rect x="360" y="950" width="280" height="130" rx="16" class="panel"/>
+    <circle cx="391" cy="981" r="16" fill="#064e3b"/><text x="391" y="986" text-anchor="middle" class="stage">2</text>
+    <text x="417" y="986" class="feature-title">Independent checks</text>
+    <text x="382" y="1010" class="feature-scope">ALL WORKFLOWS</text>
+    <text x="382" y="1035" class="feature-copy">Maker identity is excluded;</text>
+    <text x="382" y="1058" class="feature-copy">family separation by policy.</text>
+
+    <rect x="660" y="950" width="280" height="130" rx="16" class="panel"/>
+    <circle cx="691" cy="981" r="16" fill="#4c1d95"/><text x="691" y="986" text-anchor="middle" class="stage">3</text>
+    <text x="717" y="986" class="feature-title">Durable recovery</text>
+    <text x="682" y="1010" class="feature-scope">PI LIFECYCLE</text>
+    <text x="682" y="1035" class="feature-copy">Atomic state, locks + leases;</text>
+    <text x="682" y="1058" class="feature-copy">resume + crash checkpoints.</text>
+
+    <rect x="960" y="950" width="280" height="130" rx="16" class="panel"/>
+    <circle cx="991" cy="981" r="16" fill="#78350f"/><text x="991" y="986" text-anchor="middle" class="stage">4</text>
+    <text x="1017" y="986" class="feature-title">Budgets + evidence</text>
+    <text x="982" y="1010" class="feature-scope">PI WORKFLOWS</text>
+    <text x="982" y="1035" class="feature-copy">Run/day ceilings + minimized</text>
+    <text x="982" y="1058" class="feature-copy">routing outcome evidence.</text>
+
+    <rect x="1260" y="950" width="280" height="130" rx="16" class="panel"/>
+    <circle cx="1291" cy="981" r="16" fill="#3a1f35"/><text x="1291" y="986" text-anchor="middle" class="stage">5</text>
+    <text x="1317" y="986" class="feature-title">Safe delivery</text>
+    <text x="1282" y="1010" class="feature-scope">PI LIFECYCLE</text>
+    <text x="1282" y="1035" class="feature-copy">Fresh commit / PR consent.</text>
+    <text x="1282" y="1058" class="feature-copy">SHIP never pushes.</text>
+  </g>
+
+  <text x="800" y="1105" text-anchor="middle" class="footer">USER APPROVAL  •  MAKER ≠ CHECKER  •  DEBUG IS READ-ONLY  •  RESUME FROM DISK  •  NEVER PUSH AUTOMATICALLY</text>
+</svg>

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import modelRoutingPreviewExtension from "../extensions/modelRoutingPreview.js";
+import { createRun, readState, writeState } from "../src/lifecycle/artifacts.js";
 
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 const tempDirs: string[] = [];
@@ -80,6 +81,48 @@ describe("/lifecycle-models", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
     expect(pi.appendEntry).not.toHaveBeenCalled();
     expect(readdirSync(cwd).sort()).toEqual(before);
+  });
+
+  it("applies explicit role pins and excludes the current BUILD identity", async () => {
+    const cwd = join(tmpdir(), `ai-orchestrator-preview-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(cwd, { recursive: true });
+    tempDirs.push(cwd);
+    vi.stubEnv("HOME", join(cwd, "home"));
+    writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({
+      roles: { reviewer: { provider: "custom", model: "checker", thinking: "high" } },
+      routing: {
+        unknownCost: "allow",
+        profiles: {
+          "custom/maker": { family: "maker", confidence: 9000, scores: { review: 9000 } },
+          "custom/checker": { family: "checker", confidence: 9000, scores: { review: 9000 } },
+        },
+      },
+    }));
+    const run = createRun(cwd, ".ai-orchestrator/runs", "review a feature");
+    const state = readState(run.paths)!;
+    state.modelSelections.push({
+      stage: "build", provider: "custom", model: "maker", family: "maker", thinking: "high", reason: "test", selectedAt: new Date().toISOString(),
+    });
+    writeState(run.paths, state);
+
+    const commands = new Map<string, CommandHandler>();
+    const pi = { registerCommand: vi.fn((name: string, command: { handler: CommandHandler }) => commands.set(name, command.handler)) };
+    modelRoutingPreviewExtension(pi as unknown as ExtensionAPI);
+    const notify = vi.fn();
+    const ctx = {
+      cwd,
+      waitForIdle: vi.fn(async () => undefined),
+      modelRegistry: { getAvailable: () => [
+        { provider: "custom", id: "maker", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 16000 },
+        { provider: "custom", id: "checker", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 16000 },
+      ] },
+      ui: { notify },
+    } as unknown as ExtensionCommandContext;
+
+    await commands.get("lifecycle-models")!("review", ctx);
+
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("1. custom/checker"), "info");
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("custom/maker: same-builder-model"), "info");
   });
 
   it("rejects an unknown stage without reading the model registry", async () => {

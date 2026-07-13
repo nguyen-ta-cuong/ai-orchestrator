@@ -1,20 +1,33 @@
+import { createHash } from "node:crypto";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, loadConfigWithProvenance, loopConfigFrom, type ConfigProvenance, type OrchestratorConfig, type RoleConfig } from "../src/core/config.js";
 import { createPiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
 import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
-import type { ModelSelectionIdentity, RoutingStage } from "../src/core/modelRouting.js";
+import type { ModelSelectionIdentity, RoutingStage, TaskFeatures } from "../src/core/modelRouting.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
 import { currentRun, readState } from "../src/lifecycle/artifacts.js";
+import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
+import {
+  appendRoutingBudgetLedgerEvent,
+  appendUserRoutingEvidenceEvent,
+  readRoutingBudgetLedger,
+  resolveUserEvidenceRoot,
+} from "../src/lifecycle/routingEvidenceStore.js";
 
 const STATE_TYPE = "ai-orchestrator";
 const STATUS_KEY = "ai-orchestrator";
 const WIDGET_KEY = "ai-orchestrator";
-const JUDGE_TOOLS = ["read", "grep", "find", "ls", "bash", "judge_verdict"];
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
+const JUDGE_TOOLS = [...READ_ONLY_TOOLS, "judge_verdict"];
 const MUTATION_TOOLS = new Set(["edit", "write"]);
+const BUILD_TOOL_ALLOWLIST = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
+const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
 
 interface JudgeVerdictParams {
   verdict: Verdict;
@@ -24,10 +37,12 @@ interface JudgeVerdictParams {
 
 interface RuntimeState extends OrchestratorState {
   runId?: string;
+  cwd?: string;
   pendingVerdict?: JudgeVerdictParams;
   judgeReminderSent?: boolean;
   plannerReminderSent?: boolean;
   latestJudgeFeedback?: string;
+  toolsBeforeRun?: string[];
   toolsBeforeJudge?: string[];
   modelSelections?: Array<{
     stage: "plan" | "build" | "fast-judge";
@@ -41,7 +56,24 @@ interface RuntimeState extends OrchestratorState {
     taskFeaturesHash: string;
     fallbackCount: number;
     estimatedCostUsd?: number;
+    failureCategories?: string[];
+    attemptedModels: string[];
+    decisionId: string;
+    profileVersion: string;
+    task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
+    selectedAt: string;
   }>;
+  rejectionFingerprints?: string[];
+  buildEvidenceFingerprints?: string[];
+  planFingerprint?: string;
+  routingFailures?: Array<{ stage: "plan" | "build" | "fast-judge"; identity: string; category: "not-found" | "unavailable" | "provider-error" }>;
+  lastUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    observedUsd: number;
+  };
 }
 
 interface RuntimeConfig {
@@ -52,6 +84,7 @@ interface RuntimeConfig {
 export default function orchestratorExtension(pi: ExtensionAPI): void {
   let state: RuntimeState = createRuntimeState();
   let runtime: RuntimeConfig | undefined;
+  let pendingSettlement: { runId?: string; messages: unknown[] } | undefined;
   let stopping = false;
 
   pi.registerFlag("orchestrate-yolo", {
@@ -71,20 +104,24 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     ],
     parameters: Type.Object({
       verdict: StringEnum(["approve", "reject"] as const),
-      reasons: Type.String({ description: "Concrete review findings supporting the verdict" }),
-      requiredFixes: Type.Optional(Type.String({ description: "Required changes when rejecting" })),
+      reasons: Type.String({ minLength: 1, description: "Concrete review findings supporting the verdict" }),
+      requiredFixes: Type.Optional(Type.String({ minLength: 1, description: "Required changes when rejecting" })),
     }),
     async execute(_toolCallId, params) {
       if (state.phase !== "judging") {
         throw new Error("judge_verdict is only valid during an ai-orchestrator judging phase");
+      }
+      if (params.reasons.trim().length === 0) throw new Error("judge_verdict reasons must be non-empty");
+      if (params.verdict === "reject" && (!params.requiredFixes || params.requiredFixes.trim().length === 0)) {
+        throw new Error("judge_verdict rejection requires non-empty requiredFixes");
       }
 
       state = {
         ...state,
         pendingVerdict: {
           verdict: params.verdict,
-          reasons: params.reasons,
-          requiredFixes: params.requiredFixes,
+          reasons: params.reasons.trim(),
+          requiredFixes: params.requiredFixes?.trim(),
         },
       };
       persist();
@@ -108,7 +145,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   pi.registerCommand("orchestrate-stop", {
     description: "Stop the current orchestration and restore the original model",
     handler: async (_args, ctx) => {
-      if (state.phase === "idle") {
+      if (state.phase === "idle" && !isRestorePending(state)) {
         notifyUser(ctx, "No ai-orchestrator run is active.", "info");
         return;
       }
@@ -121,7 +158,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     if (!latest) {
       if (isActiveRunPhase(state.phase) || isRestorePending(state)) {
         if (isRestorePending(state)) {
-          await restorePendingSessionState(ctx, state);
+          state = await restorePendingSessionState(ctx, state);
+          if (isRestorePending(state)) {
+            persist();
+            notifyUser(ctx, "Previous ai-orchestrator run still needs original-model restoration. Fix model availability and use /orchestrate-stop to retry.", "warning");
+            updateUi(ctx);
+            return;
+          }
         } else {
           deactivateJudgeVerdictTool();
         }
@@ -138,6 +181,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
     if (isRestorePending(latest)) {
       latest = await restorePendingSessionState(ctx, latest);
+      if (isRestorePending(latest)) {
+        state = latest;
+        runtime = undefined;
+        notifyUser(ctx, "Original-model restoration is still pending. Fix model availability and use /orchestrate-stop to retry.", "warning");
+        updateUi(ctx);
+        return;
+      }
     }
 
     if (isActiveRunPhase(latest.phase)) {
@@ -159,7 +209,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
 
     if (isRestorePending(state)) {
-      await restorePendingSessionState(ctx, state);
+      state = await restorePendingSessionState(ctx, state);
+      if (isRestorePending(state)) {
+        clearUi(ctx);
+        persist();
+        return;
+      }
     } else {
       deactivateJudgeVerdictTool();
     }
@@ -170,27 +225,72 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event) => {
-    if (state.phase === "judging" && MUTATION_TOOLS.has(event.toolName)) {
-      return { block: true, reason: "ai-orchestrator judge phase is read-only; edit/write are blocked." };
+    const readOnlyPhase = state.phase === "planning" || state.phase === "replanning" || state.phase === "judging";
+    if (readOnlyPhase && MUTATION_TOOLS.has(event.toolName)) {
+      return { block: true, reason: `ai-orchestrator ${state.phase} phase is read-only; edit/write are blocked.` };
+    }
+    if (readOnlyPhase && event.toolName === "bash") {
+      const command = (event.input as { command?: unknown }).command;
+      const testCommand = state.phase === "judging" && state.cwd && (runtime?.config.judge.runTests ?? true)
+        ? detectTestCommand(state.cwd)
+        : undefined;
+      if (typeof command !== "string" || !isReadOnlyLifecycleCommand(command, testCommand)) {
+        return { block: true, reason: `ai-orchestrator ${state.phase} phase blocked a non-read-only bash command.` };
+      }
+    }
+    if (state.phase === "coding" && MUTATION_TOOLS.has(event.toolName)) {
+      const requested = (event.input as { path?: unknown }).path;
+      const path = typeof requested === "string" && state.cwd ? resolveFastPath(state.cwd, requested) : undefined;
+      const metadataRoot = state.cwd ? join(state.cwd, ".ai-orchestrator") : undefined;
+      if (path && metadataRoot && (path === metadataRoot || path.startsWith(`${metadataRoot}/`))) {
+        return { block: true, reason: "ai-orchestrator coding cannot modify orchestrator metadata." };
+      }
+    }
+    if (state.phase === "coding" && event.toolName === "bash") {
+      const command = (event.input as { command?: unknown }).command;
+      if (typeof command !== "string" || isBlockedFastBuildCommand(command)) {
+        return { block: true, reason: "ai-orchestrator coding cannot modify orchestrator metadata, perform destructive Git operations, stage, commit, tag, push, open a PR, or publish." };
+      }
     }
   });
 
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("message_end", async (event) => {
+    if (!runtime || !event.message || event.message.role !== "assistant" || !event.message.usage) return;
+    state.lastUsage = {
+      inputTokens: (state.lastUsage?.inputTokens ?? 0) + event.message.usage.input,
+      outputTokens: (state.lastUsage?.outputTokens ?? 0) + event.message.usage.output,
+      cacheReadTokens: (state.lastUsage?.cacheReadTokens ?? 0) + event.message.usage.cacheRead,
+      cacheWriteTokens: (state.lastUsage?.cacheWriteTokens ?? 0) + event.message.usage.cacheWrite,
+      observedUsd: (state.lastUsage?.observedUsd ?? 0) + event.message.usage.cost.total,
+    };
+  });
+
+  pi.on("agent_end", async (event) => {
+    if (isActiveRunPhase(state.phase)) {
+      pendingSettlement = { runId: state.runId, messages: event.messages };
+    }
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!pendingSettlement || pendingSettlement.runId !== state.runId) return;
+    const { messages } = pendingSettlement;
+    pendingSettlement = undefined;
     try {
       if (isActiveRunPhase(state.phase)) {
-        const stopReason = lastAssistantStopReason(event.messages);
+        const stopReason = lastAssistantStopReason(messages);
         if (stopReason === "aborted") {
           await stopRun(ctx, "ai-orchestrator run was aborted by user; original model restored.");
           return;
         }
         if (stopReason === "error") {
-          await stopRun(ctx, "ai-orchestrator run stopped because the phase ended with a model/provider error.");
+          if (await retryAfterProviderError(ctx)) return;
+          await stopRun(ctx, "ai-orchestrator run stopped because all eligible provider fallbacks failed.");
           return;
         }
       }
 
       if (state.phase === "planning" || state.phase === "replanning") {
-        await handlePlanProduced(ctx, extractLastAssistantText(event.messages));
+        await handlePlanProduced(ctx, extractLastAssistantText(messages));
         return;
       }
 
@@ -209,6 +309,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   });
 
   async function startRun(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (isRestorePending(state)) {
+      notifyUser(ctx, "Original-model restoration is pending. Fix model availability and use /orchestrate-stop before starting another run.", "error");
+      return;
+    }
     if (state.phase !== "idle" && state.phase !== "done" && state.phase !== "failed") {
       notifyUser(ctx, "An ai-orchestrator run is already active. Use /orchestrate-stop first.", "error");
       return;
@@ -255,16 +359,21 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     state = {
       ...(nextPhase(createIdleState(), { type: "start", task: parsed.task, yolo }, loopConfigFrom(config)) as RuntimeState),
       runId: createRunId(),
+      cwd: ctx.cwd,
       originalModel: ctx.model
         ? { provider: String(ctx.model.provider), id: String(ctx.model.id), thinking: currentThinking }
         : undefined,
+      toolsBeforeRun: pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict"),
+      rejectionFingerprints: [],
+      buildEvidenceFingerprints: [],
+      routingFailures: [],
     };
     persist();
 
     const ok = await switchToRole("planner", ctx);
     if (!ok) return;
 
-    deactivateJudgeVerdictTool();
+    activateReadOnlyTools();
     updateUi(ctx);
     pi.sendUserMessage(plannerPrompt(parsed.task));
   }
@@ -285,12 +394,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       return;
     }
 
+    persistFastStageOutcome("plan", "unknown", "unknown");
     const wasReplanning = state.phase === "replanning";
+    const nextPlanFingerprint = fastConvergenceFingerprint(planText);
+    const changedPlan = Boolean(state.planFingerprint && state.planFingerprint !== nextPlanFingerprint);
     state = {
       ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig()) as RuntimeState),
       judgeReminderSent: false,
       plannerReminderSent: false,
       latestJudgeFeedback: wasReplanning ? undefined : state.latestJudgeFeedback,
+      rejectionFingerprints: wasReplanning && changedPlan ? [] : state.rejectionFingerprints,
+      buildEvidenceFingerprints: wasReplanning && changedPlan ? [] : state.buildEvidenceFingerprints,
+      planFingerprint: nextPlanFingerprint,
     };
     persist();
     updateUi(ctx);
@@ -358,8 +473,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
   async function enterCoding(ctx: ExtensionContext): Promise<void> {
     if (state.phase !== "coding") return;
+    const breaker = fastConvergenceBreakerReason();
+    if (breaker) {
+      await stopRun(ctx, `ai-orchestrator stopped by convergence circuit breaker: ${breaker}`);
+      return;
+    }
 
-    restoreToolsAfterJudge();
+    activateBuildTools();
     const ok = await switchToRole("coder", ctx);
     if (!ok) return;
 
@@ -368,6 +488,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function handleCodeProduced(ctx: ExtensionContext): Promise<void> {
+    await recordFastBuildFingerprint(ctx);
+    if (state.phase !== "coding") return;
+    persistFastStageOutcome("build", "unknown", "unknown");
     state = nextPhase(state, { type: "code_produced" }, loopConfig()) as RuntimeState;
     state.judgeReminderSent = false;
     state.pendingVerdict = undefined;
@@ -379,8 +502,6 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     if (!ok) return;
 
     runtime = runtime ?? loadPiResolvedConfig(ctx.cwd);
-    state = { ...state, toolsBeforeJudge: pi.getActiveTools() };
-    persist();
     pi.setActiveTools(JUDGE_TOOLS);
     updateUi(ctx);
 
@@ -412,6 +533,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       throw new Error("judge phase ended without a verdict");
     }
 
+    if (verdict.verdict === "reject") {
+      state.rejectionFingerprints = [...(state.rejectionFingerprints ?? []), fastConvergenceFingerprint(`${verdict.reasons}\n${verdict.requiredFixes ?? ""}`)];
+      persist();
+    }
+    persistFastStageOutcome("fast-judge", verdict.verdict, true);
     const stateForTransition: OrchestratorState = { ...state };
     state = nextPhase(
       stateForTransition,
@@ -446,6 +572,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function enterReplanning(ctx: ExtensionContext): Promise<void> {
+    activateReadOnlyTools();
     const ok = await switchToRole("planner", ctx);
     if (!ok) return;
 
@@ -478,10 +605,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function finishRun(ctx: ExtensionContext): Promise<void> {
-    const summary = finalSummary(state);
-    await restoreOriginalModel(ctx, state);
+    const completedState = state;
+    const summary = finalSummary(completedState);
+    restoreRunTools(completedState);
+    const restored = await restoreOriginalModel(ctx, completedState);
     clearUi(ctx);
-    pi.sendMessage({ customType: STATE_TYPE, content: summary, display: true, details: state }, { triggerTurn: false });
+    pi.sendMessage({ customType: STATE_TYPE, content: summary, display: true, details: completedState }, { triggerTurn: false });
+    if (!restored) {
+      state = completedState;
+      persist();
+      deactivateJudgeVerdictTool();
+      notifyUser(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /orchestrate-stop to retry.", "warning");
+      return;
+    }
     state = createRuntimeState();
     runtime = undefined;
     persist();
@@ -497,14 +633,25 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       if (!ctx.isIdle()) {
         ctx.abort();
       }
-      restoreToolsAfterJudge();
+      restoreRunTools(stoppedState);
       state = nextPhase(stoppedState, { type: "cancelled" }, loopConfig()) as RuntimeState;
       state.runId = undefined;
       persist();
 
-      await restoreOriginalModel(ctx, stoppedState);
+      const restored = await restoreOriginalModel(ctx, stoppedState);
       clearUi(ctx);
       pi.sendMessage({ customType: STATE_TYPE, content: message, display: true, details: stoppedState }, { triggerTurn: false });
+      if (!restored) {
+        state = {
+          ...state,
+          originalModel: stoppedState.originalModel,
+          toolsBeforeRun: stoppedState.toolsBeforeRun,
+          toolsBeforeJudge: stoppedState.toolsBeforeJudge,
+        };
+        persist();
+        notifyUser(ctx, "Original-model restoration is pending. Fix model availability and run /orchestrate-stop again.", "warning");
+        return;
+      }
       state = createRuntimeState();
       runtime = undefined;
       persist();
@@ -514,7 +661,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
   }
 
-  async function switchToRole(role: keyof OrchestratorConfig["roles"], ctx: ExtensionContext): Promise<boolean> {
+  async function switchToRole(
+    role: keyof OrchestratorConfig["roles"],
+    ctx: ExtensionContext,
+    excludedIdentities: ReadonlySet<string> = new Set(),
+  ): Promise<boolean> {
     const resolved = runtime ?? loadPiResolvedConfig(ctx.cwd);
     runtime = resolved;
     const stage = fastRoutingStage(role);
@@ -524,17 +675,27 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       model: selection.model,
       ...(selection.family ? { family: selection.family } : {}),
     }));
+    const expectedRunId = state.runId;
+    const expectedPhase = state.phase;
+    const evidence = await fastRoutingEvidence(ctx);
+    if (state.runId !== expectedRunId || state.phase !== expectedPhase) return false;
     const plan = createPiRoutingPlan({
       config: resolved.config,
       provenance: resolved.provenance,
       stage,
       role,
       available: ctx.modelRegistry.getAvailable(),
-      evidence: { task: state.task, plan: state.plan, verdictCategory: state.latestJudgeFeedback },
+      evidence,
       priorSelections,
     });
     const failed: string[] = [];
     for (const candidate of plan.candidates) {
+      const identity = `${candidate.provider}/${candidate.model}`;
+      if (excludedIdentities.has(identity)) {
+        failed.push(`${identity} (provider error)`);
+        recordFastRoutingFailure(stage, identity, "provider-error");
+        continue;
+      }
       const estimate: RoutingCostEstimate = candidate.estimatedCostUsd === undefined
         ? { status: "unknown", reason: "candidate cost metadata unavailable" }
         : { status: "known", estimatedUsd: candidate.estimatedCostUsd };
@@ -546,39 +707,65 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         unattended: state.yolo || !ctx.hasUI,
       });
       if (budget.allowed !== true) {
-        await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
-        return false;
+        if (budget.allowed === "ask") {
+          const expectedRunId = state.runId;
+          const expectedPhase = state.phase;
+          const confirmed = ctx.hasUI && await ctx.ui.confirm("Routing budget warning", `${budget.reason}\n\nContinue with ${candidate.provider}/${candidate.model}?`);
+          if (state.runId !== expectedRunId || state.phase !== expectedPhase) return false;
+          if (confirmed) {
+            // Explicit interactive approval applies only to this candidate invocation.
+          } else {
+            await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
+            return false;
+          }
+        } else {
+          await abortForModelError(ctx, `${role} stopped by routing budget: ${budget.reason}`);
+          return false;
+        }
       }
       const model = ctx.modelRegistry.find(candidate.provider, candidate.model);
       if (!model) {
         failed.push(`${candidate.provider}/${candidate.model} (not found)`);
+        recordFastRoutingFailure(stage, identity, "not-found");
         continue;
       }
       const runId = state.runId;
       const phase = state.phase;
-      if (!(await pi.setModel(model))) {
+      const activated = await pi.setModel(model);
+      if (state.runId !== runId || state.phase !== phase) return false;
+      if (!activated) {
         failed.push(`${candidate.provider}/${candidate.model} (unavailable)`);
+        recordFastRoutingFailure(stage, identity, "unavailable");
         continue;
       }
-      if (state.runId !== runId || state.phase !== phase) return false;
       pi.setThinkingLevel(candidate.thinking);
-      state = {
-        ...state,
-        modelSelections: [...(state.modelSelections ?? []), {
-          stage,
-          provider: candidate.provider,
-          model: candidate.model,
-          ...(candidate.family ? { family: candidate.family } : {}),
-          thinking: candidate.thinking,
-          reason: candidate.reason,
-          engine: plan.engine,
-          policyVersion: plan.policyVersion,
-          taskFeaturesHash: plan.taskFeaturesHash,
-          fallbackCount: failed.length,
-          ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
-        }],
+      const selection: NonNullable<RuntimeState["modelSelections"]>[number] = {
+        stage,
+        provider: candidate.provider,
+        model: candidate.model,
+        ...(candidate.family ? { family: candidate.family } : {}),
+        thinking: candidate.thinking,
+        reason: candidate.reason,
+        engine: plan.engine,
+        policyVersion: plan.policyVersion,
+        taskFeaturesHash: plan.taskFeaturesHash,
+        fallbackCount: failed.length,
+        ...(candidate.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: candidate.estimatedCostUsd }),
+        failureCategories: failed.map(fastFailureCategory),
+        attemptedModels: [...failed, `${candidate.provider}/${candidate.model} (selected)`],
+        decisionId: `${state.runId ?? "unknown"}:${stage}:${(state.modelSelections?.length ?? 0) + 1}`,
+        profileVersion: candidate.profileVersion ?? "legacy-role",
+        task: {
+          workKind: plan.taskFeatures.workKind,
+          risk: plan.taskFeatures.risk,
+          languages: [...plan.taskFeatures.languages],
+          fileCount: plan.taskFeatures.fileCount,
+        },
+        selectedAt: new Date().toISOString(),
       };
+      state = { ...state, modelSelections: [...(state.modelSelections ?? []), selection], lastUsage: undefined };
       persist();
+      persistFastStageStarted(selection);
       return true;
     }
     const exclusions = plan.decision?.excluded.map((item) => `${item.identity.provider}/${item.identity.model}: ${item.code}`) ?? [];
@@ -586,12 +773,206 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     return false;
   }
 
-  function fastBudgetSnapshot(current: RuntimeState): RoutingBudgetSnapshot {
+  function recordFastRoutingFailure(
+    stage: "plan" | "build" | "fast-judge",
+    identity: string,
+    category: "not-found" | "unavailable" | "provider-error",
+  ): void {
+    if (state.routingFailures?.some((failure) => failure.stage === stage && failure.identity === identity && failure.category === category)) return;
+    state.routingFailures = [...(state.routingFailures ?? []), { stage, identity, category }];
+    persist();
+  }
+
+  function fastFailureCategory(value: string): string {
+    if (value.includes("provider error")) return "provider-error";
+    if (value.includes("not found")) return "not-found";
+    return "unavailable";
+  }
+
+  async function retryAfterProviderError(ctx: ExtensionContext): Promise<boolean> {
+    const stage = state.phase === "planning" || state.phase === "replanning" ? "plan"
+      : state.phase === "coding" ? "build" : state.phase === "judging" ? "fast-judge" : undefined;
+    const role = stage === "plan" ? "planner" : stage === "build" ? "coder" : stage === "fast-judge" ? "judge" : undefined;
+    if (!stage || !role) return false;
+    persistFastStageOutcome(stage, "unknown", false);
+    const current = [...(state.modelSelections ?? [])].reverse().find((selection) => selection.stage === stage);
+    if (current) {
+      current.failureCategories = [...(current.failureCategories ?? []), "provider-error"];
+      persist();
+    }
+    const failed = new Set((state.modelSelections ?? [])
+      .filter((selection) => selection.stage === stage && selection.failureCategories?.includes("provider-error"))
+      .map((selection) => `${selection.provider}/${selection.model}`));
+    const ok = await switchToRole(role, ctx, failed);
+    if (!ok) return true;
+
+    if (state.phase === "planning") {
+      pi.sendUserMessage(plannerPrompt(state.task), { deliverAs: "followUp" });
+    } else if (state.phase === "replanning") {
+      pi.sendUserMessage(replanPrompt(state.task, state.plan ?? "", await getDiffSummary(ctx), state.judgeReports), { deliverAs: "followUp" });
+    } else if (state.phase === "coding") {
+      pi.sendUserMessage(coderPrompt(state.plan ?? "", state.latestJudgeFeedback), { deliverAs: "followUp" });
+    } else if (state.phase === "judging") {
+      const command = runtime?.config.judge.runTests ? detectTestCommand(ctx.cwd) : undefined;
+      pi.sendUserMessage(judgePrompt(state.task, state.plan ?? "", command), { deliverAs: "followUp" });
+    }
+    return true;
+  }
+
+  async function recordFastBuildFingerprint(ctx: ExtensionContext): Promise<void> {
+    const runId = state.runId;
+    const phase = state.phase;
+    const [diff, untracked] = await Promise.all([
+      pi.exec("git", ["diff", "--no-ext-diff", "--binary", "HEAD"], { timeout: 20_000, signal: ctx.signal }),
+      pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    if (state.runId !== runId || state.phase !== phase) return;
+    const evidence = `${diff.code}:${diff.stdout}\n${diff.stderr}\n${untracked.code}:${untracked.stdout}\n${untracked.stderr}`;
+    state.buildEvidenceFingerprints = [...(state.buildEvidenceFingerprints ?? []), fastConvergenceFingerprint(evidence)];
+    persist();
+  }
+
+  function fastConvergenceBreakerReason(): string | undefined {
+    if (!runtime) return undefined;
+    const rejectionCount = fastTrailingEqualCount(state.rejectionFingerprints ?? []);
+    if (rejectionCount >= runtime.config.routing.circuitBreakers.repeatedRejectionFingerprintLimit) {
+      return `${rejectionCount} identical judge rejections reached the configured limit; revise the plan with new evidence.`;
+    }
+    const unchangedBuilds = Math.max(0, fastTrailingEqualCount(state.buildEvidenceFingerprints ?? []) - 1);
+    if (unchangedBuilds >= runtime.config.routing.circuitBreakers.maxBuildPassesWithoutImprovement) {
+      return `${unchangedBuilds} consecutive coding passes produced unchanged evidence; inspect the diff and re-plan.`;
+    }
+    return undefined;
+  }
+
+  function fastTrailingEqualCount(values: readonly string[]): number {
+    const latest = values.at(-1);
+    if (!latest) return 0;
+    let count = 0;
+    for (let index = values.length - 1; index >= 0 && values[index] === latest; index -= 1) count += 1;
+    return count;
+  }
+
+  function fastConvergenceFingerprint(value: string): string {
+    return createHash("sha256").update(value.trim().replace(/\s+/g, " ").toLowerCase()).digest("hex").slice(0, 16);
+  }
+
+  async function fastRoutingEvidence(ctx: ExtensionContext): Promise<{
+    task: string; plan?: string; verdictCategory?: string; changedPaths: string[]; languages: string[]; testCommand?: string;
+  }> {
+    const [changed, untracked] = await Promise.all([
+      pi.exec("git", ["diff", "--name-only", "-z", "HEAD"], { timeout: 10_000, signal: ctx.signal }),
+      pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    const changedPaths = [...new Set([...(changed.code === 0 ? changed.stdout.split("\0") : []), ...(untracked.code === 0 ? untracked.stdout.split("\0") : [])]
+      .filter((path) => path.length > 0))];
     return {
-      estimatedRunUsd: (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0),
-      observedRunUsd: 0,
-      estimatedDayUsd: (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0),
-      observedDayUsd: 0,
+      task: state.task,
+      plan: state.plan,
+      verdictCategory: state.latestJudgeFeedback,
+      changedPaths,
+      languages: [...new Set(changedPaths.map(fastLanguageForPath).filter((value): value is string => Boolean(value)))],
+      ...(state.cwd ? { testCommand: detectTestCommand(state.cwd) } : {}),
+    };
+  }
+
+  function fastLanguageForPath(path: string): string | undefined {
+    const extension = path.split(".").at(-1)?.toLowerCase();
+    return ({ ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", py: "python", rb: "ruby", rs: "rust", go: "go", swift: "swift", kt: "kotlin", java: "java", cs: "csharp" } as Record<string, string>)[extension ?? ""];
+  }
+
+  function persistFastStageStarted(selection: NonNullable<RuntimeState["modelSelections"]>[number]): void {
+    if (!runtime || !state.runId) return;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    appendRoutingBudgetLedgerEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${selection.decisionId}:budget:stage-started`,
+      runId: state.runId,
+      recordedAt: new Date().toISOString(),
+      outcome: "stage-started",
+      ...(selection.estimatedCostUsd === undefined ? {} : { estimatedUsd: selection.estimatedCostUsd }),
+    });
+    if (!runtime.config.routing.evidence.enabled) return;
+    appendUserRoutingEvidenceEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${selection.decisionId}:stage-started`,
+      runId: state.runId,
+      decisionId: selection.decisionId,
+      stage: selection.stage,
+      recordedAt: new Date().toISOString(),
+      policyVersion: selection.policyVersion,
+      profileVersion: selection.profileVersion,
+      task: selection.task,
+      selected: { provider: selection.provider, model: selection.model, ...(selection.family ? { family: selection.family } : {}) },
+      durationMs: "unknown",
+      fallbackCount: selection.fallbackCount,
+      usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+      cost: { estimatedUsd: selection.estimatedCostUsd ?? "unknown", observedUsd: "unknown" },
+      outcome: { type: "stage-started", structuredToolCompliance: "unknown", verdict: "unknown", buildIteration: state.coderIterations },
+    });
+  }
+
+  function persistFastStageOutcome(
+    stage: "plan" | "build" | "fast-judge",
+    verdict: "approve" | "reject" | "unknown",
+    structuredToolCompliance: boolean | "unknown",
+  ): void {
+    if (!runtime || !state.runId) return;
+    const selection = [...(state.modelSelections ?? [])].reverse().find((item) => item.stage === stage);
+    if (!selection) return;
+    const usage = state.lastUsage;
+    const userStoreRoot = resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir);
+    appendRoutingBudgetLedgerEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${selection.decisionId}:budget:stage-ended`,
+      runId: state.runId,
+      recordedAt: new Date().toISOString(),
+      outcome: "stage-ended",
+      ...(usage ? { observedUsd: usage.observedUsd } : {}),
+    });
+    if (!runtime.config.routing.evidence.enabled) {
+      state.lastUsage = undefined;
+      return;
+    }
+    appendUserRoutingEvidenceEvent(userStoreRoot, {
+      version: 1,
+      eventId: `${selection.decisionId}:stage-ended`,
+      runId: state.runId,
+      decisionId: selection.decisionId,
+      stage,
+      recordedAt: new Date().toISOString(),
+      policyVersion: selection.policyVersion,
+      profileVersion: selection.profileVersion,
+      task: selection.task,
+      selected: { provider: selection.provider, model: selection.model, ...(selection.family ? { family: selection.family } : {}) },
+      durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+      fallbackCount: selection.fallbackCount,
+      ...(verdict === "reject" ? { rejectionCategory: `${stage}-reject` } : {}),
+      usage: {
+        inputTokens: usage?.inputTokens ?? "unknown",
+        outputTokens: usage?.outputTokens ?? "unknown",
+        cacheReadTokens: usage?.cacheReadTokens ?? "unknown",
+        cacheWriteTokens: usage?.cacheWriteTokens ?? "unknown",
+      },
+      cost: { estimatedUsd: selection.estimatedCostUsd ?? "unknown", observedUsd: usage?.observedUsd ?? "unknown" },
+      outcome: { type: "stage-ended", structuredToolCompliance, verdict, buildIteration: state.coderIterations },
+    });
+    state.lastUsage = undefined;
+  }
+
+  function fastBudgetSnapshot(current: RuntimeState): RoutingBudgetSnapshot {
+    const ledger = runtime
+      ? readRoutingBudgetLedger(join(resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir), "budget.jsonl"))
+      : [];
+    const runEvents = ledger.filter((event) => event.runId === current.runId);
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyEvents = ledger.filter((event) => event.recordedAt.startsWith(today));
+    const estimatedSelections = (current.modelSelections ?? []).reduce((sum, selection) => sum + (selection.estimatedCostUsd ?? 0), 0);
+    return {
+      estimatedRunUsd: runEvents.length > 0 ? ledgerCost(runEvents, "stage-started", "estimatedUsd") : estimatedSelections,
+      observedRunUsd: ledgerCost(runEvents, "stage-ended", "observedUsd"),
+      estimatedDayUsd: ledgerCost(dailyEvents, "stage-started", "estimatedUsd"),
+      observedDayUsd: ledgerCost(dailyEvents, "stage-ended", "observedUsd"),
       paidFallbacks: (current.modelSelections ?? []).reduce((sum, selection) => sum + selection.fallbackCount, 0),
       attemptsByStage: Object.fromEntries(
         (current.modelSelections ?? []).map((selection) => [
@@ -602,44 +983,71 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     };
   }
 
+  function ledgerCost(
+    events: ReturnType<typeof readRoutingBudgetLedger>,
+    outcome: "stage-started" | "stage-ended",
+    field: "estimatedUsd" | "observedUsd",
+  ): number {
+    return events.reduce((sum, event) => sum + (event.outcome === outcome ? event[field] ?? 0 : 0), 0);
+  }
+
   async function abortForModelError(ctx: ExtensionContext, reason: string): Promise<void> {
     const configHint = `Fix role config in ~/.ai-orchestrator/config.json or ${ctx.cwd}/.ai-orchestrator.json.`;
     await stopRun(ctx, `ai-orchestrator aborted: ${reason}. ${configHint}`);
   }
 
-  async function restoreOriginalModel(ctx: ExtensionContext, source: RuntimeState): Promise<void> {
+  async function restoreOriginalModel(ctx: ExtensionContext, source: RuntimeState): Promise<boolean> {
     const original = source.originalModel;
-    if (!original) return;
+    if (!original) return true;
 
     const model = ctx.modelRegistry.find(original.provider, original.id);
     if (!model) {
       notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: model not found.`, "warning");
-    } else {
-      const restored = await pi.setModel(model);
-      if (!restored) {
-        notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: API key is unavailable.`, "warning");
-      }
+      return false;
+    }
+    const restored = await pi.setModel(model);
+    if (!restored) {
+      notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: API key is unavailable.`, "warning");
+      return false;
     }
     pi.setThinkingLevel(original.thinking);
+    return true;
   }
 
   async function restorePendingSessionState(ctx: ExtensionContext, persistedState: RuntimeState): Promise<RuntimeState> {
     state = persistedState;
-    restoreToolsAfterJudge();
-    await restoreOriginalModel(ctx, persistedState);
-    state = { ...state, originalModel: undefined, toolsBeforeJudge: undefined };
+    restoreRunTools(persistedState);
+    if (!(await restoreOriginalModel(ctx, persistedState))) {
+      persist();
+      return state;
+    }
+    state = { ...state, originalModel: undefined, toolsBeforeRun: undefined, toolsBeforeJudge: undefined };
     persist();
     return state;
   }
 
-  function restoreToolsAfterJudge(): void {
-    if (state.toolsBeforeJudge) {
-      pi.setActiveTools(state.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
-      state = { ...state, toolsBeforeJudge: undefined };
-      persist();
+  function activateReadOnlyTools(): void {
+    pi.setActiveTools(READ_ONLY_TOOLS);
+  }
+
+  function activateBuildTools(): void {
+    const original = state.toolsBeforeRun ?? pi.getActiveTools().filter((toolName) => toolName !== "judge_verdict");
+    pi.setActiveTools(original.filter((toolName) => BUILD_TOOL_ALLOWLIST.has(toolName)));
+  }
+
+  function restoreRunTools(source: RuntimeState): void {
+    if (source.toolsBeforeRun) {
+      pi.setActiveTools(source.toolsBeforeRun.filter((toolName) => toolName !== "judge_verdict"));
+    } else if (source.toolsBeforeJudge) {
+      pi.setActiveTools(source.toolsBeforeJudge.filter((toolName) => toolName !== "judge_verdict"));
     } else {
       deactivateJudgeVerdictTool();
     }
+  }
+
+  function restoreToolsAfterJudge(): void {
+    if (state.phase === "coding") activateBuildTools();
+    else deactivateJudgeVerdictTool();
   }
 
   function deactivateJudgeVerdictTool(): void {
@@ -702,6 +1110,20 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       { triggerTurn: false },
     );
   }
+}
+
+function isBlockedFastBuildCommand(command: string): boolean {
+  // Normalize quoting and shell escapes so equivalent forms such as
+  // `git -C . push`, `g\\it push`, and `bash -lc 'git push'` remain gated.
+  const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
+  return PUBLICATION_COMMAND.test(normalized) || DESTRUCTIVE_GIT_COMMAND.test(normalized) ||
+    normalized.includes(".ai-orchestrator") ||
+    /\brm\b[\s\S]*?(?:\s\.\/?(?:\s|$)|\s\*|\/\*)/i.test(normalized) ||
+    /\bfind\b[\s\S]*?\s-delete\b/i.test(normalized);
+}
+
+function resolveFastPath(cwd: string, requested: string): string {
+  return resolve(cwd, requested.replace(/^@/, ""));
 }
 
 function createRuntimeState(overrides: Partial<RuntimeState> = {}): RuntimeState {
@@ -787,7 +1209,7 @@ function isActiveRunPhase(phase: OrchestratorState["phase"]): boolean {
 }
 
 function isRestorePending(state: RuntimeState): boolean {
-  return Boolean(state.originalModel || state.toolsBeforeJudge);
+  return Boolean(state.originalModel || state.toolsBeforeRun || state.toolsBeforeJudge);
 }
 
 function findLastAssistant(messages: unknown[]): Record<string, unknown> | undefined {

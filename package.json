@@ -25,7 +25,10 @@
     "skills",
     "extensions",
     "mcp",
-    "src"
+    "src",
+    "docs/setup.md",
+    "docs/user-guide.md",
+    "docs/images/ai-orchestrator-workflow.svg"
   ],
   "repository": {
     "type": "git",

@@ -45,7 +45,9 @@ export interface LifecycleModelSelection {
     decisionId: string;
     engine: "legacy" | "capability-shadow" | "capability";
     policyVersion: string;
+    profileVersion?: string;
     taskFeaturesHash: string;
+    phaseEntryKey?: string;
     selectedRank: number;
     score?: number;
     separation: "not-applicable" | "different-model" | "different-family";
@@ -68,10 +70,21 @@ export interface LifecycleState {
   consecutiveRejections: number;
   verdicts: LifecycleStageVerdict[];
   modelSelections: LifecycleModelSelection[];
+  rejectionFingerprints: string[];
+  buildEvidenceFingerprints: string[];
+  planFingerprint?: string;
+  pendingCheckerVerdict?: {
+    phase: "verifying" | "reviewing" | "shipping";
+    kind: "verify" | "review" | "ship";
+    verdict: LifecycleVerdict;
+    reasons: string;
+    requiredFixes?: string;
+  };
+  routingPolicyVersion?: string;
   baselinePaths?: string[];
   baselineStagedPaths?: string[];
   modelRestored?: boolean;
-  finalization?: { commitSha?: string; prUrl?: string };
+  finalization?: { commitSha?: string; commitBaseSha?: string; commitMessage?: string; prUrl?: string; prHead?: string };
   shipReport?: string;
   yolo: boolean;
   originalModel?: LifecycleOriginalModelState;
@@ -109,11 +122,16 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
     consecutiveRejections: 0,
     verdicts: [],
     modelSelections: [],
+    rejectionFingerprints: [],
+    buildEvidenceFingerprints: [],
     modelRestored: true,
     yolo: false,
     ...overrides,
   };
   state.verdicts = overrides.verdicts ? overrides.verdicts.map((verdict) => ({ ...verdict })) : [];
+  state.rejectionFingerprints = overrides.rejectionFingerprints ? [...overrides.rejectionFingerprints] : [];
+  state.buildEvidenceFingerprints = overrides.buildEvidenceFingerprints ? [...overrides.buildEvidenceFingerprints] : [];
+  state.pendingCheckerVerdict = overrides.pendingCheckerVerdict ? { ...overrides.pendingCheckerVerdict } : undefined;
   state.modelSelections = overrides.modelSelections
     ? overrides.modelSelections.map((selection) => ({
       ...selection,
@@ -334,6 +352,8 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
   return {
     ...state,
     verdicts: state.verdicts.map((verdict) => ({ ...verdict })),
+    rejectionFingerprints: [...state.rejectionFingerprints],
+    buildEvidenceFingerprints: [...state.buildEvidenceFingerprints],
     modelSelections: state.modelSelections.map((selection) => ({
       ...selection,
       routing: selection.routing ? {
@@ -345,6 +365,7 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
     baselinePaths: state.baselinePaths ? [...state.baselinePaths] : undefined,
     baselineStagedPaths: state.baselineStagedPaths ? [...state.baselineStagedPaths] : undefined,
     finalization: state.finalization ? { ...state.finalization } : undefined,
+    pendingCheckerVerdict: state.pendingCheckerVerdict ? { ...state.pendingCheckerVerdict } : undefined,
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
   };
 }
