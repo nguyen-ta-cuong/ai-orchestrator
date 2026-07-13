@@ -635,13 +635,17 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       model: selection.model,
       ...(selection.family ? { family: selection.family } : {}),
     }));
+    const expectedRunId = state.runId;
+    const expectedPhase = state.phase;
+    const evidence = await fastRoutingEvidence(ctx);
+    if (state.runId !== expectedRunId || state.phase !== expectedPhase) return false;
     const plan = createPiRoutingPlan({
       config: resolved.config,
       provenance: resolved.provenance,
       stage,
       role,
       available: ctx.modelRegistry.getAvailable(),
-      evidence: { task: state.task, plan: state.plan, verdictCategory: state.latestJudgeFeedback },
+      evidence,
       priorSelections,
     });
     const failed: string[] = [];
@@ -750,6 +754,30 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       pi.sendUserMessage(judgePrompt(state.task, state.plan ?? "", command), { deliverAs: "followUp" });
     }
     return true;
+  }
+
+  async function fastRoutingEvidence(ctx: ExtensionContext): Promise<{
+    task: string; plan?: string; verdictCategory?: string; changedPaths: string[]; languages: string[]; testCommand?: string;
+  }> {
+    const [changed, untracked] = await Promise.all([
+      pi.exec("git", ["diff", "--name-only", "-z", "HEAD"], { timeout: 10_000, signal: ctx.signal }),
+      pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { timeout: 10_000, signal: ctx.signal }),
+    ]);
+    const changedPaths = [...new Set([...(changed.code === 0 ? changed.stdout.split("\0") : []), ...(untracked.code === 0 ? untracked.stdout.split("\0") : [])]
+      .filter((path) => path.length > 0))];
+    return {
+      task: state.task,
+      plan: state.plan,
+      verdictCategory: state.latestJudgeFeedback,
+      changedPaths,
+      languages: [...new Set(changedPaths.map(fastLanguageForPath).filter((value): value is string => Boolean(value)))],
+      ...(state.cwd ? { testCommand: detectTestCommand(state.cwd) } : {}),
+    };
+  }
+
+  function fastLanguageForPath(path: string): string | undefined {
+    const extension = path.split(".").at(-1)?.toLowerCase();
+    return ({ ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", py: "python", rb: "ruby", rs: "rust", go: "go", swift: "swift", kt: "kotlin", java: "java", cs: "csharp" } as Record<string, string>)[extension ?? ""];
   }
 
   function persistFastStageStarted(selection: NonNullable<RuntimeState["modelSelections"]>[number]): void {
