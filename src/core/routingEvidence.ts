@@ -165,9 +165,16 @@ export function recommendRoutingPolicyChanges(
   options: { minimumSamples?: number } = {},
 ): RoutingPolicyRecommendation[] {
   const minimumSamples = options.minimumSamples ?? 10;
-  const groups = new Map<string, RoutingEvidenceEvent[]>();
+  const latestByDecision = new Map<string, RoutingEvidenceEvent>();
   for (const event of events) {
     if (event.outcome.type !== "stage-ended") continue;
+    const previous = latestByDecision.get(event.decisionId);
+    if (!previous || event.recordedAt >= previous.recordedAt || event.outcome.laterReversal || event.outcome.humanOverride) {
+      latestByDecision.set(event.decisionId, event);
+    }
+  }
+  const groups = new Map<string, RoutingEvidenceEvent[]>();
+  for (const event of latestByDecision.values()) {
     const key = `${event.stage}\u0000${event.task.workKind}\u0000${event.task.risk}\u0000${event.policyVersion}\u0000${event.profileVersion}`;
     const group = groups.get(key) ?? [];
     group.push(event);
