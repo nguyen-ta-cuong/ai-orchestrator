@@ -707,6 +707,7 @@ function constrainProjectRoutingPatch(
   protectDenyRules(routing, userRouting);
   protectLimits(routing, userRouting);
   protectBudgets(routing, userRouting);
+  protectEvidence(routing, userRouting);
   protectCircuitBreakers(routing, userRouting);
   protectSeparation(routing, userRouting);
   return { ...patch, routing: routing as unknown as ConfigPatch["routing"] };
@@ -794,6 +795,24 @@ function protectBudgets(routing: Record<string, unknown>, userRouting: Capabilit
   if (typeof routing.budgets.allowUnknownCost === "boolean") {
     routing.budgets.allowUnknownCost = !routing.budgets.allowUnknownCost;
   }
+}
+
+function protectEvidence(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.evidence === undefined) {
+    routing.evidence = cloneConfig(userRouting.evidence);
+    return;
+  }
+  if (!isPlainObject(routing.evidence)) return;
+  routing.evidence.enabled = protectedPermission(userRouting.evidence.enabled, routing.evidence.enabled);
+  routing.evidence.shadowComparisons = protectedPermission(
+    userRouting.evidence.shadowComparisons,
+    routing.evidence.shadowComparisons,
+  );
+  routing.evidence.minRecommendationSamples = protectedMaximum(
+    userRouting.evidence.minRecommendationSamples,
+    routing.evidence.minRecommendationSamples,
+  );
+  routing.evidence.userStoreDir = userRouting.evidence.userStoreDir;
 }
 
 function protectCircuitBreakers(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
