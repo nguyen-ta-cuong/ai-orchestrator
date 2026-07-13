@@ -254,6 +254,21 @@ describe("capability model routing", () => {
     expect(selectThinkingLevel("build", candidate, policy, "high")).toMatchObject({ requested: "high", selected: "high", clamped: false });
   });
 
+  it("excludes models that violate privacy policy before scoring", () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.privacy = { allowed: ["local", "private"], allowUnknown: false, providers: { local: "local", cloud: "public" } };
+    const decision = rankModels(request([
+      model({ provider: "local", model: "safe" }),
+      model({ provider: "cloud", model: "public" }),
+      model({ provider: "mystery", model: "unknown" }),
+    ], {
+      "local/safe": profile(), "cloud/public": profile(), "mystery/unknown": profile(),
+    }, { policy }));
+
+    expect(decision.eligible.map((candidate) => candidate.identity.model)).toEqual(["safe"]);
+    expect(decision.excluded.filter((candidate) => candidate.code === "privacy-not-allowed")).toHaveLength(2);
+  });
+
   it("returns typed exclusions when no candidate is eligible", () => {
     const unavailable = model({ provider: "p", model: "m", callable: false });
     const decision = rankModels(request([unavailable], { "p/m": profile() }));
