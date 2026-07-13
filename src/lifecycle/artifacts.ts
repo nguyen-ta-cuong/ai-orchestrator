@@ -509,6 +509,7 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     (candidate.rejectionFingerprints === undefined || (Array.isArray(candidate.rejectionFingerprints) && candidate.rejectionFingerprints.every(isFingerprint))) &&
     (candidate.buildEvidenceFingerprints === undefined || (Array.isArray(candidate.buildEvidenceFingerprints) && candidate.buildEvidenceFingerprints.every(isFingerprint))) &&
     (candidate.planFingerprint === undefined || isFingerprint(candidate.planFingerprint)) &&
+    isPendingCheckerVerdict(candidate.pendingCheckerVerdict) &&
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
     (candidate.routingPolicyVersion === undefined || (typeof candidate.routingPolicyVersion === "string" && candidate.routingPolicyVersion.length > 0)) &&
@@ -524,6 +525,18 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     isLifecycleFinalization(candidate.finalization) &&
     typeof candidate.yolo === "boolean"
   );
+}
+
+function isPendingCheckerVerdict(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  const phaseMatchesKind = (candidate.phase === "verifying" && candidate.kind === "verify") ||
+    (candidate.phase === "reviewing" && candidate.kind === "review") ||
+    (candidate.phase === "shipping" && candidate.kind === "ship");
+  return phaseMatchesKind && (candidate.verdict === "approve" || candidate.verdict === "reject") &&
+    typeof candidate.reasons === "string" && candidate.reasons.trim().length > 0 &&
+    (candidate.requiredFixes === undefined || (typeof candidate.requiredFixes === "string" && candidate.requiredFixes.trim().length > 0));
 }
 
 function isFingerprint(value: unknown): boolean {
