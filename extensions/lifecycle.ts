@@ -64,7 +64,8 @@ const WIDGET_KEY = ENTRY_TYPE;
 const VERDICT_TOOLS = new Set(["verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
-const PUBLICATION_COMMAND = /(?:^|[\s;&|])(?:git\s+(?:add|commit|push|tag)|gh\s+pr\s+create|(?:npm|pnpm|yarn)\s+publish)(?:\s|$)/i;
+const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
+const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
 const TESTABLE_READ_ONLY_PHASES = new Set<LifecyclePhase>(["verifying", "reviewing", "debugging", "shipping"]);
 
 type StandaloneStage = "spec" | "plan" | "build" | "test" | "debug" | "review" | "ship";
@@ -175,9 +176,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (event.toolName === "bash") {
       const command = typeof event.input.command === "string" ? event.input.command : "";
       if (state.phase === "building") {
-        const artifactsRoot = resolve(activeRuntime.paths.root, "..");
-        if (PUBLICATION_COMMAND.test(command) || command.includes(activeRuntime.config.lifecycle.artifactsDir) || command.includes(artifactsRoot)) {
-          return { block: true, reason: "BUILD may edit source but cannot modify lifecycle artifacts or stage, commit, tag, push, open a PR, or publish." };
+        const metadataRoot = resolve(activeRuntime.paths.root, "../..");
+        if (isBlockedBuildCommand(command, activeRuntime.config.lifecycle.artifactsDir, metadataRoot)) {
+          return { block: true, reason: "BUILD may edit source but cannot modify orchestrator metadata, perform destructive Git operations, or stage, commit, tag, push, open a PR, or publish." };
         }
         return;
       }
@@ -1110,6 +1111,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       },
     });
     if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+  }
+
+  function isBlockedBuildCommand(command: string, artifactsDir: string, metadataRoot: string): boolean {
+    const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
+    return PUBLICATION_COMMAND.test(normalized) || DESTRUCTIVE_GIT_COMMAND.test(normalized) ||
+      normalized.includes(artifactsDir) || normalized.includes(metadataRoot) || normalized.includes(".ai-orchestrator") ||
+      /\brm\b[\s\S]*?(?:\s\.\/?(?:\s|$)|\s\*|\/\*)/i.test(normalized) ||
+      /\bfind\b[\s\S]*?\s-delete\b/i.test(normalized);
   }
 
   function currentPhaseEntryKey(state: LifecycleState): string {
