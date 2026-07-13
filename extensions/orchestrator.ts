@@ -273,19 +273,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       }
 
       if (state.phase === "planning" || state.phase === "replanning") {
-        persistFastStageOutcome("plan", "unknown", "unknown");
         await handlePlanProduced(ctx, extractLastAssistantText(messages));
         return;
       }
 
       if (state.phase === "coding") {
-        persistFastStageOutcome("build", "unknown", "unknown");
         await handleCodeProduced(ctx);
         return;
       }
 
       if (state.phase === "judging") {
-        persistFastStageOutcome("fast-judge", state.pendingVerdict?.verdict ?? "unknown", Boolean(state.pendingVerdict));
         await handleJudgingEnded(ctx);
       }
     } catch (error) {
@@ -377,6 +374,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       return;
     }
 
+    persistFastStageOutcome("plan", "unknown", "unknown");
     const wasReplanning = state.phase === "replanning";
     state = {
       ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig()) as RuntimeState),
@@ -460,6 +458,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function handleCodeProduced(ctx: ExtensionContext): Promise<void> {
+    persistFastStageOutcome("build", "unknown", "unknown");
     state = nextPhase(state, { type: "code_produced" }, loopConfig()) as RuntimeState;
     state.judgeReminderSent = false;
     state.pendingVerdict = undefined;
@@ -502,6 +501,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       throw new Error("judge phase ended without a verdict");
     }
 
+    persistFastStageOutcome("fast-judge", verdict.verdict, true);
     const stateForTransition: OrchestratorState = { ...state };
     state = nextPhase(
       stateForTransition,
