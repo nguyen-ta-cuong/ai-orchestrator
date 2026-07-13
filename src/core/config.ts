@@ -690,7 +690,7 @@ function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routi
   // On MCP the repository may rank/pin within the trusted user catalog and tighten
   // deny/separation/ceilings. It cannot select the engine, invent profiles, relax
   // capability requirements, or alter scoring/cost treatment.
-  const allowed = new Set(["stages", "deny", "separation", "limits", "budgets", "circuitBreakers"]);
+  const allowed = new Set(["stages", "privacy", "deny", "separation", "limits", "budgets", "circuitBreakers"]);
   for (const key of Object.keys(routing)) {
     if (!allowed.has(key)) delete (routing as Record<string, unknown>)[key];
   }
