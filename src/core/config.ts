@@ -257,6 +257,8 @@ export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions
   const userMerged = deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders));
   validateConfig(cloneConfig(userMerged));
   const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
+  validateConfig(deepMerge(cloneConfig(userMerged), cloneConfig(projectPatch)));
+  constrainProjectExecutionSafetyPatch(projectPatch, userMerged);
   if (options.ignoreProjectMcpProviders) {
     constrainProjectMcpRoles(projectPatch);
     if (projectPatch.routing) constrainProjectMcpRoutingPatch(projectPatch.routing);
@@ -633,6 +635,35 @@ function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): 
   return rest;
 }
 
+function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: OrchestratorConfig): void {
+  if (patch.approval) {
+    patch.approval.requirePlanApproval = protectedBoolean(
+      trusted.approval.requirePlanApproval,
+      patch.approval.requirePlanApproval,
+    ) as boolean;
+  }
+  if (patch.judge) {
+    patch.judge.runTests = protectedBoolean(trusted.judge.runTests, patch.judge.runTests) as boolean;
+  }
+  if (patch.loop) {
+    patch.loop.maxCoderIterations = protectedMinimum(trusted.loop.maxCoderIterations, patch.loop.maxCoderIterations) as number;
+    patch.loop.plannerEscalationAfterRejections = protectedMinimum(
+      trusted.loop.plannerEscalationAfterRejections,
+      patch.loop.plannerEscalationAfterRejections,
+    ) as number;
+  }
+  if (patch.build) {
+    patch.build.commitPerTask = protectedPermission(
+      trusted.build.commitPerTask,
+      patch.build.commitPerTask,
+    ) as boolean;
+  }
+  if (patch.ship) {
+    patch.ship.commit = stricterMode<ShipCommitMode>(trusted.ship.commit, patch.ship.commit, ["never", "ask", "auto"]);
+    patch.ship.openPr = stricterMode<ShipOpenPrMode>(trusted.ship.openPr, patch.ship.openPr, ["never", "ask"]);
+  }
+}
+
 function constrainProjectMcpRoles(patch: ConfigPatch): void {
   // Repository config is not trusted to select models that receive user
   // credentials. MCP planner/judge exact routes therefore come only from
@@ -663,12 +694,53 @@ function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routi
 function constrainProjectRoutingPatch(patch: ConfigPatch, userRouting: CapabilityRoutingConfig): ConfigPatch {
   if (!patch.routing) return patch;
   const routing = cloneConfig(patch.routing) as unknown as Record<string, unknown>;
+  routing.engine = userRouting.engine;
+  routing.mode = userRouting.mode;
+  routing.allowInferredProfiles = protectedPermission(userRouting.allowInferredProfiles, routing.allowInferredProfiles);
+  routing.unknownCost = stricterMode(userRouting.unknownCost, routing.unknownCost, ["exclude", "penalize", "allow"]);
+  protectStageRequirements(routing, userRouting);
+  protectProfiles(routing, userRouting);
   protectDenyRules(routing, userRouting);
   protectLimits(routing, userRouting);
   protectBudgets(routing, userRouting);
   protectCircuitBreakers(routing, userRouting);
   protectSeparation(routing, userRouting);
   return { ...patch, routing: routing as unknown as ConfigPatch["routing"] };
+}
+
+function protectStageRequirements(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.stages === undefined) {
+    routing.stages = cloneConfig(userRouting.stages);
+    return;
+  }
+  if (!isPlainObject(routing.stages)) return;
+  for (const stageName of ROUTING_STAGES) {
+    const trusted = userRouting.stages[stageName];
+    const patch = routing.stages[stageName];
+    if (patch === undefined) {
+      routing.stages[stageName] = cloneConfig(trusted);
+      continue;
+    }
+    if (!isPlainObject(patch)) continue;
+    patch.requiredInput = protectedUnion(trusted.requiredInput, patch.requiredInput);
+    patch.minimumContextWindow = protectedMaximum(trusted.minimumContextWindow, patch.minimumContextWindow);
+    patch.minimumOutputTokens = protectedMaximum(trusted.minimumOutputTokens, patch.minimumOutputTokens);
+    patch.requiresReasoning = protectedBoolean(trusted.requiresReasoning, patch.requiresReasoning);
+    patch.minimumProfileConfidence = protectedMaximum(trusted.minimumProfileConfidence, patch.minimumProfileConfidence);
+    patch.thinking = stricterMode(trusted.thinking, patch.thinking, THINKING_LEVELS);
+    patch.minimumScores = protectedCapabilityMinimums(trusted.minimumScores, patch.minimumScores);
+  }
+}
+
+function protectProfiles(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.profiles === undefined) {
+    routing.profiles = cloneConfig(userRouting.profiles);
+    return;
+  }
+  if (!isPlainObject(routing.profiles)) return;
+  for (const [identity, profile] of Object.entries(userRouting.profiles)) {
+    routing.profiles[identity] = cloneConfig(profile);
+  }
 }
 
 function protectDenyRules(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
@@ -750,10 +822,7 @@ function protectSeparation(routing: Record<string, unknown>, userRouting: Capabi
     return;
   }
   if (!isPlainObject(routing.separation)) return;
-  routing.separation.checkerMustDifferFromBuilder = protectedBoolean(
-    userRouting.separation.checkerMustDifferFromBuilder,
-    routing.separation.checkerMustDifferFromBuilder,
-  );
+  routing.separation.checkerMustDifferFromBuilder = true;
   routing.separation.preferDifferentProviderFamily = protectedBoolean(
     userRouting.separation.preferDifferentProviderFamily,
     routing.separation.preferDifferentProviderFamily,
@@ -770,6 +839,30 @@ function protectedUnion(base: readonly string[], patch: unknown): unknown {
 
 function protectedMinimum(base: number, patch: unknown): unknown {
   return patch === undefined ? base : typeof patch === "number" ? Math.min(base, patch) : patch;
+}
+
+function protectedMaximum(base: number, patch: unknown): unknown {
+  return patch === undefined ? base : typeof patch === "number" ? Math.max(base, patch) : patch;
+}
+
+function protectedCapabilityMinimums(base: Partial<Record<string, number>>, patch: unknown): unknown {
+  if (patch === undefined) return cloneConfig(base);
+  if (!isPlainObject(patch)) return patch;
+  const result = { ...patch };
+  for (const [capability, minimum] of Object.entries(base)) {
+    if (minimum !== undefined) result[capability] = protectedMaximum(minimum, result[capability]);
+  }
+  return result;
+}
+
+function protectedPermission(base: boolean, patch: unknown): unknown {
+  return patch === undefined ? base : typeof patch === "boolean" ? base && patch : patch;
+}
+
+function stricterMode<T extends string>(base: T, patch: unknown, order: readonly T[]): T {
+  if (patch === undefined) return base;
+  if (typeof patch !== "string" || !order.includes(patch as T)) return patch as T;
+  return order[Math.min(order.indexOf(base), order.indexOf(patch as T))]!;
 }
 
 function protectedBoolean(base: boolean, patch: unknown): unknown {

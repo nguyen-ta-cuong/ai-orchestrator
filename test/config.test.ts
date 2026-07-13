@@ -80,7 +80,7 @@ describe("loadConfig", () => {
     });
     expect(config.loop.maxCoderIterations).toBe(5);
     expect(config.loop.plannerEscalationAfterRejections).toBe(2);
-    expect(config.approval.requirePlanApproval).toBe(false);
+    expect(config.approval.requirePlanApproval).toBe(true);
     expect(config.judge.runTests).toBe(false);
   });
 
@@ -325,8 +325,8 @@ describe("loadConfig", () => {
     });
 
     const config = loadConfig(project);
-    expect(config.routing.engine).toBe("legacy");
-    expect(config.routing.mode).toBe("quality");
+    expect(config.routing.engine).toBe("capability-shadow");
+    expect(config.routing.mode).toBe("balanced");
     expect(config.routing.budgets.maxEstimatedUsdPerStage).toBe(1);
     expect(config.routing.budgets.allowUnknownCost).toBe(false);
     expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(2);
@@ -342,24 +342,55 @@ describe("loadConfig", () => {
     vi.stubEnv("HOME", home);
     writeJson(join(home, ".ai-orchestrator", "config.json"), {
       routing: {
+        engine: "capability",
+        mode: "economy",
+        unknownCost: "exclude",
+        allowInferredProfiles: false,
         deny: { providers: ["denied-provider"], models: ["denied/model"] },
         limits: { maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 },
         budgets: { maxEstimatedUsdPerRun: 2, maxEstimatedUsdPerStage: 1, allowUnknownCost: false, maxPaidFallbacksPerRun: 1 },
         circuitBreakers: { maxSelectionFailures: 2, requireIndependentChecker: true },
         separation: { checkerMustDifferFromBuilder: true, requireDifferentProviderFamilyFor: ["review"] },
+        stages: { review: { minimumContextWindow: 128000, minimumProfileConfidence: 8000, minimumScores: { review: 8000 }, requiresReasoning: true } },
+        profiles: { "trusted/reviewer": { family: "trusted-family", confidence: 9000, scores: { review: 9000 } } },
       },
     });
     writeJson(join(project, ".ai-orchestrator.json"), {
+      approval: { requirePlanApproval: false },
+      judge: { runTests: false },
+      build: { commitPerTask: true },
+      ship: { commit: "auto" },
       routing: {
+        engine: "legacy",
+        mode: "quality",
+        unknownCost: "allow",
+        allowInferredProfiles: true,
         deny: { providers: [], models: [] },
         limits: { maxEstimatedUsdPerRun: 20, maxAttemptsPerStage: 8 },
         budgets: { maxEstimatedUsdPerRun: 20, maxEstimatedUsdPerStage: 10, allowUnknownCost: true, maxPaidFallbacksPerRun: 9 },
         circuitBreakers: { maxSelectionFailures: 9, requireIndependentChecker: false },
         separation: { checkerMustDifferFromBuilder: false, requireDifferentProviderFamilyFor: [] },
+        stages: { review: { minimumContextWindow: 1, minimumProfileConfidence: 1, minimumScores: { review: 1 }, requiresReasoning: false } },
+        profiles: { "trusted/reviewer": { family: "attacker-family", confidence: 1, scores: { review: 1 } } },
       },
     });
 
     const config = loadConfig(project);
+    expect(config.approval.requirePlanApproval).toBe(true);
+    expect(config.judge.runTests).toBe(true);
+    expect(config.build.commitPerTask).toBe(false);
+    expect(config.ship.commit).toBe("ask");
+    expect(config.routing.engine).toBe("capability");
+    expect(config.routing.mode).toBe("economy");
+    expect(config.routing.unknownCost).toBe("exclude");
+    expect(config.routing.allowInferredProfiles).toBe(false);
+    expect(config.routing.stages.review).toMatchObject({
+      minimumContextWindow: 128000,
+      minimumProfileConfidence: 8000,
+      minimumScores: { review: 8000 },
+      requiresReasoning: true,
+    });
+    expect(config.routing.profiles["trusted/reviewer"]).toMatchObject({ family: "trusted-family", confidence: 9000, scores: { review: 9000 } });
     expect(config.routing.deny.providers).toContain("denied-provider");
     expect(config.routing.deny.models).toContain("denied/model");
     expect(config.routing.limits).toEqual({ maxEstimatedUsdPerRun: 2, maxAttemptsPerStage: 2 });
@@ -426,8 +457,8 @@ describe("loadConfig", () => {
       { provider: "local", model: "debug-model", thinking: "high" },
     ]);
     expect(config.routing.lifecycle.stages.verify).toEqual(DEFAULT_CONFIG.routing.lifecycle.stages.verify);
-    expect(config.build.commitPerTask).toBe(true);
-    expect(config.ship).toEqual({ commit: "auto", openPr: "never" });
+    expect(config.build.commitPerTask).toBe(false);
+    expect(config.ship).toEqual({ commit: "ask", openPr: "never" });
   });
 
   it("rejects unsafe lifecycle paths and invalid ship modes", () => {
