@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -275,6 +276,23 @@ describe("lifecycle Pi extension safety", () => {
     await migrated.commands.get("lifecycle")!("resume", migrated.ctx);
     expect(migrated.pi.sendUserMessage).toHaveBeenCalled();
     expect(readState(run.paths)?.modelSelections.at(-1)?.routing?.failureCategories).not.toContain("policy-migrated");
+  });
+
+  it("retains convergence breakers when a re-plan is unchanged", async () => {
+    const run = makeRun("planning");
+    const state = readState(run.paths)!;
+    state.yolo = true;
+    state.rejectionFingerprints = ["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"];
+    state.planFingerprint = createHash("sha256").update("# plan").digest("hex").slice(0, 16);
+    writeState(run.paths, state);
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ routing: { circuitBreakers: { repeatedRejectionFingerprintLimit: 2 } } }));
+    const harness = extensionHarness(run.cwd);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+    await harness.events.get("agent_end")!({ messages: [{ role: "assistant", content: "plan unchanged" }] }, harness.ctx as unknown as ExtensionContext);
+    await harness.events.get("agent_settled")!({}, harness.ctx as unknown as ExtensionContext);
+
+    expect(readState(run.paths)?.rejectionFingerprints).toEqual(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"]);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("identical checker rejections");
   });
 
   it.each([
