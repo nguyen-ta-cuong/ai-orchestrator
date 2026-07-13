@@ -108,9 +108,12 @@ describe("fast Pi capability routing", () => {
     expect(activeTools).toContain("judge_verdict");
     await expect(judgeTool.execute("bad", { verdict: "reject", reasons: " ", requiredFixes: " " })).rejects.toThrow(/reasons must be non-empty/);
     await expect(judgeTool.execute("bad", { verdict: "reject", reasons: "real issue" })).rejects.toThrow(/requires non-empty requiredFixes/);
+    await events.get("agent_end")!({ messages: [{ role: "assistant", content: "review without verdict" }] }, ctx as unknown as ExtensionContext);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     const evidence = readFileSync(join(cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8")
       .trim().split("\n").map((line) => JSON.parse(line));
     expect(evidence.filter((event) => event.outcome.type === "stage-ended").map((event) => event.cost.observedUsd)).toEqual([0.02, 0.04]);
+    expect(evidence.some((event) => event.stage === "fast-judge" && event.outcome.type === "stage-ended")).toBe(false);
 
     setModel.mockImplementation(async (model: unknown) => (model as { id: string }).id !== "model");
     await commands.get("orchestrate-stop")!("", ctx);
