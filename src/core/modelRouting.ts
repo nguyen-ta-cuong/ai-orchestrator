@@ -389,6 +389,10 @@ function exclusionFor(
   if (policy.deny.models.includes(identityText)) return excluded("denied-model", `${identityText} is denied by policy`);
   const family = profile?.family ?? model.family;
   if (family && policy.deny.families.includes(family)) return excluded("denied-family", `family ${family} is denied by policy`);
+  const builder = latestBuildSelection(request.priorSelections);
+  if (builder && CHECKER_STAGES.has(request.stage) && modelIdentityKey(builder) === modelIdentityKey(model)) {
+    return excluded("same-builder-model", `${identityText} is the BUILD model and cannot check its own work`);
+  }
   if ((policy.mode === "pinned" || stage.pins.length > 0) && !stage.pins.includes(identityText)) {
     return excluded("pinned-only", `${identityText} is not pinned for ${request.stage}`);
   }
@@ -415,11 +419,7 @@ function exclusionFor(
     return excluded("cost-limit-exceeded", `${identityText} estimated cost $${estimatedCost.toFixed(4)} exceeds $${policy.limits.maxEstimatedUsdPerRun}`);
   }
 
-  const builder = latestBuildSelection(request.priorSelections);
   if (builder && CHECKER_STAGES.has(request.stage)) {
-    if (modelIdentityKey(builder) === modelIdentityKey(model)) {
-      return excluded("same-builder-model", `${identityText} is the BUILD model and cannot check its own work`);
-    }
     if (policy.separation.requireDifferentProviderFamilyFor.includes(request.stage)) {
       if (!family || !builder.family || family === builder.family) {
         return excluded("same-builder-family", `${identityText} does not prove a family distinct from BUILD`);
