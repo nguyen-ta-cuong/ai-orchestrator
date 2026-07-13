@@ -223,14 +223,24 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     deactivateVerdictTools();
     const loaded = loadCurrent(ctx.cwd);
-    if (!loaded || !isActivePhase(loaded.state.phase)) {
+    if (!loaded || (!isActivePhase(loaded.state.phase) && loaded.state.modelRestored !== false)) {
       clearUi(ctx);
       return;
     }
 
     if (loaded.state.modelRestored === false) {
-      await restoreOriginalModel(ctx, loaded.state);
+      const restored = await restoreOriginalModel(ctx, loaded.state);
       writeState(loaded.paths, loaded.state);
+      if (!restored) {
+        clearUi(ctx);
+        notify(ctx, `Lifecycle run ${loaded.state.runId} still needs original-model restoration. Fix model availability and use /lifecycle resume or /lifecycle-stop.`, "warning");
+        return;
+      }
+      if (!isActivePhase(loaded.state.phase)) {
+        releaseRun(ctx.cwd, loadPiConfig(ctx.cwd).lifecycle.artifactsDir, loaded.state.runId);
+        clearUi(ctx);
+        return;
+      }
     }
     clearUi(ctx);
     runtime = undefined;
@@ -429,11 +439,26 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, "No lifecycle run is available to resume.", "error");
       return;
     }
+    const resolved = loadPiResolvedConfig(ctx.cwd);
     if (!isActivePhase(loaded.state.phase)) {
-      notify(ctx, `Lifecycle run ${loaded.state.runId} is ${loaded.state.phase}; it cannot be resumed.`, "info");
+      if (loaded.state.modelRestored !== false) {
+        notify(ctx, `Lifecycle run ${loaded.state.runId} is ${loaded.state.phase}; it cannot be resumed.`, "info");
+        return;
+      }
+      runtime = makeRuntime(resolved.config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
+      restoreTools();
+      const restored = await restoreRuntimeModel(ctx);
+      if (restored) {
+        releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, loaded.state.runId);
+        notify(ctx, "Original lifecycle model restored; terminal run ownership released.", "info");
+      } else {
+        notify(ctx, "Original-model restoration is still pending. Fix model availability and run /lifecycle resume again.", "warning");
+      }
+      runtime = undefined;
+      deactivateVerdictTools();
+      clearUi(ctx);
       return;
     }
-    const resolved = loadPiResolvedConfig(ctx.cwd);
     const config = resolved.config;
     if (!loaded.state.originalModel) {
       loaded.state.originalModel = currentModelState(ctx);
@@ -1163,9 +1188,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const state = runtime.state;
     restoreTools();
-    await restoreRuntimeModel(ctx);
+    const restored = await restoreRuntimeModel(ctx);
     clearUi(ctx);
-    notify(ctx, message, "info");
+    notify(ctx, restored ? message : `${message} Original-model restoration is still pending; use /lifecycle resume to retry.`, restored ? "info" : "warning");
     persistMirror(state);
     runtime = undefined;
     deactivateVerdictTools();
@@ -1176,11 +1201,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const finished = runtime.state;
     const summary = finalSummary(finished, runtime.paths);
     restoreTools();
-    await restoreRuntimeModel(ctx);
-    releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
+    const restored = await restoreRuntimeModel(ctx);
+    if (restored) {
+      releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
+    } else {
+      appendJournal(runtime.paths, "Run finished but original-model restoration is pending; current ownership retained");
+    }
     clearUi(ctx);
     pi.sendMessage({ customType: ENTRY_TYPE, content: summary, display: true, details: finished }, { triggerTurn: false });
     persistMirror(finished);
+    if (!restored) notify(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /lifecycle resume.", "warning");
     runtime = undefined;
     deactivateVerdictTools();
   }
@@ -1191,7 +1221,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     try {
       if (!runtime) {
         const loaded = loadCurrent(ctx.cwd);
-        if (!loaded || !isActivePhase(loaded.state.phase)) {
+        if (!loaded || (!isActivePhase(loaded.state.phase) && loaded.state.modelRestored !== false)) {
           notify(ctx, "No active lifecycle run.", "info");
           return;
         }
@@ -1202,10 +1232,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       if (!ctx.isIdle()) ctx.abort();
       await transition({ type: "cancelled" }, "Lifecycle cancelled", ctx);
       restoreTools();
-      await restoreRuntimeModel(ctx);
-      releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
+      const restored = await restoreRuntimeModel(ctx);
+      if (restored) {
+        releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
+      } else {
+        appendJournal(runtime.paths, "Lifecycle cancelled but original-model restoration is pending; current ownership retained");
+      }
       clearUi(ctx);
       pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: stopped }, { triggerTurn: false });
+      if (!restored) notify(ctx, "Original-model restoration is pending. Fix model availability and run /lifecycle-stop again.", "warning");
       runtime = undefined;
       deactivateVerdictTools();
     } finally {
@@ -1350,35 +1385,40 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       : undefined;
   }
 
-  async function restoreRuntimeModel(ctx: ExtensionContext): Promise<void> {
-    if (!runtime) return;
+  async function restoreRuntimeModel(ctx: ExtensionContext): Promise<boolean> {
+    if (!runtime) return true;
     const originalModel = runtime.automatic ? runtime.state.originalModel : runtime.invocationOriginal;
-    await restoreOriginalModel(ctx, runtime.state, originalModel);
+    return restoreOriginalModel(ctx, runtime.state, originalModel);
   }
 
   async function restoreOriginalModel(
     ctx: ExtensionContext,
     state: LifecycleState,
     originalModel: LifecycleState["originalModel"] = state.originalModel,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const original = originalModel;
     if (!original) {
       state.modelRestored = true;
       persistRestoredState(state);
-      return;
+      return true;
     }
     const model = ctx.modelRegistry.find(original.provider, original.id);
     if (!model) {
+      state.modelRestored = false;
+      persistRestoredState(state);
       notify(ctx, `Could not restore original model ${original.provider}/${original.id}: model not found.`, "warning");
-      return;
+      return false;
     }
     if (!(await pi.setModel(model))) {
+      state.modelRestored = false;
+      persistRestoredState(state);
       notify(ctx, `Could not restore original model ${original.provider}/${original.id}: authentication unavailable.`, "warning");
-      return;
+      return false;
     }
     pi.setThinkingLevel(original.thinking);
     state.modelRestored = true;
     persistRestoredState(state);
+    return true;
   }
 
   function persistRestoredState(state: LifecycleState): void {
