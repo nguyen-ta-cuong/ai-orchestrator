@@ -172,6 +172,16 @@ describe("lifecycle artifacts", () => {
     expect(releaseRunLease(run.paths, "owner-b")).toBe(true);
   });
 
+  it("reclaims a current-run lock owned by a dead process", () => {
+    const cwd = makeTempDir();
+    const lock = join(cwd, artifactsDir, "current.lock");
+    mkdirSync(join(lock, ".."), { recursive: true });
+    writeFileSync(lock, `${JSON.stringify({ owner: "dead", pid: 99_999_999, createdAt: new Date().toISOString() })}\n`);
+
+    expect(createRun(cwd, artifactsDir, "recovered").runId).toMatch(/^\d{8}-\d{4}-[a-f0-9]{6}$/);
+    expect(existsSync(lock)).toBe(false);
+  });
+
   it("blocks creating a run while another process holds the current-run lock", () => {
     const cwd = makeTempDir();
     mkdirSync(join(cwd, ".ai-orchestrator", "runs", "current.lock"), { recursive: true });
