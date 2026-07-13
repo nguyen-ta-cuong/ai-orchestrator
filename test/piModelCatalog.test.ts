@@ -13,6 +13,7 @@ describe("Pi model catalog normalization", () => {
       contextWindow: 200_000,
       maxTokens: 32_000,
       cost: { input: 2, output: 8, cacheRead: 0.2, cacheWrite: 2 },
+      privacy: "private",
       thinkingLevelMap: { off: null, high: "high", xhigh: null, max: "max" },
       baseUrl: "https://secret.invalid",
       headers: { authorization: "secret" },
@@ -30,6 +31,7 @@ describe("Pi model catalog normalization", () => {
       contextWindow: 200_000,
       maxOutputTokens: 32_000,
       cost: { input: 2, output: 8, cacheRead: 0.2, cacheWrite: 2 },
+      privacy: "private",
     });
     expect(JSON.stringify(normalized)).not.toContain("secret");
   });
