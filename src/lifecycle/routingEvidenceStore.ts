@@ -52,6 +52,7 @@ export function readRoutingBudgetLedger(path: string): RoutingBudgetLedgerEvent[
   const events: RoutingBudgetLedgerEvent[] = [];
   for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
     if (!line) continue;
+    if (Buffer.byteLength(line, "utf8") > MAX_EVIDENCE_LINE_BYTES) throw new Error("routing budget ledger is corrupt: line exceeds size limit");
     try {
       const value = JSON.parse(line) as RoutingBudgetLedgerEvent;
       validateBudgetLedgerEvent(value);
@@ -142,7 +143,9 @@ function appendJsonLine(path: string, value: { eventId: string }): void {
 }
 
 function validateBudgetLedgerEvent(event: RoutingBudgetLedgerEvent): void {
-  if (event.version !== 1 || !event.eventId || !event.runId || !event.recordedAt ||
+  const allowed = new Set(["version", "eventId", "runId", "recordedAt", "outcome", "estimatedUsd", "observedUsd"]);
+  if (!event || typeof event !== "object" || Object.keys(event).some((key) => !allowed.has(key)) ||
+    event.version !== 1 || !event.eventId || !event.runId || !event.recordedAt ||
     (event.outcome !== "stage-started" && event.outcome !== "stage-ended") ||
     (event.estimatedUsd !== undefined && (!Number.isFinite(event.estimatedUsd) || event.estimatedUsd < 0)) ||
     (event.observedUsd !== undefined && (!Number.isFinite(event.observedUsd) || event.observedUsd < 0))) {
