@@ -15,7 +15,7 @@ import {
   type RoleName,
   type ThinkingLevel,
 } from "../src/core/config.js";
-import { createPiRoutingPlan, type PiRoutingCandidate, type PiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
+import { createPiRoutingPlan, piRoutingRunVersion, type PiRoutingCandidate, type PiRoutingPlan } from "../src/adapters/piCapabilityRouting.js";
 import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
 import {
   debugPrompt,
@@ -687,6 +687,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function enterModelStage(stage: LifecycleRoutedStage | "build", role: RoleName, ctx: ExtensionContext): Promise<boolean> {
     if (!runtime) return false;
+    const runPolicyVersion = piRoutingRunVersion(runtime.config, runtime.provenance);
+    if (runtime.state.routingPolicyVersion && runtime.state.routingPolicyVersion !== runPolicyVersion) {
+      await interruptRun(ctx, `Lifecycle routing policy changed from ${runtime.state.routingPolicyVersion} to ${runPolicyVersion}. Restore the saved policy or explicitly migrate the run before resuming.`);
+      return false;
+    }
+    if (!runtime.state.routingPolicyVersion) {
+      runtime.state.routingPolicyVersion = runPolicyVersion;
+      writeState(runtime.paths, runtime.state);
+      appendJournal(runtime.paths, `Routing policy frozen for run: ${runPolicyVersion}`);
+    }
     const available = ctx.modelRegistry.getAvailable();
     const plan = createPiRoutingPlan({
       config: runtime.config,
