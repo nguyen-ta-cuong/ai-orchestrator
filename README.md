@@ -84,7 +84,7 @@ Pi discovers the packaged `extensions/` and `skills/` directories.
 /orchestrate-stop
 ```
 
-The extension plans, waits for approval unless `--yolo` was supplied, lets the selected coder edit and test, and requires an independent structured judge verdict. By default, two consecutive rejections trigger re-planning and three total coder passes stop the run. `--yolo` skips plan approval only; it does not bypass testing, checking, iteration caps, or publication gates.
+The extension plans, waits for approval unless `--yolo` was supplied, lets the selected coder edit, delegates test execution to the independent checker, and requires a structured judge verdict. By default, two consecutive rejections trigger re-planning and three total coder passes stop the run. `--yolo` skips plan approval only; it does not bypass testing, checking, iteration caps, or publication gates.
 
 ### Durable lifecycle
 
@@ -98,8 +98,12 @@ Commands:
 ```text
 /lifecycle [--yolo] <task>   Create and drive a full run
 /lifecycle resume            Resume the active run from disk
+/lifecycle migrate-routing   Confirm policy migration for an unfinished run
 /lifecycle-stop              Cancel while preserving its run directory
 /lifecycle-models [stage]    Preview Pi legacy and capability routing
+/lifecycle-routing-report    Show report-only evidence recommendations
+/lifecycle-routing-apply N   Confirm a global trusted-user preference change
+/lifecycle-routing-rollback ID  Confirm exact rollback of an applied change
 /spec [--yolo] <idea>        Run DEFINE only
 /plan                        Run PLAN at the saved phase
 /build                       Run BUILD at the saved phase
