@@ -65,6 +65,7 @@ interface RuntimeState extends OrchestratorState {
   }>;
   rejectionFingerprints?: string[];
   buildEvidenceFingerprints?: string[];
+  planFingerprint?: string;
   routingFailures?: Array<{ stage: "plan" | "build" | "fast-judge"; identity: string; category: "not-found" | "unavailable" | "provider-error" }>;
   lastUsage?: {
     inputTokens: number;
@@ -395,13 +396,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
     persistFastStageOutcome("plan", "unknown", "unknown");
     const wasReplanning = state.phase === "replanning";
+    const nextPlanFingerprint = fastConvergenceFingerprint(planText);
+    const changedPlan = Boolean(state.planFingerprint && state.planFingerprint !== nextPlanFingerprint);
     state = {
       ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig()) as RuntimeState),
       judgeReminderSent: false,
       plannerReminderSent: false,
       latestJudgeFeedback: wasReplanning ? undefined : state.latestJudgeFeedback,
-      rejectionFingerprints: wasReplanning ? [] : state.rejectionFingerprints,
-      buildEvidenceFingerprints: wasReplanning ? [] : state.buildEvidenceFingerprints,
+      rejectionFingerprints: wasReplanning && changedPlan ? [] : state.rejectionFingerprints,
+      buildEvidenceFingerprints: wasReplanning && changedPlan ? [] : state.buildEvidenceFingerprints,
+      planFingerprint: nextPlanFingerprint,
     };
     persist();
     updateUi(ctx);
