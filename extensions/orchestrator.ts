@@ -114,7 +114,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   pi.registerCommand("orchestrate-stop", {
     description: "Stop the current orchestration and restore the original model",
     handler: async (_args, ctx) => {
-      if (state.phase === "idle") {
+      if (state.phase === "idle" && !isRestorePending(state)) {
         notifyUser(ctx, "No ai-orchestrator run is active.", "info");
         return;
       }
@@ -127,7 +127,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     if (!latest) {
       if (isActiveRunPhase(state.phase) || isRestorePending(state)) {
         if (isRestorePending(state)) {
-          await restorePendingSessionState(ctx, state);
+          state = await restorePendingSessionState(ctx, state);
+          if (isRestorePending(state)) {
+            persist();
+            notifyUser(ctx, "Previous ai-orchestrator run still needs original-model restoration. Fix model availability and use /orchestrate-stop to retry.", "warning");
+            updateUi(ctx);
+            return;
+          }
         } else {
           deactivateJudgeVerdictTool();
         }
@@ -144,6 +150,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
     if (isRestorePending(latest)) {
       latest = await restorePendingSessionState(ctx, latest);
+      if (isRestorePending(latest)) {
+        state = latest;
+        runtime = undefined;
+        notifyUser(ctx, "Original-model restoration is still pending. Fix model availability and use /orchestrate-stop to retry.", "warning");
+        updateUi(ctx);
+        return;
+      }
     }
 
     if (isActiveRunPhase(latest.phase)) {
@@ -165,7 +178,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
 
     if (isRestorePending(state)) {
-      await restorePendingSessionState(ctx, state);
+      state = await restorePendingSessionState(ctx, state);
+      if (isRestorePending(state)) {
+        clearUi(ctx);
+        persist();
+        return;
+      }
     } else {
       deactivateJudgeVerdictTool();
     }
@@ -240,6 +258,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   });
 
   async function startRun(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (isRestorePending(state)) {
+      notifyUser(ctx, "Original-model restoration is pending. Fix model availability and use /orchestrate-stop before starting another run.", "error");
+      return;
+    }
     if (state.phase !== "idle" && state.phase !== "done" && state.phase !== "failed") {
       notifyUser(ctx, "An ai-orchestrator run is already active. Use /orchestrate-stop first.", "error");
       return;
@@ -510,11 +532,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
   }
 
   async function finishRun(ctx: ExtensionContext): Promise<void> {
-    const summary = finalSummary(state);
-    restoreRunTools(state);
-    await restoreOriginalModel(ctx, state);
+    const completedState = state;
+    const summary = finalSummary(completedState);
+    restoreRunTools(completedState);
+    const restored = await restoreOriginalModel(ctx, completedState);
     clearUi(ctx);
-    pi.sendMessage({ customType: STATE_TYPE, content: summary, display: true, details: state }, { triggerTurn: false });
+    pi.sendMessage({ customType: STATE_TYPE, content: summary, display: true, details: completedState }, { triggerTurn: false });
+    if (!restored) {
+      state = completedState;
+      persist();
+      deactivateJudgeVerdictTool();
+      notifyUser(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /orchestrate-stop to retry.", "warning");
+      return;
+    }
     state = createRuntimeState();
     runtime = undefined;
     persist();
@@ -535,9 +565,20 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       state.runId = undefined;
       persist();
 
-      await restoreOriginalModel(ctx, stoppedState);
+      const restored = await restoreOriginalModel(ctx, stoppedState);
       clearUi(ctx);
       pi.sendMessage({ customType: STATE_TYPE, content: message, display: true, details: stoppedState }, { triggerTurn: false });
+      if (!restored) {
+        state = {
+          ...state,
+          originalModel: stoppedState.originalModel,
+          toolsBeforeRun: stoppedState.toolsBeforeRun,
+          toolsBeforeJudge: stoppedState.toolsBeforeJudge,
+        };
+        persist();
+        notifyUser(ctx, "Original-model restoration is pending. Fix model availability and run /orchestrate-stop again.", "warning");
+        return;
+      }
       state = createRuntimeState();
       runtime = undefined;
       persist();
@@ -640,26 +681,31 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     await stopRun(ctx, `ai-orchestrator aborted: ${reason}. ${configHint}`);
   }
 
-  async function restoreOriginalModel(ctx: ExtensionContext, source: RuntimeState): Promise<void> {
+  async function restoreOriginalModel(ctx: ExtensionContext, source: RuntimeState): Promise<boolean> {
     const original = source.originalModel;
-    if (!original) return;
+    if (!original) return true;
 
     const model = ctx.modelRegistry.find(original.provider, original.id);
     if (!model) {
       notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: model not found.`, "warning");
-    } else {
-      const restored = await pi.setModel(model);
-      if (!restored) {
-        notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: API key is unavailable.`, "warning");
-      }
+      return false;
+    }
+    const restored = await pi.setModel(model);
+    if (!restored) {
+      notifyUser(ctx, `Could not restore original model ${original.provider}/${original.id}: API key is unavailable.`, "warning");
+      return false;
     }
     pi.setThinkingLevel(original.thinking);
+    return true;
   }
 
   async function restorePendingSessionState(ctx: ExtensionContext, persistedState: RuntimeState): Promise<RuntimeState> {
     state = persistedState;
     restoreRunTools(persistedState);
-    await restoreOriginalModel(ctx, persistedState);
+    if (!(await restoreOriginalModel(ctx, persistedState))) {
+      persist();
+      return state;
+    }
     state = { ...state, originalModel: undefined, toolsBeforeRun: undefined, toolsBeforeJudge: undefined };
     persist();
     return state;
@@ -833,7 +879,7 @@ function isActiveRunPhase(phase: OrchestratorState["phase"]): boolean {
 }
 
 function isRestorePending(state: RuntimeState): boolean {
-  return Boolean(state.originalModel || state.toolsBeforeJudge);
+  return Boolean(state.originalModel || state.toolsBeforeRun || state.toolsBeforeJudge);
 }
 
 function findLastAssistant(messages: unknown[]): Record<string, unknown> | undefined {
