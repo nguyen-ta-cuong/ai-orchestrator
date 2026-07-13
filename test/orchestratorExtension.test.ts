@@ -110,6 +110,9 @@ describe("fast Pi capability routing", () => {
     expect(latest.modelSelections[1]).toMatchObject({
       failureCategories: ["provider-error"], attemptedModels: [expect.stringContaining("planner"), expect.stringContaining("selected")],
     });
+    expect((latest as unknown as { routingFailures: unknown[] }).routingFailures).toEqual([
+      expect.objectContaining({ stage: "plan", identity: "invented/planner", category: "provider-error" }),
+    ]);
     expect(activeTools).toContain("judge_verdict");
     await expect(judgeTool.execute("bad", { verdict: "reject", reasons: " ", requiredFixes: " " })).rejects.toThrow(/reasons must be non-empty/);
     await expect(judgeTool.execute("bad", { verdict: "reject", reasons: "real issue" })).rejects.toThrow(/requires non-empty requiredFixes/);
