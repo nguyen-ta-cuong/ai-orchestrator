@@ -33,6 +33,7 @@ function makeRun(phase: LifecyclePhase) {
 }
 
 function extensionHarness(cwd: string, models: Array<Record<string, unknown>> = [{ provider: "anthropic", id: "claude-fable-5" }]) {
+  vi.stubEnv("HOME", join(cwd, "home"));
   const commands = new Map<string, CommandHandler>();
   const events = new Map<string, EventHandler>();
   let activeTools = ["read", "bash", "agent_team"];
@@ -81,6 +82,7 @@ function extensionHarness(cwd: string, models: Array<Record<string, unknown>> = 
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -168,6 +170,9 @@ describe("lifecycle Pi extension safety", () => {
       cost: expect.objectContaining({ observedUsd: 0.012 }),
       outcome: expect.objectContaining({ type: "stage-ended", structuredToolCompliance: true }),
     }));
+    const userEvents = readFileSync(join(run.cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8");
+    expect(userEvents).toContain("coder-profile-v1");
+    expect(userEvents).toContain('"type":"stage-ended"');
   });
 
   it("pauses before model activation when a routing budget would be exceeded", async () => {

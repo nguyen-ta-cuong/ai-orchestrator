@@ -45,7 +45,7 @@ import {
   writeState,
   type RunPaths,
 } from "../src/lifecycle/artifacts.js";
-import { appendRoutingEvidenceEvent, readRoutingEvidenceEvents } from "../src/lifecycle/routingEvidenceStore.js";
+import { appendRoutingEvidenceEvent, readRoutingEvidenceEvents, resolveUserEvidenceRoot } from "../src/lifecycle/routingEvidenceStore.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -869,6 +869,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime || !runtime.config.routing.evidence.enabled) return;
     appendRoutingEvidenceEvent({
       runPaths: runtime.paths,
+      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
       event: {
         version: 1,
         eventId: `${decisionId}:stage-started`,
@@ -921,6 +922,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const usage = outcome.type === "final-status" ? undefined : runtime.lastUsage;
     appendRoutingEvidenceEvent({
       runPaths: runtime.paths,
+      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
       event: {
         version: 1,
         eventId: `${selection.routing.decisionId}:${outcome.type ?? "stage-ended"}:${runtime.state.buildIterations}:${runtime.state.verdicts.length}`,
