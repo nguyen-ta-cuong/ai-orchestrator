@@ -128,15 +128,16 @@ function fakeCompletion(role: ModelRole): string {
 }
 
 async function anthropicMessages(baseUrl: string, apiKey: string, role: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
+  const allocation = anthropicTokenAllocation(role);
   const json = await postJson(endpoint(baseUrl, "/messages"), {
     "content-type": "application/json",
     "x-api-key": apiKey,
     "anthropic-version": "2023-06-01",
   }, {
     model: role.model,
-    max_tokens: completionTokenLimit(role, anthropicMaxTokens(role.thinking)),
+    max_tokens: allocation.maxTokens,
     messages: [{ role: "user", content: prompt }],
-    ...anthropicThinking(role.thinking, completionTokenLimit(role, anthropicMaxTokens(role.thinking))),
+    ...(allocation.thinkingBudget > 0 ? { thinking: { type: "enabled", budget_tokens: allocation.thinkingBudget } } : {}),
   }, signal, [apiKey]);
   const response = json as { content?: Array<{ type?: string; text?: string }>; stop_reason?: string };
   if (response.stop_reason === "max_tokens") {
@@ -317,9 +318,11 @@ function openaiEffort(thinking: ThinkingLevel): "minimal" | "low" | "medium" | "
   return thinking === "minimal" ? "minimal" : thinking === "low" ? "low" : thinking === "medium" ? "medium" : "high";
 }
 
-function anthropicThinking(thinking: ThinkingLevel, maxTokens: number): Record<string, unknown> {
-  if (thinking === "off" || thinking === "minimal" || thinking === "low") {
-    return {};
+function anthropicTokenAllocation(role: McpCompletionCandidate): { maxTokens: number; thinkingBudget: number } {
+  const totalLimit = Math.max(1, Math.min(role.maxOutputTokens ?? anthropicMaxTokens(role.thinking), anthropicMaxTokens(role.thinking)));
+  const requestedVisible = Math.max(1, Math.min(role.requestedOutputTokens ?? Math.min(4_096, totalLimit), totalLimit));
+  if (role.thinking === "off" || role.thinking === "minimal" || role.thinking === "low") {
+    return { maxTokens: requestedVisible, thinkingBudget: 0 };
   }
   const budgetByLevel: Record<ThinkingLevel, number> = {
     off: 0,
@@ -330,7 +333,9 @@ function anthropicThinking(thinking: ThinkingLevel, maxTokens: number): Record<s
     xhigh: 4096,
     max: 8192,
   };
-  return { thinking: { type: "enabled", budget_tokens: Math.min(budgetByLevel[thinking], Math.max(1, maxTokens - 1)) } };
+  const availableThinking = Math.max(0, totalLimit - requestedVisible);
+  const thinkingBudget = availableThinking >= 1_024 ? Math.min(budgetByLevel[role.thinking], availableThinking) : 0;
+  return { maxTokens: requestedVisible + thinkingBudget, thinkingBudget };
 }
 
 function completionTokenLimit(role: McpCompletionCandidate, apiLimit: number): number {
