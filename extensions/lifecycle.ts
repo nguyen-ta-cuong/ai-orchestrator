@@ -1127,6 +1127,34 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (outcome.type !== "final-status") runtime.lastUsage = undefined;
   }
 
+  function persistDownstreamReversal(stage: "verify" | "review", reason: string): void {
+    if (!runtime?.config.routing.evidence.enabled) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing) return;
+    const started = readRoutingEvidenceEvents(runtime.paths.evidence).events.find((event) =>
+      event.decisionId === selection.routing!.decisionId && event.outcome.type === "stage-started");
+    if (!started) return;
+    appendRoutingEvidenceEvent({
+      runPaths: runtime.paths,
+      userStoreRoot: resolveUserEvidenceRoot(undefined, runtime.config.routing.evidence.userStoreDir),
+      event: {
+        ...started,
+        eventId: `${selection.routing.decisionId}:downstream-reversal:${runtime.state.verdicts.length}`,
+        recordedAt: new Date().toISOString(),
+        usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
+        cost: { estimatedUsd: started.cost.estimatedUsd, observedUsd: "unknown" },
+        outcome: {
+          type: "stage-ended",
+          structuredToolCompliance: true,
+          verdict: "reject",
+          laterReversal: true,
+          buildIteration: runtime.state.buildIterations,
+        },
+      },
+    });
+    appendJournal(runtime.paths, `${stage.toUpperCase()} downstream outcome reversed: ${truncate(reason, 120)}`);
+  }
+
   function isBlockedBuildCommand(command: string, artifactsDir: string, metadataRoot: string): boolean {
     const normalized = command.replace(/\\(?:\r?\n)?/g, "").replace(/["']/g, " ");
     return PUBLICATION_COMMAND.test(normalized) || DESTRUCTIVE_GIT_COMMAND.test(normalized) ||
@@ -1258,6 +1286,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!verdict) throw new Error(`${stage} verdict was not available after recovery`);
     runtime.pendingVerdict = undefined;
     persistRoutingStageOutcome(stage, { structuredToolCompliance, verdict: verdict.verdict });
+    if (verdict.verdict === "reject" && stage === "review") persistDownstreamReversal("verify", verdict.reasons);
+    if (verdict.verdict === "reject" && stage === "ship") {
+      persistDownstreamReversal("review", verdict.reasons);
+      persistDownstreamReversal("verify", verdict.reasons);
+    }
     await transition({
       type: "verdict",
       stage,
