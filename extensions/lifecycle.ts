@@ -713,8 +713,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         ...(selection.family ? { family: selection.family } : {}),
       })),
     });
+    const phaseEntryKey = currentPhaseEntryKey(runtime.state);
     const saved = [...runtime.state.modelSelections].reverse().find((selection) =>
-      selection.stage === stage && selection.routing && !selection.routing.failureCategories.includes("provider-error"));
+      selection.stage === stage && selection.routing?.phaseEntryKey === phaseEntryKey
+      && !selection.routing.failureCategories.includes("provider-error"));
     if (saved) {
       if (saved.routing!.policyVersion !== plan.policyVersion || saved.routing!.engine !== plan.engine) {
         await modelFailure(ctx, stage, [`saved decision ${saved.routing!.decisionId} uses a different routing policy`]);
@@ -808,6 +810,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         policyVersion: plan.policyVersion,
         ...(candidate.profileVersion ? { profileVersion: candidate.profileVersion } : {}),
         taskFeaturesHash: plan.taskFeaturesHash,
+        phaseEntryKey: currentPhaseEntryKey(runtime.state),
         selectedRank: candidate.rank,
         ...(candidate.score === undefined ? {} : { score: candidate.score }),
         separation,
@@ -1014,6 +1017,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       },
     });
     if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+  }
+
+  function currentPhaseEntryKey(state: LifecycleState): string {
+    return `${state.phase}:${state.buildIterations}:${state.verdicts.length}:${state.debugDiagnosisVerdictIndex ?? "none"}`;
   }
 
   function routingStageForPhase(phase: LifecyclePhase): LifecycleRoutedStage | "build" | undefined {
