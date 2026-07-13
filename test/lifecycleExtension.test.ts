@@ -150,6 +150,18 @@ describe("lifecycle Pi extension safety", () => {
     expect(readState(run.paths)?.modelSelections.filter((selection) => selection.stage === "build")).toHaveLength(2);
   });
 
+  it("exposes routing recommendations as a report without mutating policy", async () => {
+    const { cwd } = makeRun("planning");
+    const harness = extensionHarness(cwd);
+    await harness.commands.get("lifecycle-routing-report")!("", harness.ctx);
+
+    expect(harness.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("No routing recommendation") }),
+      { triggerTurn: false },
+    );
+    expect(existsSync(join(cwd, ".ai-orchestrator.json"))).toBe(false);
+  });
+
   it("rejects missing prerequisite artifacts before changing model or tools", async () => {
     const run = makeRun("planning");
     writeFileSync(run.paths.spec, "");
