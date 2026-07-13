@@ -511,6 +511,7 @@ function isRoutingSummary(value: unknown): boolean {
     typeof candidate.policyVersion === "string" &&
     (candidate.profileVersion === undefined || typeof candidate.profileVersion === "string") &&
     typeof candidate.taskFeaturesHash === "string" &&
+    (candidate.phaseEntryKey === undefined || typeof candidate.phaseEntryKey === "string") &&
     Number.isInteger(candidate.selectedRank) && (candidate.selectedRank as number) > 0 &&
     (candidate.score === undefined || typeof candidate.score === "number") &&
     (candidate.separation === "not-applicable" || candidate.separation === "different-model" || candidate.separation === "different-family") &&

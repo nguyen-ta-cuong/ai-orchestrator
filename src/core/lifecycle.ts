@@ -47,6 +47,7 @@ export interface LifecycleModelSelection {
     policyVersion: string;
     profileVersion?: string;
     taskFeaturesHash: string;
+    phaseEntryKey?: string;
     selectedRank: number;
     score?: number;
     separation: "not-applicable" | "different-model" | "different-family";
