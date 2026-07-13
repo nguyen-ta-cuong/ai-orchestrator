@@ -1164,6 +1164,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           model: candidate.model,
           ...(candidate.family ? { family: candidate.family } : {}),
         },
+        durationMs: "unknown",
+        fallbackCount: runtime.state.modelSelections.at(-1)?.routing?.fallbackCount ?? 0,
         usage: {
           inputTokens: "unknown",
           outputTokens: "unknown",
@@ -1227,6 +1229,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           model: selection.model,
           ...(selection.family ? { family: selection.family } : {}),
         },
+        durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+        fallbackCount: selection.routing.fallbackCount,
+        ...(outcome.verdict === "reject" ? { rejectionCategory: `${stage}-reject` } : {}),
         usage: {
           inputTokens: usage?.inputTokens ?? "unknown",
           outputTokens: usage?.outputTokens ?? "unknown",
@@ -1302,6 +1307,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         ...started,
         eventId: `${selection.routing.decisionId}:downstream-reversal:${runtime.state.verdicts.length}`,
         recordedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - Date.parse(selection.selectedAt)),
+        rejectionCategory: "downstream-reversal",
         usage: { inputTokens: "unknown", outputTokens: "unknown", cacheReadTokens: "unknown", cacheWriteTokens: "unknown" },
         cost: { estimatedUsd: started.cost.estimatedUsd, observedUsd: "unknown" },
         outcome: {
