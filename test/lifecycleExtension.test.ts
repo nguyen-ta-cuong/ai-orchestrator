@@ -129,6 +129,27 @@ describe("lifecycle Pi extension safety", () => {
     expect(readFileSync(run.paths.routing, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
+  it("records a fresh routing decision for a later BUILD pass", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      routing: { engine: "capability", unknownCost: "allow", profiles: {
+        "invented/coder": { confidence: 9000, version: "test", scores: { coding: 9500 } },
+      } },
+    }));
+    const models = [{ provider: "invented", id: "coder", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 16000 }];
+    const first = extensionHarness(run.cwd, models);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+
+    const state = readState(run.paths)!;
+    state.buildIterations += 1;
+    writeState(run.paths, state);
+    const next = extensionHarness(run.cwd, models);
+    await next.commands.get("lifecycle")!("resume", next.ctx);
+
+    expect(readState(run.paths)?.modelSelections.filter((selection) => selection.stage === "build")).toHaveLength(2);
+  });
+
   it("rejects missing prerequisite artifacts before changing model or tools", async () => {
     const run = makeRun("planning");
     writeFileSync(run.paths.spec, "");
