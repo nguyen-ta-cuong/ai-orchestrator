@@ -69,6 +69,8 @@ describe("fast Pi capability routing", () => {
       abort: vi.fn(),
     } as unknown as ExtensionCommandContext;
 
+    const judgeTool = vi.mocked(pi.registerTool).mock.calls.find(([tool]) => (tool as { name?: string }).name === "judge_verdict")?.[0] as { execute: (id: string, params: unknown) => Promise<unknown> };
+
     await commands.get("orchestrate")!("--yolo build a feature", ctx);
     expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
     await expect(events.get("tool_call")!({ toolName: "edit", input: {} }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
@@ -104,6 +106,8 @@ describe("fast Pi capability routing", () => {
     ]);
     expect((latest.modelSelections[0] as { failureCategories?: string[] }).failureCategories).toContain("provider-error");
     expect(activeTools).toContain("judge_verdict");
+    await expect(judgeTool.execute("bad", { verdict: "reject", reasons: " ", requiredFixes: " " })).rejects.toThrow(/reasons must be non-empty/);
+    await expect(judgeTool.execute("bad", { verdict: "reject", reasons: "real issue" })).rejects.toThrow(/requires non-empty requiredFixes/);
     const evidence = readFileSync(join(cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8")
       .trim().split("\n").map((line) => JSON.parse(line));
     expect(evidence.filter((event) => event.outcome.type === "stage-ended").map((event) => event.cost.observedUsd)).toEqual([0.02, 0.04]);
