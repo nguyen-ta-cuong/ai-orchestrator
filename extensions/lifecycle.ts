@@ -858,11 +858,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       const expectedRunId = runtime.state.runId;
       const expectedPhase = runtime.state.phase;
-      if (!(await pi.setModel(model))) {
+      const activated = await pi.setModel(model);
+      if (!runtime || !ownsRun(expectedRunId, expectedPhase)) return false;
+      if (!activated) {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
         continue;
       }
-      if (!runtime || !ownsRun(expectedRunId, expectedPhase)) return false;
       attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "selected" });
       pi.setThinkingLevel(candidate.thinking);
       recordModelSelection(stage, candidate, plan, attempts);
