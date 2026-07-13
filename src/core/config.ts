@@ -42,6 +42,7 @@ export interface McpModelConfig {
   contextWindow: number;
   maxOutputTokens: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  privacy?: "local" | "private" | "public" | "unknown";
   /** Key in routing.profiles. Defaults to provider/model. */
   profile?: string;
 }
@@ -113,6 +114,7 @@ type ConfigPatch = Partial<{
   routing: Partial<CapabilityRoutingConfig> & {
     lifecycle?: Partial<{ enabled: boolean; stages: Partial<Record<LifecycleRoutedStage, ModelCandidate[]>> }>;
     deny?: Partial<RoutingPolicy["deny"]>;
+    privacy?: Partial<RoutingPolicy["privacy"]>;
     separation?: Partial<RoutingPolicy["separation"]>;
     limits?: Partial<RoutingPolicy["limits"]>;
     evidence?: Partial<RoutingEvidenceConfig>;
@@ -405,6 +407,10 @@ function validateCapabilityRouting(routing: Record<string, unknown>): void {
   requireNonNegativeInteger(routing.confidenceBonusBasisPoints, "routing.confidenceBonusBasisPoints");
   requireNonNegativeNumber(routing.costPenaltyBasisPointsPerUsd, "routing.costPenaltyBasisPointsPerUsd");
 
+  const privacy = requirePlainObject(routing.privacy, "routing.privacy");
+  requireEnumArray(privacy.allowed, "routing.privacy.allowed", ["local", "private", "public"] as const);
+  requireBoolean(privacy.allowUnknown, "routing.privacy.allowUnknown");
+
   const deny = requirePlainObject(routing.deny, "routing.deny");
   requireStringArray(deny.providers, "routing.deny.providers");
   requireStringArray(deny.models, "routing.deny.models");
@@ -512,6 +518,7 @@ function validateMcpModel(value: unknown, path: string): void {
   requirePositiveInteger(model.contextWindow, `${path}.contextWindow`);
   requirePositiveInteger(model.maxOutputTokens, `${path}.maxOutputTokens`);
   if (model.profile !== undefined) requireNonEmptyString(model.profile, `${path}.profile`);
+  if (model.privacy !== undefined) requireStringEnum(model.privacy, `${path}.privacy`, ["local", "private", "public", "unknown"] as const);
   if (model.cost !== undefined) {
     const cost = requirePlainObject(model.cost, `${path}.cost`);
     for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) requireNonNegativeNumber(cost[key], `${path}.cost.${key}`);
@@ -704,6 +711,7 @@ function constrainProjectRoutingPatch(
   routing.unknownCost = stricterMode(userRouting.unknownCost, routing.unknownCost, ["exclude", "penalize", "allow"]);
   protectStageRequirements(routing, userRouting);
   protectProfiles(routing, userRouting);
+  protectPrivacy(routing, userRouting);
   protectDenyRules(routing, userRouting);
   protectLimits(routing, userRouting);
   protectBudgets(routing, userRouting);
@@ -746,6 +754,19 @@ function protectProfiles(routing: Record<string, unknown>, userRouting: Capabili
   for (const [identity, profile] of Object.entries(userRouting.profiles)) {
     routing.profiles[identity] = cloneConfig(profile);
   }
+}
+
+function protectPrivacy(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
+  if (routing.privacy === undefined) {
+    routing.privacy = cloneConfig(userRouting.privacy);
+    return;
+  }
+  if (!isPlainObject(routing.privacy)) return;
+  const projectAllowed = routing.privacy.allowed;
+  routing.privacy.allowed = Array.isArray(projectAllowed)
+    ? userRouting.privacy.allowed.filter((value) => projectAllowed.includes(value))
+    : projectAllowed ?? [...userRouting.privacy.allowed];
+  routing.privacy.allowUnknown = protectedPermission(userRouting.privacy.allowUnknown, routing.privacy.allowUnknown);
 }
 
 function protectDenyRules(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
