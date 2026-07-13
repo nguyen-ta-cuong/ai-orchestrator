@@ -65,6 +65,7 @@ const WIDGET_KEY = ENTRY_TYPE;
 const VERDICT_TOOLS = new Set(["verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
+const BUILD_TOOL_ALLOWLIST = new Set(["read", "grep", "find", "ls", "edit", "write"]);
 const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
 const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
 const TESTABLE_READ_ONLY_PHASES = new Set<LifecyclePhase>(["verifying", "reviewing", "debugging", "shipping"]);
@@ -1883,7 +1884,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function restoreBuildTools(): void {
     if (!runtime) return;
-    pi.setActiveTools(runtime.toolsBeforeRun);
+    pi.setActiveTools(runtime.toolsBeforeRun.filter((tool) => BUILD_TOOL_ALLOWLIST.has(tool)));
   }
 
   function restoreTools(): void {
