@@ -450,6 +450,7 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     candidate.verdicts.every(isLifecycleVerdict) &&
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
+    (candidate.routingPolicyVersion === undefined || typeof candidate.routingPolicyVersion === "string") &&
     (candidate.debugPath === undefined || typeof candidate.debugPath === "string") &&
     (candidate.debugDiagnosisVerdictIndex === undefined ||
       (Number.isInteger(candidate.debugDiagnosisVerdictIndex) && candidate.debugDiagnosisVerdictIndex >= 0)) &&
