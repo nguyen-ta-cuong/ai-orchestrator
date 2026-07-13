@@ -263,7 +263,7 @@ export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions
     constrainProjectMcpRoles(projectPatch);
     if (projectPatch.routing) constrainProjectMcpRoutingPatch(projectPatch.routing);
   }
-  const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing));
+  const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing, userConfig.routing));
 
   return {
     config: interpolateMcpApiKeys(validateConfig(merged)),
@@ -691,11 +691,15 @@ function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routi
   }
 }
 
-function constrainProjectRoutingPatch(patch: ConfigPatch, userRouting: CapabilityRoutingConfig): ConfigPatch {
+function constrainProjectRoutingPatch(
+  patch: ConfigPatch,
+  userRouting: CapabilityRoutingConfig,
+  explicitUserRouting?: ConfigPatch["routing"],
+): ConfigPatch {
   if (!patch.routing) return patch;
   const routing = cloneConfig(patch.routing) as unknown as Record<string, unknown>;
-  routing.engine = userRouting.engine;
-  routing.mode = userRouting.mode;
+  if (explicitUserRouting?.engine !== undefined) routing.engine = userRouting.engine;
+  if (explicitUserRouting?.mode !== undefined) routing.mode = userRouting.mode;
   routing.allowInferredProfiles = protectedPermission(userRouting.allowInferredProfiles, routing.allowInferredProfiles);
   routing.unknownCost = stricterMode(userRouting.unknownCost, routing.unknownCost, ["exclude", "penalize", "allow"]);
   protectStageRequirements(routing, userRouting);

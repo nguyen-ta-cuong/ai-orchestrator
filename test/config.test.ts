@@ -325,8 +325,8 @@ describe("loadConfig", () => {
     });
 
     const config = loadConfig(project);
-    expect(config.routing.engine).toBe("capability-shadow");
-    expect(config.routing.mode).toBe("balanced");
+    expect(config.routing.engine).toBe("legacy");
+    expect(config.routing.mode).toBe("quality");
     expect(config.routing.budgets.maxEstimatedUsdPerStage).toBe(1);
     expect(config.routing.budgets.allowUnknownCost).toBe(false);
     expect(config.routing.circuitBreakers.maxSelectionFailures).toBe(2);
