@@ -508,30 +508,38 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       case "awaiting_spec_approval":
         await requestArtifactApproval(ctx, "spec");
         break;
-      case "planning":
+      case "planning": {
+        const spec = readRequired(runtime.paths.spec, "spec");
         if (!(await enterRoutedStage("plan", "planner", ctx))) return;
         activateArtifactTools();
         updateUi(ctx);
-        sendPrompt(taskPlanPrompt(readRequired(runtime.paths.spec, "spec"), rel(runtime.paths.plan), runtime.planRevisionFeedback ?? replanFeedback()));
+        sendPrompt(taskPlanPrompt(spec, rel(runtime.paths.plan), runtime.planRevisionFeedback ?? replanFeedback()));
         break;
+      }
       case "awaiting_plan_approval":
         await requestArtifactApproval(ctx, "plan");
         break;
       case "building":
         await enterBuild(ctx);
         break;
-      case "verifying":
+      case "verifying": {
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("verify", "verifier", ctx))) return;
         activateReadOnlyTools("verify_verdict");
         updateUi(ctx);
-        sendPrompt(verifyPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
+        sendPrompt(verifyPrompt(spec, plan, runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
         break;
-      case "reviewing":
+      }
+      case "reviewing": {
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("review", "reviewer", ctx))) return;
         activateReadOnlyTools("review_verdict");
         updateUi(ctx);
-        sendPrompt(reviewPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan")));
+        sendPrompt(reviewPrompt(spec, plan));
         break;
+      }
       case "debugging": {
         const rejectionIndex = latestRejectionIndex();
         if (runtime.state.debugDiagnosisVerdictIndex === rejectionIndex && isNonEmpty(runtime.paths.debug)) {
@@ -542,6 +550,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           else await continueOrPause(ctx, nextStandaloneForPhase(recoveredPhase));
           break;
         }
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         runtime.state.debugDiagnosisVerdictIndex = undefined;
         writeState(runtime.paths, runtime.state);
         assertRunPathsSafe(runtime.paths);
@@ -550,19 +560,22 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         activateReadOnlyTools("debug_diagnosis");
         updateUi(ctx);
         sendPrompt(debugPrompt(
-          readRequired(runtime.paths.spec, "spec"),
-          readRequired(runtime.paths.plan, "plan"),
+          spec,
+          plan,
           latestRejection(),
           rel(runtime.paths.debug),
         ));
         break;
       }
-      case "shipping":
+      case "shipping": {
+        const spec = readRequired(runtime.paths.spec, "spec");
+        const plan = readRequired(runtime.paths.plan, "plan");
         if (!(await enterRoutedStage("ship", "shipper", ctx))) return;
         activateReadOnlyTools("ship_decision");
         updateUi(ctx);
-        sendPrompt(shipPrompt(readRequired(runtime.paths.spec, "spec"), readRequired(runtime.paths.plan, "plan"), runtime.state.verdicts));
+        sendPrompt(shipPrompt(spec, plan, runtime.state.verdicts));
         break;
+      }
       case "awaiting_ship_approval":
         await requestShipApproval(ctx);
         break;
@@ -583,10 +596,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
+    const plan = readRequired(runtime.paths.plan, "plan");
     restoreBuildTools();
     if (!(await enterModelStage("build", "coder", ctx))) return;
     updateUi(ctx);
-    sendPrompt(buildPrompt(readRequired(runtime.paths.plan, "plan"), buildFeedback(), runtime.config.build.commitPerTask));
+    sendPrompt(buildPrompt(plan, buildFeedback(), runtime.config.build.commitPerTask));
   }
 
   async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<boolean> {
