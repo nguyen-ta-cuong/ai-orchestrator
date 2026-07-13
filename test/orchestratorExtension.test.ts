@@ -72,10 +72,14 @@ describe("fast Pi capability routing", () => {
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "rm -rf src" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
+    expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "edit", "bash"]);
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implemented" }] }, ctx as unknown as ExtensionContext);
+    expect(activeTools).toEqual(["read", "edit", "bash"]);
+    await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash", "judge_verdict"]);
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git diff --staged" } }, ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git reset --hard" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });

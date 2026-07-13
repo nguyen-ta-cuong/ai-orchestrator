@@ -57,6 +57,7 @@ interface RuntimeConfig {
 export default function orchestratorExtension(pi: ExtensionAPI): void {
   let state: RuntimeState = createRuntimeState();
   let runtime: RuntimeConfig | undefined;
+  let pendingSettlement: { runId?: string; messages: unknown[] } | undefined;
   let stopping = false;
 
   pi.registerFlag("orchestrate-yolo", {
@@ -196,10 +197,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("agent_end", async (event) => {
+    if (isActiveRunPhase(state.phase)) {
+      pendingSettlement = { runId: state.runId, messages: event.messages };
+    }
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!pendingSettlement || pendingSettlement.runId !== state.runId) return;
+    const { messages } = pendingSettlement;
+    pendingSettlement = undefined;
     try {
       if (isActiveRunPhase(state.phase)) {
-        const stopReason = lastAssistantStopReason(event.messages);
+        const stopReason = lastAssistantStopReason(messages);
         if (stopReason === "aborted") {
           await stopRun(ctx, "ai-orchestrator run was aborted by user; original model restored.");
           return;
@@ -211,7 +221,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       }
 
       if (state.phase === "planning" || state.phase === "replanning") {
-        await handlePlanProduced(ctx, extractLastAssistantText(event.messages));
+        await handlePlanProduced(ctx, extractLastAssistantText(messages));
         return;
       }
 
