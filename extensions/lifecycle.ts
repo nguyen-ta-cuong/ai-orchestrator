@@ -207,9 +207,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     try {
       const stopReason = lastAssistantStopReason(messages);
       if (stopReason === "aborted" || stopReason === "error") {
+        if (stopReason === "error") recordProviderFailure();
         await interruptRun(ctx, stopReason === "aborted"
           ? "Lifecycle turn was aborted. Run /lifecycle resume to continue."
-          : "Lifecycle turn ended with a model/provider error. Run /lifecycle resume to retry.");
+          : "Lifecycle turn ended with a model/provider error. Run /lifecycle resume to try the next eligible fallback.");
         return;
       }
 
@@ -712,7 +713,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         ...(selection.family ? { family: selection.family } : {}),
       })),
     });
-    const saved = [...runtime.state.modelSelections].reverse().find((selection) => selection.stage === stage && selection.routing);
+    const saved = [...runtime.state.modelSelections].reverse().find((selection) =>
+      selection.stage === stage && selection.routing && !selection.routing.failureCategories.includes("provider-error"));
     if (saved) {
       if (saved.routing!.policyVersion !== plan.policyVersion || saved.routing!.engine !== plan.engine) {
         await modelFailure(ctx, stage, [`saved decision ${saved.routing!.decisionId} uses a different routing policy`]);
@@ -736,8 +738,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
 
     runtime.attemptedModels = [];
+    const providerFailed = new Set(runtime.state.modelSelections
+      .filter((selection) => selection.stage === stage && selection.routing?.failureCategories.includes("provider-error"))
+      .map((selection) => `${selection.provider}/${selection.model}`));
     const attempts: { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[] = [];
     for (const candidate of plan.candidates) {
+      if (providerFailed.has(`${candidate.provider}/${candidate.model}`)) {
+        attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
+        continue;
+      }
       const label = `${candidate.provider}/${candidate.model}`;
       if (breakerBlocksCandidate(stage, candidate, attempts)) {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
@@ -1005,6 +1014,18 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       },
     });
     if (outcome.type !== "final-status") runtime.lastUsage = undefined;
+  }
+
+  function routingStageForPhase(phase: LifecyclePhase): LifecycleRoutedStage | "build" | undefined {
+    return ({
+      defining: "define",
+      planning: "plan",
+      building: "build",
+      verifying: "verify",
+      reviewing: "review",
+      debugging: "debug",
+      shipping: "ship",
+    } as Partial<Record<LifecyclePhase, LifecycleRoutedStage | "build">>)[phase];
   }
 
   function isCheckerRoutingStage(stage: LifecycleRoutedStage | "build"): boolean {
@@ -1457,6 +1478,19 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function releaseRuntimeLease(): void {
     if (runtime) releaseRunLease(runtime.paths, runtime.leaseOwner);
+  }
+
+  function recordProviderFailure(): void {
+    if (!runtime) return;
+    const stage = routingStageForPhase(runtime.state.phase);
+    if (!stage) return;
+    const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
+    if (!selection?.routing || selection.routing.failureCategories.includes("provider-error")) return;
+    selection.routing.failureCategories.push("provider-error");
+    selection.routing.fallbackCount += 1;
+    writeState(runtime.paths, runtime.state);
+    appendJournal(runtime.paths, `Model ${stage}: ${selection.provider}/${selection.model} failed during provider execution; fallback required`);
+    persistMirror(runtime.state);
   }
 
   function latestRejectionIndex(): number {
