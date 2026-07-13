@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -471,7 +471,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     if (!ctx.hasUI || !(await ctx.ui.confirm(
       "Apply routing recommendation to trusted user config?",
-      `${recommendation.expectedTradeoff}\n\nThis writes only routing.stages.${recommendation.stage}.prefer in ~/.ai-orchestrator/config.json and creates a rollback record.`,
+      `Observed category: ${recommendation.taskCategory}\n${recommendation.downstreamEvidence}\n${recommendation.expectedTradeoff}\n\nScope: this writes a GLOBAL routing.stages.${recommendation.stage}.prefer entry for every task in trusted user config and creates a rollback record.`,
     ))) return;
 
     const configPath = join(homedir(), ".ai-orchestrator", "config.json");
@@ -486,11 +486,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const previousVersion = typeof routing.version === "string" ? routing.version : undefined;
     const id = `${Date.now()}-${randomUUID().slice(0, 8)}`;
     routing.version = `recommendation-${id}`;
-    writeUserJson(configPath, raw);
-    writeUserJson(join(userStoreRoot, "recommendations", `${id}.json`), {
-      version: 1, id, status: "applied", appliedAt: new Date().toISOString(), stage: recommendation.stage,
+    const recordPath = join(userStoreRoot, "recommendations", `${id}.json`);
+    const record = {
+      version: 1, id, status: "pending", appliedAt: new Date().toISOString(), stage: recommendation.stage,
       identity, previousPrefer, appliedPrefer, previousVersion, appliedVersion: routing.version,
-    });
+    };
+    writeUserJson(recordPath, record);
+    writeUserJson(configPath, raw);
+    writeUserJson(recordPath, { ...record, status: "applied" });
     notify(ctx, `Applied routing recommendation ${id}. Roll back with /lifecycle-routing-rollback ${id}.`, "info");
   }
 
@@ -504,18 +507,22 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const userStoreRoot = resolveUserEvidenceRoot(undefined, config.routing.evidence.userStoreDir);
     const recordPath = join(userStoreRoot, "recommendations", `${id}.json`);
     const record = readUserConfigObject(recordPath) as Record<string, unknown>;
-    if (record.status !== "applied" || typeof record.stage !== "string" || !Array.isArray(record.previousPrefer) || !Array.isArray(record.appliedPrefer)) {
+    const validStage = typeof record.stage === "string" && ["define", "plan", "build", "verify", "debug", "review", "ship", "fast-judge"].includes(record.stage);
+    const validPrevious = Array.isArray(record.previousPrefer) && record.previousPrefer.every((value) => typeof value === "string");
+    const validApplied = Array.isArray(record.appliedPrefer) && record.appliedPrefer.every((value) => typeof value === "string");
+    if (record.status !== "applied" || !validStage || !validPrevious || !validApplied || typeof record.appliedVersion !== "string") {
       notify(ctx, `Recommendation ${id} is unavailable or already rolled back.`, "error");
       return;
     }
-    if (!ctx.hasUI || !(await ctx.ui.confirm("Rollback routing recommendation?", `Restore the previous trusted user preference list for ${record.stage}?`))) return;
+    const recordStage = record.stage as string;
+    if (!ctx.hasUI || !(await ctx.ui.confirm("Rollback routing recommendation?", `Restore the previous trusted user preference list for ${recordStage}?`))) return;
     const configPath = join(homedir(), ".ai-orchestrator", "config.json");
     const raw = readUserConfigObject(configPath);
     const routing = objectChild(raw, "routing");
     const stages = objectChild(routing, "stages");
-    const stage = objectChild(stages, record.stage);
-    if (JSON.stringify(stage.prefer ?? []) !== JSON.stringify(record.appliedPrefer)) {
-      notify(ctx, "Current user preferences changed after application; refusing an unsafe automatic rollback.", "error");
+    const stage = objectChild(stages, recordStage);
+    if (JSON.stringify(stage.prefer ?? []) !== JSON.stringify(record.appliedPrefer) || routing.version !== record.appliedVersion) {
+      notify(ctx, "Current user preferences or policy version changed after application; refusing an unsafe automatic rollback.", "error");
       return;
     }
     stage.prefer = record.previousPrefer;
@@ -544,12 +551,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function writeUserJson(path: string, value: Record<string, unknown>): void {
     const directory = join(path, "..");
-    mkdirSync(directory, { recursive: true });
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
     if (lstatSync(directory).isSymbolicLink()) throw new Error(`Refusing symlinked user policy directory: ${directory}`);
     if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw new Error(`Refusing symlinked user policy file: ${path}`);
+    const existingMode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600;
+    const secureMode = existingMode & 0o600 || 0o600;
     const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode: secureMode });
     renameSync(temporary, path);
+    chmodSync(path, secureMode);
   }
 
   async function startPipeline(args: string, ctx: ExtensionCommandContext): Promise<void> {
