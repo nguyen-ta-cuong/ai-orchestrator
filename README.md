@@ -9,6 +9,13 @@ AI Orchestrator separates planning, implementation, and checking instead of aski
 
 The working tree is never reverted automatically. SHIP never pushes. Built-in model names are defaults or preferences, not universal requirements.
 
+## Documentation
+
+- [Setup guide](docs/setup.md): install Pi or Cursor, configure trusted MCP providers/models, and verify the installation.
+- [User guide](docs/user-guide.md): run the fast path, durable lifecycle, routing operations, Cursor handoffs, recovery, and publication gates.
+- [Configuration and trust boundaries](#configuration-and-trust-boundaries): complete routing/catalog reference and security model.
+- [Troubleshooting](#troubleshooting): common Pi, Cursor, MCP, routing, and recovery problems.
+
 ## Architecture and surface parity
 
 All surfaces use the same pure routing concepts: stage requirements, task features, capability profiles, pins/preferences, deny rules, cost-aware ranking, policy versions, and maker/checker separation. The fast planner maps to `plan`; the fast judge maps to `fast-judge`, a combined verification/review policy. Existing loop state machines remain authoritative for counters and escalation.
@@ -372,7 +379,7 @@ Change roles, legacy candidate lists, catalog entries, profiles, and policy to m
 
 ## Clean install, package contents, and validation
 
-The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, and `src/`. npm also includes package metadata and this README. Plans and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
+The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, `src/`, and the user-facing setup/user guides under `docs/`. npm also includes package metadata and this README. Plans, internal design documents, and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
 
 The MCP binary uses the runtime dependencies `@modelcontextprotocol/sdk` and `zod`; it does not require optional Pi peer packages. Pi peers remain optional so a clean MCP/Cursor install does not need Pi.
 
