@@ -221,6 +221,13 @@ describe("lifecycle Pi extension safety", () => {
     expect(readFileSync(run.paths.journal, "utf8")).toContain("routing policy changed");
     expect(readState(run.paths)?.phase).toBe("building");
     expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
+
+    await resumed.commands.get("lifecycle")!("migrate-routing", resumed.ctx);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("Routing policy explicitly migrated");
+    const migrated = extensionHarness(run.cwd, models);
+    await migrated.commands.get("lifecycle")!("resume", migrated.ctx);
+    expect(migrated.pi.sendUserMessage).toHaveBeenCalled();
+    expect(readState(run.paths)?.modelSelections.at(-1)?.routing?.failureCategories).not.toContain("policy-migrated");
   });
 
   it("pauses before model activation when a routing budget would be exceeded", async () => {
