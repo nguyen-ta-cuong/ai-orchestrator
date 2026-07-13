@@ -337,7 +337,7 @@ describe("MCP server", () => {
         arguments: { task: "x", plan: "plan", diff: "diff", iteration: 1, consecutiveRejections: 0 },
       }) as { isError?: boolean; content: Array<{ text: string }> };
       expect(result.isError).toBe(true);
-      expect(result.content[0]?.text).toMatch(/requires coderIdentity/);
+      expect(result.content[0]?.text).toMatch(/coderIdentity/);
     }, {}, (_cwd, home) => {
       const configDir = join(home, ".ai-orchestrator");
       mkdirSync(configDir, { recursive: true });
@@ -372,6 +372,7 @@ describe("MCP server", () => {
           diff: "diff --git a/cli.ts b/cli.ts\n+broken",
           iteration: 4,
           consecutiveRejections: 0,
+          coderIdentity: "openai-codex/gpt-5.5",
         },
       }) as { isError?: boolean; content: Array<{ text: string }> };
       expect(result.isError).toBe(true);

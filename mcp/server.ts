@@ -61,7 +61,7 @@ const judgeInputSchema = {
   testOutput: boundedText.optional().describe("Client-collected relevant test command output, if tests were run."),
   iteration: z.number().int().min(1).describe("Total coding pass number being judged now. First judge call uses 1; use nextIteration returned by the prior judge call thereafter."),
   consecutiveRejections: z.number().int().min(0).describe("Consecutive rejection count before this verdict. First judge call uses 0; use nextConsecutiveRejections returned by the prior judge call thereafter."),
-  coderIdentity: z.string().trim().regex(/^[^/\s]+\/\S+$/).max(500).optional().describe("Optional provider/model identity of the coder, required by strict autonomous separation."),
+  coderIdentity: z.string().trim().regex(/^[^/\s]+\/\S+$/).max(500).describe("Required provider/model identity of the coder for maker/checker separation."),
   taskFeatures: taskFeaturesSchema.optional(),
 };
 
