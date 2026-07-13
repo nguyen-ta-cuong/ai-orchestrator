@@ -86,6 +86,7 @@ function capabilityPolicy(input: CreatePiRoutingPlanInput): RoutingPolicy {
     stage.pins = [identity];
     stage.minimumProfileConfidence = 0;
     stage.minimumScores = {};
+    stage.thinking = input.config.roles[input.role].thinking;
     policy.allowInferredProfiles = true;
   }
   return policy;
