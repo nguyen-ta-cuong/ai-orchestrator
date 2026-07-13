@@ -248,6 +248,15 @@ describe("lifecycle Pi extension safety", () => {
     expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
   });
 
+  it("resumes standalone SHIP from finalizing", async () => {
+    const run = makeRun("finalizing");
+    const harness = extensionHarness(run.cwd);
+
+    await harness.commands.get("ship")!("", harness.ctx);
+
+    expect(readState(run.paths)?.phase).toBe("done");
+  });
+
   it("refuses PR creation until an explicitly pushed upstream matches HEAD", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
