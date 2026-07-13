@@ -111,10 +111,12 @@ describe("lifecycle Pi extension safety", () => {
     expect(evidence).toMatchObject({ stage: "build", selected: { provider: "invented", model: "coder" } });
     expect(JSON.stringify(evidence)).not.toContain("# Plan");
 
+    await buildHarness.events.get("session_shutdown")!({}, buildHarness.ctx as unknown as ExtensionContext);
     const resumeHarness = extensionHarness(run.cwd, models);
     await resumeHarness.commands.get("lifecycle")!("resume", resumeHarness.ctx);
     expect(readState(run.paths)?.modelSelections).toHaveLength(1);
     expect(readFileSync(run.paths.journal, "utf8")).toContain("reused saved decision");
+    await resumeHarness.events.get("session_shutdown")!({}, resumeHarness.ctx as unknown as ExtensionContext);
 
     const state = readState(run.paths)!;
     state.phase = "verifying";

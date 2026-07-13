@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -35,13 +36,16 @@ import {
 import { detectTestCommand } from "../src/core/tests.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import {
+  acquireRunLease,
   appendJournal,
   appendRoutingTrace,
   assertRunPathsSafe,
   createRun,
   currentRun,
+  ownsRunLease,
   readState,
   releaseRun,
+  releaseRunLease,
   writeState,
   type RunPaths,
 } from "../src/lifecycle/artifacts.js";
@@ -86,6 +90,7 @@ interface Runtime {
   specRevisionFeedback?: string;
   planRevisionFeedback?: string;
   attemptedModels: string[];
+  leaseOwner: string;
   lastUsage?: {
     inputTokens: number;
     outputTokens: number;
@@ -273,6 +278,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       restoreTools();
       await restoreRuntimeModel(ctx);
       persistMirror(runtime.state);
+      releaseRuntimeLease();
     }
     runtime = undefined;
     deactivateVerdictTools();
@@ -475,6 +481,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       } else {
         notify(ctx, "Original-model restoration is still pending. Fix model availability and run /lifecycle resume again.", "warning");
       }
+      releaseRuntimeLease();
       runtime = undefined;
       deactivateVerdictTools();
       clearUi(ctx);
@@ -530,6 +537,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     standalone: StandaloneStage | undefined,
     invocationOriginal: LifecycleState["originalModel"],
   ): Runtime {
+    const leaseOwner = randomUUID();
+    acquireRunLease(paths, leaseOwner);
     return {
       config,
       provenance,
@@ -541,6 +550,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       toolsBeforeRun: pi.getActiveTools().filter((name) => !VERDICT_TOOLS.has(name)),
       invocationOriginal,
       attemptedModels: [],
+      leaseOwner,
     };
   }
 
@@ -1277,6 +1287,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     clearUi(ctx);
     notify(ctx, restored ? message : `${message} Original-model restoration is still pending; use /lifecycle resume to retry.`, restored ? "info" : "warning");
     persistMirror(state);
+    releaseRuntimeLease();
     runtime = undefined;
     deactivateVerdictTools();
   }
@@ -1305,6 +1316,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     pi.sendMessage({ customType: ENTRY_TYPE, content: summary, display: true, details: finished }, { triggerTurn: false });
     persistMirror(finished);
     if (!restored) notify(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /lifecycle resume.", "warning");
+    releaseRuntimeLease();
     runtime = undefined;
     deactivateVerdictTools();
   }
@@ -1335,6 +1347,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       clearUi(ctx);
       pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: stopped }, { triggerTurn: false });
       if (!restored) notify(ctx, "Original-model restoration is pending. Fix model availability and run /lifecycle-stop again.", "warning");
+      releaseRuntimeLease();
       runtime = undefined;
       deactivateVerdictTools();
     } finally {
@@ -1352,6 +1365,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     appendJournal(runtime.paths, message);
     persistMirror(state);
     pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: state }, { triggerTurn: false });
+    releaseRuntimeLease();
     runtime = undefined;
     deactivateVerdictTools();
   }
@@ -1405,7 +1419,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime || runtime.state.runId !== runId || (phase && runtime.state.phase !== phase)) return false;
     const active = currentRun(runtime.cwd, runtime.config.lifecycle.artifactsDir);
     const disk = active && readState(active.paths);
-    return active?.runId === runId && disk?.runId === runId && (!phase || disk.phase === phase);
+    return active?.runId === runId && disk?.runId === runId && ownsRunLease(runtime.paths, runtime.leaseOwner) && (!phase || disk.phase === phase);
+  }
+
+  function releaseRuntimeLease(): void {
+    if (runtime) releaseRunLease(runtime.paths, runtime.leaseOwner);
   }
 
   function latestRejectionIndex(): number {
