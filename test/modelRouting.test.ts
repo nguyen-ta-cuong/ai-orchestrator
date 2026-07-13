@@ -175,6 +175,22 @@ describe("capability model routing", () => {
     expect(first.eligible.map((item) => `${item.identity.provider}/${item.identity.model}`)).toEqual(["a/first", "z/second"]);
   });
 
+  it("uses task features to distinguish feature and bug-fix suitability", () => {
+    const architect = model({ provider: "p", model: "architect" });
+    const debuggerModel = model({ provider: "p", model: "debugger" });
+    const profiles = {
+      "p/architect": profile({ scores: { coding: 7_000, architecture: 10_000, debugging: 1_000 } }),
+      "p/debugger": profile({ scores: { coding: 7_000, architecture: 1_000, debugging: 10_000 } }),
+    };
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.stages.build.weights = { coding: 1 };
+    const featureTask = { ...request([], {}).task, workKind: "feature" as const };
+    const bugTask = { ...featureTask, workKind: "bug-fix" as const, failureSignals: ["test-assertion"] };
+
+    expect(rankModels(request([architect, debuggerModel], profiles, { stage: "build", policy, task: featureTask })).eligible[0]?.identity.model).toBe("architect");
+    expect(rankModels(request([architect, debuggerModel], profiles, { stage: "build", policy, task: bugTask })).eligible[0]?.identity.model).toBe("debugger");
+  });
+
   it("makes quality and economy modes behaviorally distinct while preserving pin order", () => {
     const expensive = model({ provider: "p", model: "strong", cost: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0 } });
     const cheap = model({ provider: "p", model: "cheap", cost: { input: 0.1, output: 0.1, cacheRead: 0, cacheWrite: 0 } });
