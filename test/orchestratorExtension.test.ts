@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -10,12 +10,14 @@ const dirs: string[] = [];
 describe("fast Pi capability routing", () => {
   afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    vi.unstubAllEnvs();
   });
 
   it("routes planner, coder, and an independent judge without changing loop transitions", async () => {
     const cwd = join(tmpdir(), `ai-orchestrator-fast-${process.pid}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(cwd, { recursive: true });
     dirs.push(cwd);
+    vi.stubEnv("HOME", join(cwd, "home"));
     writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({
       routing: {
         engine: "capability",
@@ -76,12 +78,14 @@ describe("fast Pi capability routing", () => {
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     expect(setModel.mock.calls.map(([model]) => (model as { id: string }).id)).toEqual(["planner", "planner-backup"]);
 
+    await events.get("message_end")!({ message: { role: "assistant", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } }, ctx as unknown as ExtensionContext);
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implementation plan" }] }, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "grep", "find", "ls", "bash"]);
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "edit", "bash"]);
     await expect(events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
+    await events.get("message_end")!({ message: { role: "assistant", usage: { input: 200, output: 40, cacheRead: 0, cacheWrite: 0, cost: { total: 0.04 } } } }, ctx as unknown as ExtensionContext);
     await events.get("agent_end")!({ messages: [{ role: "assistant", content: "Implemented" }] }, ctx as unknown as ExtensionContext);
     expect(activeTools).toEqual(["read", "edit", "bash"]);
     await events.get("agent_settled")!({}, ctx as unknown as ExtensionContext);
@@ -97,6 +101,9 @@ describe("fast Pi capability routing", () => {
     ]);
     expect((latest.modelSelections[0] as { failureCategories?: string[] }).failureCategories).toContain("provider-error");
     expect(activeTools).toContain("judge_verdict");
+    const evidence = readFileSync(join(cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(evidence.filter((event) => event.outcome.type === "stage-ended").map((event) => event.cost.observedUsd)).toEqual([0.02, 0.04]);
 
     setModel.mockImplementation(async (model: unknown) => (model as { id: string }).id !== "model");
     await commands.get("orchestrate-stop")!("", ctx);
