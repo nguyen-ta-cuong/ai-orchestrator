@@ -26,6 +26,12 @@ export function appendRoutingEvidenceEvent(input: AppendRoutingEvidenceInput): v
   }
 }
 
+export function appendUserRoutingEvidenceEvent(userStoreRoot: string, event: RoutingEvidenceEvent): void {
+  const validation = validateRoutingEvidenceEvent(event);
+  if (!validation.ok) throw new Error(`routing evidence event is invalid: ${validation.error}`);
+  appendJsonLine(join(userStoreRoot, "events.jsonl"), event);
+}
+
 export function readRoutingEvidenceEvents(path: string): ReadRoutingEvidenceResult {
   if (!existsSync(path)) return { events: [], warnings: [] };
   const events: RoutingEvidenceEvent[] = [];
