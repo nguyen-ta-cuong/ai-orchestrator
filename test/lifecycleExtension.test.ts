@@ -440,6 +440,26 @@ describe("lifecycle Pi extension safety", () => {
     expect(readState(run.paths)?.phase).toBe("done");
   });
 
+  it("recovers a commit created before its SHA checkpoint was persisted", async () => {
+    const run = makeRun("finalizing");
+    const state = readState(run.paths)!;
+    state.finalization = { commitBaseSha: "base123", commitMessage: "Implement recovered work" };
+    writeState(run.paths, state);
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ ship: { openPr: "never" } }));
+    const harness = extensionHarness(run.cwd);
+    harness.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === "git" && args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: "new456\n", stderr: "" };
+      if (command === "git" && args.join(" ") === "rev-parse HEAD^") return { code: 0, stdout: "base123\n", stderr: "" };
+      if (command === "git" && args.join(" ") === "log -1 --format=%s") return { code: 0, stdout: "Implement recovered work\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    });
+
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(readState(run.paths)).toMatchObject({ phase: "done", finalization: { commitSha: "new456" } });
+    expect(harness.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["commit"]), expect.anything());
+  });
+
   it("refuses PR creation until an explicitly pushed upstream matches HEAD", async () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
