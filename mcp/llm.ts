@@ -23,6 +23,7 @@ export interface RoutedCompletionResult {
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+const MAX_LLM_RESPONSE_BYTES = 2 * 1024 * 1024;
 const ANTHROPIC_DEFAULT_MAX_TOKENS = 8192;
 const ANTHROPIC_MAX_THINKING_MAX_TOKENS = 16384;
 let fakeLlmWarningPrinted = false;
@@ -106,6 +107,7 @@ function sanitizeError(error: unknown, secrets: string[]): string {
   if (message.startsWith("Missing API key")) return "MCP provider API key is missing";
   if (message.startsWith("Unsupported MCP provider API")) return "MCP provider API is unsupported";
   if (message.includes("returned an empty completion")) return "LLM provider returned an empty completion";
+  if (message.includes("response exceeded")) return "LLM response exceeded the size limit";
   return "MCP candidate failed";
 }
 
@@ -205,7 +207,7 @@ async function postJson(
   const timeout = withTimeout(signal, DEFAULT_LLM_TIMEOUT_MS);
   try {
     const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: timeout.signal, redirect: "error" });
-    const text = await response.text();
+    const text = await readBoundedResponseText(response);
     if (!response.ok) {
       throw new Error(
         `LLM request failed (${response.status} ${response.statusText}): ${redactSecrets(text, secrets).slice(0, 1000)}`,
@@ -228,6 +230,31 @@ async function postJson(
   } finally {
     timeout.cleanup();
   }
+}
+
+async function readBoundedResponseText(response: Response): Promise<string> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_LLM_RESPONSE_BYTES) {
+    await response.body?.cancel();
+    throw new Error(`LLM response exceeded ${MAX_LLM_RESPONSE_BYTES} bytes`);
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_LLM_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new Error(`LLM response exceeded ${MAX_LLM_RESPONSE_BYTES} bytes`);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
 }
 
 function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): {
