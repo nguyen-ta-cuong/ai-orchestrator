@@ -70,6 +70,8 @@ export interface LifecycleState {
   consecutiveRejections: number;
   verdicts: LifecycleStageVerdict[];
   modelSelections: LifecycleModelSelection[];
+  rejectionFingerprints: string[];
+  buildEvidenceFingerprints: string[];
   routingPolicyVersion?: string;
   baselinePaths?: string[];
   baselineStagedPaths?: string[];
@@ -112,11 +114,15 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
     consecutiveRejections: 0,
     verdicts: [],
     modelSelections: [],
+    rejectionFingerprints: [],
+    buildEvidenceFingerprints: [],
     modelRestored: true,
     yolo: false,
     ...overrides,
   };
   state.verdicts = overrides.verdicts ? overrides.verdicts.map((verdict) => ({ ...verdict })) : [];
+  state.rejectionFingerprints = overrides.rejectionFingerprints ? [...overrides.rejectionFingerprints] : [];
+  state.buildEvidenceFingerprints = overrides.buildEvidenceFingerprints ? [...overrides.buildEvidenceFingerprints] : [];
   state.modelSelections = overrides.modelSelections
     ? overrides.modelSelections.map((selection) => ({
       ...selection,
@@ -337,6 +343,8 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
   return {
     ...state,
     verdicts: state.verdicts.map((verdict) => ({ ...verdict })),
+    rejectionFingerprints: [...state.rejectionFingerprints],
+    buildEvidenceFingerprints: [...state.buildEvidenceFingerprints],
     modelSelections: state.modelSelections.map((selection) => ({
       ...selection,
       routing: selection.routing ? {

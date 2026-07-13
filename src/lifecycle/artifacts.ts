@@ -100,6 +100,8 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
     if (!isLifecycleState(parsed)) return undefined;
     return {
       ...parsed,
+      rejectionFingerprints: parsed.rejectionFingerprints ? [...parsed.rejectionFingerprints] : [],
+      buildEvidenceFingerprints: parsed.buildEvidenceFingerprints ? [...parsed.buildEvidenceFingerprints] : [],
       modelSelections: parsed.modelSelections?.map((selection) => ({
         ...selection,
         routing: selection.routing ? {
@@ -491,6 +493,8 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     typeof candidate.consecutiveRejections === "number" && Number.isSafeInteger(candidate.consecutiveRejections) && candidate.consecutiveRejections >= 0 &&
     Array.isArray(candidate.verdicts) &&
     candidate.verdicts.every(isLifecycleVerdict) &&
+    (candidate.rejectionFingerprints === undefined || (Array.isArray(candidate.rejectionFingerprints) && candidate.rejectionFingerprints.every(isFingerprint))) &&
+    (candidate.buildEvidenceFingerprints === undefined || (Array.isArray(candidate.buildEvidenceFingerprints) && candidate.buildEvidenceFingerprints.every(isFingerprint))) &&
     (candidate.modelSelections === undefined ||
       (Array.isArray(candidate.modelSelections) && candidate.modelSelections.every(isLifecycleModelSelection))) &&
     (candidate.routingPolicyVersion === undefined || (typeof candidate.routingPolicyVersion === "string" && candidate.routingPolicyVersion.length > 0)) &&
@@ -506,6 +510,10 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     isLifecycleFinalization(candidate.finalization) &&
     typeof candidate.yolo === "boolean"
   );
+}
+
+function isFingerprint(value: unknown): boolean {
+  return typeof value === "string" && /^[a-f0-9]{16}$/.test(value);
 }
 
 function isLifecycleOriginalModel(value: unknown): boolean {
