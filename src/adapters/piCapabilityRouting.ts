@@ -133,6 +133,15 @@ function legacyCandidates(input: CreatePiRoutingPlanInput, taskFeatures: TaskFea
       ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }),
       ...(profile?.version ? { profileVersion: profile.version } : {}),
     };
+  }).filter((candidate) => {
+    const identity = `${candidate.provider}/${candidate.model}`;
+    const model = catalog.find((item) => item.provider === candidate.provider && item.model === candidate.model);
+    const privacy = model?.privacy ?? input.config.routing.privacy.providers[candidate.provider] ?? "unknown";
+    return !input.config.routing.deny.providers.includes(candidate.provider) &&
+      !input.config.routing.deny.models.includes(identity) &&
+      !(candidate.family && input.config.routing.deny.families.includes(candidate.family)) &&
+      !((privacy === "unknown" && !input.config.routing.privacy.allowUnknown) ||
+        (privacy !== "unknown" && !input.config.routing.privacy.allowed.includes(privacy)));
   });
 
   if (!["verify", "debug", "review", "ship", "fast-judge"].includes(input.stage)) return candidates;
