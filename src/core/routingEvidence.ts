@@ -22,6 +22,9 @@ export interface RoutingEvidenceEvent {
   profileVersion: string;
   task: Pick<TaskFeatures, "workKind" | "risk" | "languages" | "fileCount">;
   selected: EvidenceModelIdentity;
+  durationMs?: EvidenceNumber;
+  fallbackCount?: number;
+  rejectionCategory?: string;
   fallback?: {
     from: EvidenceModelIdentity;
     reason: "unavailable" | "unconfigured" | "selection-failed" | "policy-mismatch";
@@ -136,6 +139,9 @@ export function validateRoutingEvidenceEvent(value: unknown): RoutingEvidenceVal
     return { ok: false, error: "stage must be a routing stage" };
   }
   if (!isModelIdentity(value.selected)) return { ok: false, error: "selected model identity is invalid" };
+  if (value.durationMs !== undefined && !isEvidenceNumber(value.durationMs)) return { ok: false, error: "durationMs is invalid" };
+  if (value.fallbackCount !== undefined && (!Number.isInteger(value.fallbackCount) || (value.fallbackCount as number) < 0)) return { ok: false, error: "fallbackCount is invalid" };
+  if (value.rejectionCategory !== undefined && (typeof value.rejectionCategory !== "string" || value.rejectionCategory.length === 0)) return { ok: false, error: "rejectionCategory is invalid" };
   if (!isUsage(value.usage)) return { ok: false, error: "usage is invalid" };
   if (!isCost(value.cost)) return { ok: false, error: "cost is invalid" };
   if (!isTaskSummary(value.task)) return { ok: false, error: "task summary is invalid" };
@@ -311,7 +317,7 @@ function isEvidenceNumber(value: unknown): value is EvidenceNumber {
 }
 
 function unexpectedEvidenceField(value: Record<string, unknown>): string | undefined {
-  const top = unexpectedKey(value, ["version", "eventId", "runId", "decisionId", "stage", "recordedAt", "policyVersion", "profileVersion", "task", "selected", "fallback", "usage", "cost", "outcome"]);
+  const top = unexpectedKey(value, ["version", "eventId", "runId", "decisionId", "stage", "recordedAt", "policyVersion", "profileVersion", "task", "selected", "durationMs", "fallbackCount", "rejectionCategory", "fallback", "usage", "cost", "outcome"]);
   if (top) return top;
   const nested: Array<[unknown, readonly string[], string]> = [
     [value.task, ["workKind", "risk", "languages", "fileCount"], "task"],
