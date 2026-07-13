@@ -836,10 +836,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       .map((selection) => `${selection.provider}/${selection.model}`));
     const attempts: { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[] = [];
     for (const candidate of plan.candidates) {
-      if (providerFailed.has(`${candidate.provider}/${candidate.model}`)) {
-        attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
-        continue;
-      }
+      if (providerFailed.has(`${candidate.provider}/${candidate.model}`)) continue;
       const label = `${candidate.provider}/${candidate.model}`;
       if (breakerBlocksCandidate(stage, candidate, attempts)) {
         attempts.push({ provider: candidate.provider, model: candidate.model, outcome: "unavailable" });
@@ -1685,6 +1682,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!stage) return;
     const selection = [...runtime.state.modelSelections].reverse().find((item) => item.stage === stage && item.routing);
     if (!selection?.routing || selection.routing.failureCategories.includes("provider-error")) return;
+    persistRoutingStageOutcome(stage, { structuredToolCompliance: false, verdict: "unknown" });
     selection.routing.failureCategories.push("provider-error");
     selection.routing.fallbackCount += 1;
     writeState(runtime.paths, runtime.state);
