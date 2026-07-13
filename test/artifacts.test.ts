@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -155,7 +155,7 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(join(cwd, ".ai-orchestrator", "runs", "current"))).toBe(false);
   });
 
-  it("allows a new run when current state is terminal or corrupt", () => {
+  it("allows terminal replacement but fails closed on corrupt current state", () => {
     const cwd = makeTempDir();
     const first = createRun(cwd, artifactsDir, "first");
     writeState(first.paths, createIdleLifecycleState({ runId: first.runId, phase: "done", task: "first" }));
@@ -164,12 +164,10 @@ describe("lifecycle artifacts", () => {
     expect(second.runId).not.toBe(first.runId);
 
     writeFileSync(second.paths.state, "not json");
-    const third = createRun(cwd, artifactsDir, "third");
-    expect(third.runId).not.toBe(second.runId);
+    expect(() => createRun(cwd, artifactsDir, "third")).toThrow(/corrupt state/);
 
-    writeFileSync(third.paths.state, JSON.stringify({ ...createIdleLifecycleState({ runId: third.runId, task: "third" }), phase: "unknown" }));
-    const fourth = createRun(cwd, artifactsDir, "fourth");
-    expect(fourth.runId).not.toBe(third.runId);
+    writeFileSync(second.paths.state, JSON.stringify({ ...createIdleLifecycleState({ runId: second.runId, task: "second" }), phase: "unknown" }));
+    expect(() => createRun(cwd, artifactsDir, "third")).toThrow(/corrupt state/);
   });
 
   it("ignores invalid current run ids instead of joining untrusted path text", () => {
@@ -178,6 +176,7 @@ describe("lifecycle artifacts", () => {
     writeFileSync(join(cwd, ".ai-orchestrator", "runs", "current"), "../../outside\n");
 
     expect(currentRun(cwd, artifactsDir)).toBeUndefined();
+    expect(() => createRun(cwd, artifactsDir, "task")).toThrow(/current pointer is invalid/);
   });
 
   it("keeps the current pointer inside the artifact directory for non-default artifact directories", () => {
@@ -204,11 +203,28 @@ describe("lifecycle artifacts", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, ".orch\\runs", "task");
 
-    expect(run.paths.root).toBe(join(cwd, ".orch", "runs", run.runId));
+    expect(run.paths.root).toBe(join(realpathSync(cwd), ".orch", "runs", run.runId));
     expect(readFileSync(join(cwd, ".orch", "runs", "current"), "utf8").trim()).toBe(run.runId);
     expect(existsSync(join(cwd, ".orch", "current"))).toBe(false);
     expect(existsSync(join(cwd, "current"))).toBe(false);
     expect(existsSync(join(cwd, ".orch\\runs"))).toBe(false);
+  });
+
+  it("rejects symlinked artifact ancestors and artifact files", () => {
+    const cwd = makeTempDir();
+    const outside = makeTempDir();
+    symlinkSync(outside, join(cwd, ".ai-orchestrator"), "dir");
+    expect(() => createRun(cwd, artifactsDir, "task")).toThrow(/must not contain symlinks/);
+    expect(existsSync(join(outside, "runs"))).toBe(false);
+
+    unlinkSync(join(cwd, ".ai-orchestrator"));
+    const run = createRun(cwd, artifactsDir, "task");
+    const outsideJournal = join(outside, "journal.md");
+    writeFileSync(outsideJournal, "outside\n");
+    unlinkSync(run.paths.journal);
+    symlinkSync(outsideJournal, run.paths.journal);
+    expect(() => appendJournal(run.paths, "must not escape")).toThrow(/must not contain symlinks/);
+    expect(readFileSync(outsideJournal, "utf8")).toBe("outside\n");
   });
 
   it("rejects artifact directories that collide with current coordination names", () => {

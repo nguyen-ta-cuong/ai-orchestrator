@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, parse, relative, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
 
@@ -25,18 +25,22 @@ export interface RoutingTraceRecord {
 }
 
 export function createRun(cwd: string, artifactsDir: string, task: string, yolo = false): { runId: string; paths: RunPaths } {
+  assertArtifactRootSafe(cwd, artifactsDir);
   ensureArtifactsExcludedFromGit(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => {
     const currentPath = currentRunPath(cwd, artifactsDir);
     const active = currentRun(cwd, artifactsDir);
     if (active) {
       const activeState = readState(active.paths);
-      if (activeState && isActivePhase(activeState.phase)) {
+      if (!activeState) {
+        throw new Error(`Lifecycle run ${active.runId} has missing or corrupt state; explicit recovery is required`);
+      }
+      if (isActivePhase(activeState.phase)) {
         throw new Error(`An ai-orchestrator lifecycle run is already active: ${active.runId}`);
       }
       rmSync(currentPath, { force: true });
     } else if (existsSync(currentPath)) {
-      rmSync(currentPath, { force: true });
+      throw new Error("Lifecycle current pointer is invalid; explicit recovery is required");
     }
 
     const runId = createRunId();
@@ -44,6 +48,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
     let currentPointerWritten = false;
     try {
       mkdirSync(paths.root, { recursive: true });
+      assertRunPathsSafe(paths);
       writeFileSync(paths.spec, "");
       writeFileSync(paths.plan, "");
       writeFileSync(paths.debug, "");
@@ -63,7 +68,9 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
 }
 
 export function currentRun(cwd: string, artifactsDir: string): { runId: string; paths: RunPaths } | undefined {
+  assertArtifactRootSafe(cwd, artifactsDir);
   const currentPath = currentRunPath(cwd, artifactsDir);
+  assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath)) return undefined;
   const runId = readFileSync(currentPath, "utf8").trim();
   if (!isRunId(runId)) return undefined;
@@ -71,6 +78,7 @@ export function currentRun(cwd: string, artifactsDir: string): { runId: string; 
 }
 
 export function readState(paths: RunPaths): LifecycleState | undefined {
+  assertRunPathsSafe(paths);
   if (!existsSync(paths.state)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(paths.state, "utf8")) as unknown;
@@ -92,7 +100,9 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
 }
 
 export function writeState(paths: RunPaths, state: LifecycleState): void {
+  assertRunPathsSafe(paths);
   mkdirSync(paths.root, { recursive: true });
+  assertRunPathsSafe(paths);
   const tempPath = `${paths.state}.${process.pid}.${Date.now()}.tmp`;
   let completed = false;
   try {
@@ -107,12 +117,15 @@ export function writeState(paths: RunPaths, state: LifecycleState): void {
 }
 
 export function appendJournal(paths: RunPaths, line: string): void {
+  assertRunPathsSafe(paths);
   mkdirSync(paths.root, { recursive: true });
+  assertRunPathsSafe(paths);
   const timestamp = new Date().toISOString();
   writeFileSync(paths.journal, `- ${timestamp} ${line}\n`, { flag: "a" });
 }
 
 export function appendRoutingTrace(paths: RunPaths, record: RoutingTraceRecord): void {
+  assertRunPathsSafe(paths);
   if (!isRoutingTraceRecord(record)) throw new Error("routing trace record is invalid");
   const line = JSON.stringify(record);
   if (Buffer.byteLength(line, "utf8") > 256 * 1024) throw new Error("routing trace record exceeds 256 KiB");
@@ -121,11 +134,13 @@ export function appendRoutingTrace(paths: RunPaths, record: RoutingTraceRecord):
 }
 
 export function releaseRun(cwd: string, artifactsDir: string, runId: string): boolean {
+  assertArtifactRootSafe(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => releaseCurrentPointerIfMatches(cwd, artifactsDir, runId));
 }
 
 export function pathsForRun(cwd: string, artifactsDir: string, runId: string): RunPaths {
-  const root = join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), runId);
+  if (!isRunId(runId)) throw new Error("lifecycle run id is invalid");
+  const root = join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), runId);
   return {
     root,
     spec: join(root, "spec.md"),
@@ -139,15 +154,16 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
 }
 
 function currentRunPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), "current");
+  return join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), "current");
 }
 
 function currentRunLockPath(cwd: string, artifactsDir: string): string {
-  return join(cwd, ...normalizeArtifactsDir(artifactsDir).split("/"), "current.lock");
+  return join(realpathSync(cwd), ...normalizeArtifactsDir(artifactsDir).split("/"), "current.lock");
 }
 
 function releaseCurrentPointerIfMatches(cwd: string, artifactsDir: string, runId: string): boolean {
   const currentPath = currentRunPath(cwd, artifactsDir);
+  assertNoSymlinkComponents(currentPath);
   if (!existsSync(currentPath) || readFileSync(currentPath, "utf8").trim() !== runId) {
     return false;
   }
@@ -236,8 +252,10 @@ function resolveGitDir(cwd: string): string | undefined {
 }
 
 function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () => T): T {
+  assertArtifactRootSafe(cwd, artifactsDir);
   const lockPath = currentRunLockPath(cwd, artifactsDir);
   mkdirSync(join(lockPath, ".."), { recursive: true });
+  assertArtifactRootSafe(cwd, artifactsDir);
   let locked = false;
   try {
     mkdirSync(lockPath);
@@ -251,6 +269,37 @@ function withCurrentRunLock<T>(cwd: string, artifactsDir: string, operation: () 
   } finally {
     if (locked) {
       rmSync(lockPath, { recursive: true, force: true });
+    }
+  }
+}
+
+function assertArtifactRootSafe(cwd: string, artifactsDir: string): void {
+  const projectRoot = realpathSync(cwd);
+  const artifactRoot = resolve(projectRoot, ...normalizeArtifactsDir(artifactsDir).split("/"));
+  const contained = relative(projectRoot, artifactRoot);
+  if (!contained || contained.startsWith("..") || isAbsolute(contained)) {
+    throw new Error("Lifecycle artifact root must remain inside the project");
+  }
+  assertNoSymlinkComponents(artifactRoot);
+}
+
+function assertRunPathsSafe(paths: RunPaths): void {
+  for (const path of Object.values(paths)) assertNoSymlinkComponents(path);
+}
+
+function assertNoSymlinkComponents(target: string): void {
+  const absolute = resolve(target);
+  const root = parse(absolute).root;
+  let current = root;
+  for (const part of absolute.slice(root.length).split(/[\\/]+/).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new Error(`Lifecycle artifact path must not contain symlinks: ${current}`);
+      }
+    } catch (error) {
+      if (isNodeErrorWithCode(error, "ENOENT")) return;
+      throw error;
     }
   }
 }
