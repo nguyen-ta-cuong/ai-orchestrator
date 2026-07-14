@@ -224,7 +224,7 @@ Then implement the interfaces above. Keep `src/core/` free of Pi imports and fil
 
 Milestone acceptance is:
 
-    cd /Users/cuongnguyen/Documents/github/ai-orchestrator-lifecycle-milestone-2
+    cd /absolute/path/to/ai-orchestrator
     npm test
     npx tsc --noEmit
     npm run build
@@ -269,7 +269,7 @@ Include a “Without lifecycle tools” fallback for Cursor and other agents. It
 
 Run automated validation:
 
-    cd /Users/cuongnguyen/Documents/github/ai-orchestrator-lifecycle-milestone-2
+    cd /absolute/path/to/ai-orchestrator
     npm test
     npx tsc --noEmit
     npm run build
@@ -280,7 +280,7 @@ Confirm the tarball includes `extensions/lifecycle.ts`, `skills/lifecycle/SKILL.
 Manual validation uses `/tmp/lc-demo`, with a tiny TypeScript CLI and tests. Install the worktree path with Pi. First configure cheap local candidates to exercise fallbacks, then use defaults once:
 
     cd /tmp/lc-demo
-    pi install /Users/cuongnguyen/Documents/github/ai-orchestrator-lifecycle-milestone-2
+    pi install /absolute/path/to/ai-orchestrator
     pi
     /lifecycle add a --version flag that prints 1.0.0
 
@@ -335,7 +335,7 @@ Automated implementation evidence:
     npm pack --dry-run
     # 61 files; includes lifecycle extension/skill/routing/debug policy; excludes plans and tests
 
-    pi -e /Users/cuongnguyen/Documents/github/ai-orchestrator-lifecycle-milestone-2 --list-models
+    pi -e /absolute/path/to/ai-orchestrator --list-models
     # exit 0; stderr empty (no extension or skill warnings)
 
 The paid interactive lifecycle transcript remains pending.

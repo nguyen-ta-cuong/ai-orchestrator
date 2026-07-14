@@ -29,6 +29,8 @@ How to read the canvas:
 - [User guide](docs/user-guide.md): run the fast path, durable lifecycle, routing operations, Cursor handoffs, recovery, and publication gates.
 - [Configuration and trust boundaries](#configuration-and-trust-boundaries): complete routing/catalog reference and security model.
 - [Troubleshooting](#troubleshooting): common Pi, Cursor, MCP, routing, and recovery problems.
+- [Contributing](CONTRIBUTING.md): development workflow, architecture constraints, and validation requirements.
+- [Security policy](SECURITY.md): supported versions and private vulnerability reporting.
 
 ## Architecture and surface parity
 
@@ -76,17 +78,17 @@ AI Orchestrator preserves those ownership boundaries but deliberately uses host-
 
 | Environment | Install | Start with |
 | --- | --- | --- |
-| Pi fast path | `pi install npm:ai-orchestrator` | `/orchestrate <task>` |
-| Pi lifecycle | `pi install npm:ai-orchestrator` | `/lifecycle <task>` |
-| Cursor with MCP | `npx ai-orchestrator install-cursor` | Ask Cursor to use the AI Orchestrator workflow |
-| Cursor without MCP | `npx ai-orchestrator install-cursor --no-mcp` | Follow the installed `orchestrate` skill |
+| Pi fast path | `pi install npm:@miracle3010/ai-orchestrator` | `/orchestrate <task>` |
+| Pi lifecycle | `pi install npm:@miracle3010/ai-orchestrator` | `/lifecycle <task>` |
+| Cursor with MCP | `npx @miracle3010/ai-orchestrator install-cursor` | Ask Cursor to use the AI Orchestrator workflow |
+| Cursor without MCP | `npx @miracle3010/ai-orchestrator install-cursor --no-mcp` | Follow the installed `orchestrate` skill |
 
 ## Pi workflows
 
 Install the published package:
 
 ```sh
-pi install npm:ai-orchestrator
+pi install npm:@miracle3010/ai-orchestrator
 ```
 
 For a local checkout, use its absolute path:
@@ -157,7 +159,7 @@ Standalone stage commands do not skip or rewind `state.json`. VERIFY, REVIEW, DE
 From the published package, run in the Cursor project:
 
 ```sh
-npx ai-orchestrator install-cursor
+npx @miracle3010/ai-orchestrator install-cursor
 ```
 
 From a source checkout, build first:
@@ -184,8 +186,8 @@ The installer is idempotent for identical files and never overwrites customized 
 Use `--global` for `~/.cursor/`, or `--no-mcp` to install only the rule and skill:
 
 ```sh
-npx ai-orchestrator install-cursor --global
-npx ai-orchestrator install-cursor --no-mcp
+npx @miracle3010/ai-orchestrator install-cursor --global
+npx @miracle3010/ai-orchestrator install-cursor --no-mcp
 ```
 
 ### Cursor with MCP
@@ -205,7 +207,7 @@ The MCP server routes its own planner/judge API calls; those catalog identities 
 ### Cursor without MCP
 
 ```sh
-npx ai-orchestrator install-cursor --no-mcp
+npx @miracle3010/ai-orchestrator install-cursor --no-mcp
 ```
 
 The installed skill requires a manually approved plan, a recorded coding-capable maker, tests, a recorded independent checker, and the configured loop caps. Re-plan after two consecutive rejections and stop after three coding passes unless stricter project policy applies. If strict independent checking cannot be satisfied, fail closed; never describe same-model review as independent. No-MCP mode has no server-side routing, completion fallback, metadata, or counter calculation.
@@ -453,6 +455,10 @@ Neither MCP nor Markdown can switch Cursor's host model. With MCP, select and re
 ### A Pi run was interrupted
 
 Use `/lifecycle resume` for an active lifecycle run. `/lifecycle-stop` preserves artifacts but releases the active pointer, so that stopped run cannot resume. `/orchestrate-stop` cancels the fast loop and restores the prior Pi model.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a change. Report suspected vulnerabilities privately according to [SECURITY.md](SECURITY.md); do not disclose exploitable details in a public issue.
 
 ## License
 

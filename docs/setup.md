@@ -13,16 +13,16 @@ Choose one setup:
 
 | Environment | Install command | Credentials |
 | --- | --- | --- |
-| Pi | `pi install npm:ai-orchestrator` | Managed by Pi |
-| Cursor with MCP | `npx ai-orchestrator install-cursor` | Trusted user MCP config |
-| Cursor without MCP | `npx ai-orchestrator install-cursor --no-mcp` | None used by AI Orchestrator |
+| Pi | `pi install npm:@miracle3010/ai-orchestrator` | Managed by Pi |
+| Cursor with MCP | `npx @miracle3010/ai-orchestrator install-cursor` | Trusted user MCP config |
+| Cursor without MCP | `npx @miracle3010/ai-orchestrator install-cursor --no-mcp` | None used by AI Orchestrator |
 
 ## Install for Pi
 
 Install the published package after reviewing it; Pi packages and their extensions run with full system access:
 
 ```sh
-pi install npm:ai-orchestrator
+pi install npm:@miracle3010/ai-orchestrator
 ```
 
 For a source checkout, install dependencies first and give Pi the absolute package path:
@@ -47,7 +47,7 @@ Pi uses its own authenticated model registry and ignores all `mcp.*` configurati
 Run the installer from the Cursor project:
 
 ```sh
-npx ai-orchestrator install-cursor
+npx @miracle3010/ai-orchestrator install-cursor
 ```
 
 A fresh install creates:
@@ -77,10 +77,10 @@ Other installation modes:
 
 ```sh
 # Install under ~/.cursor instead of the current project
-npx ai-orchestrator install-cursor --global
+npx @miracle3010/ai-orchestrator install-cursor --global
 
 # Install instructions only; do not create mcp.json
-npx ai-orchestrator install-cursor --no-mcp
+npx @miracle3010/ai-orchestrator install-cursor --no-mcp
 ```
 
 Restart or reload Cursor after installation. For MCP mode, enable the `ai-orchestrator` server and confirm that these tools are available:
@@ -215,8 +215,8 @@ Do not run `npm test` concurrently with `npm run build` or `npm pack`; packaged-
 Update or remove the Pi package, then restart Pi:
 
 ```sh
-pi update npm:ai-orchestrator
-pi remove npm:ai-orchestrator
+pi update npm:@miracle3010/ai-orchestrator
+pi remove npm:@miracle3010/ai-orchestrator
 ```
 
 `pi update` by itself updates Pi, not installed packages. Use `pi update --extensions` to update all unpinned installed packages.

@@ -1,5 +1,5 @@
 {
-  "name": "ai-orchestrator",
+  "name": "@miracle3010/ai-orchestrator",
   "version": "0.1.0",
   "description": "Plan-code-judge AI orchestration for Pi and Cursor.",
   "type": "module",
@@ -26,20 +26,35 @@
     "extensions",
     "mcp",
     "src",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
     "docs/setup.md",
     "docs/user-guide.md",
-    "docs/images/ai-orchestrator-workflow.svg"
+    "docs/images/ai-orchestrator-workflow.svg",
+    "docs/images/ai-orchestrator-workflow.png"
   ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nguyen-ta-cuong/ai-orchestrator.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "pi-package",
     "mcp",
     "cursor"
   ],
-  "author": "",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "image": "https://raw.githubusercontent.com/nguyen-ta-cuong/ai-orchestrator/main/docs/images/ai-orchestrator-workflow.png"
+  },
+  "author": "Cuong Nguyen",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/nguyen-ta-cuong/ai-orchestrator/issues"

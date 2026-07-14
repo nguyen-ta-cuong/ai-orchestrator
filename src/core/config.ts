@@ -829,10 +829,10 @@ function protectBudgets(routing: Record<string, unknown>, userRouting: Capabilit
   ] as const) {
     routing.budgets[key] = protectedMinimum(userRouting.budgets[key], routing.budgets[key]);
   }
-  routing.budgets.allowUnknownCost = protectedBoolean(!userRouting.budgets.allowUnknownCost, invertBoolean(routing.budgets.allowUnknownCost));
-  if (typeof routing.budgets.allowUnknownCost === "boolean") {
-    routing.budgets.allowUnknownCost = !routing.budgets.allowUnknownCost;
-  }
+  routing.budgets.allowUnknownCost = protectedPermission(
+    userRouting.budgets.allowUnknownCost,
+    routing.budgets.allowUnknownCost,
+  );
 }
 
 function protectEvidence(routing: Record<string, unknown>, userRouting: CapabilityRoutingConfig): void {
@@ -928,10 +928,6 @@ function stricterMode<T extends string>(base: T, patch: unknown, order: readonly
 
 function protectedBoolean(base: boolean, patch: unknown): unknown {
   return patch === undefined ? base : typeof patch === "boolean" ? base || patch : patch;
-}
-
-function invertBoolean(value: unknown): unknown {
-  return typeof value === "boolean" ? !value : value;
 }
 
 function deepMerge<T>(base: T, patch: unknown): T {

@@ -1,4 +1,4 @@
-import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
+import { execFileSync, spawnSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -9,6 +9,7 @@ const binPath = resolve("bin/ai-orchestrator.js");
 const mcpBinPath = resolve("bin/ai-orchestrator-mcp.js");
 const staticSnippetPath = resolve("cursor/mcp.json");
 const packageJsonPath = resolve("package.json");
+const galleryImagePath = resolve("docs/images/ai-orchestrator-workflow.png");
 
 function makeTempDir(): string {
   const dir = join(tmpdir(), `ai-orchestrator-install-${process.pid}-${Math.random().toString(36).slice(2)}`);
@@ -126,7 +127,10 @@ describe("ai-orchestrator install-cursor", () => {
     const outside = makeTempDir();
     symlinkSync(outside, join(cwd, ".cursor"), "dir");
 
-    expect(() => runInstaller(cwd, "--no-mcp")).toThrow(/refuses symlinked Cursor path/);
+    const result = spawnSync(process.execPath, [binPath, "install-cursor", "--no-mcp"], installerOptions(cwd));
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/refuses symlinked Cursor path/);
     expect(existsSync(join(outside, "rules"))).toBe(false);
     expect(existsSync(join(outside, "skills"))).toBe(false);
   });
@@ -151,14 +155,49 @@ describe("ai-orchestrator install-cursor", () => {
   it("packages MCP source while excluding local plans and tests", () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { files: string[] };
     expect(packageJson.files).toContain("mcp");
+    expect(packageJson.files).toContain("CONTRIBUTING.md");
+    expect(packageJson.files).toContain("SECURITY.md");
+    expect(packageJson.files).toContain("docs/images/ai-orchestrator-workflow.png");
     expect(packageJson.files).not.toContain("plans");
     expect(packageJson.files).not.toContain("test");
+  });
+
+  it("declares deterministic Pi resources and gallery discovery metadata", () => {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      name: string;
+      keywords: string[];
+      pi?: { extensions?: string[]; skills?: string[]; image?: string };
+      publishConfig?: { access?: string };
+    };
+
+    expect(packageJson.name).toBe("@miracle3010/ai-orchestrator");
+    expect(packageJson.publishConfig).toEqual({ access: "public" });
+    expect(packageJson.keywords).toContain("pi-package");
+    expect(packageJson.pi).toEqual({
+      extensions: ["./extensions"],
+      skills: ["./skills"],
+      image: "https://raw.githubusercontent.com/nguyen-ta-cuong/ai-orchestrator/main/docs/images/ai-orchestrator-workflow.png",
+    });
+  });
+
+  it("declares the approved npm author", () => {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { author?: string };
+
+    expect(packageJson.author).toBe("Cuong Nguyen");
+  });
+
+  it("ships a valid 1600 by 1135 PNG for the Pi package gallery", () => {
+    const image = readFileSync(galleryImagePath);
+
+    expect(image.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    expect(image.readUInt32BE(16)).toBe(1600);
+    expect(image.readUInt32BE(20)).toBe(1135);
   });
 
   it("keeps the static npx snippet pinned to the package version", () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version: string };
     const snippet = readFileSync(staticSnippetPath, "utf8");
 
-    expect(snippet).toContain(`ai-orchestrator@${packageJson.version}`);
+    expect(snippet).toContain(`@miracle3010/ai-orchestrator@${packageJson.version}`);
   });
 });

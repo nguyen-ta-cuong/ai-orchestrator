@@ -413,6 +413,29 @@ describe("loadConfig", () => {
   });
 
   it.each([
+    { userAllowsUnknownCost: true, projectAllowsUnknownCost: true, expected: true },
+    { userAllowsUnknownCost: true, projectAllowsUnknownCost: false, expected: false },
+    { userAllowsUnknownCost: false, projectAllowsUnknownCost: true, expected: false },
+    { userAllowsUnknownCost: false, projectAllowsUnknownCost: false, expected: false },
+  ])(
+    "lets project routing tighten but never loosen unknown-cost policy: user=$userAllowsUnknownCost project=$projectAllowsUnknownCost",
+    ({ userAllowsUnknownCost, projectAllowsUnknownCost, expected }) => {
+      const home = makeTempDir();
+      const project = makeTempDir();
+      mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+      vi.stubEnv("HOME", home);
+      writeJson(join(home, ".ai-orchestrator", "config.json"), {
+        routing: { budgets: { allowUnknownCost: userAllowsUnknownCost } },
+      });
+      writeJson(join(project, ".ai-orchestrator.json"), {
+        routing: { budgets: { allowUnknownCost: projectAllowsUnknownCost } },
+      });
+
+      expect(loadConfig(project).routing.budgets.allowUnknownCost).toBe(expected);
+    },
+  );
+
+  it.each([
     [{ routing: { engine: "automatic" } }, "routing.engine must be one of"],
     [{ routing: { mode: "fastest" } }, "routing.mode must be one of"],
     [{ routing: { version: "raw prompt text" } }, "routing.version must be a bounded canonical metadata token"],
