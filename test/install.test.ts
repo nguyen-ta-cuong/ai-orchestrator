@@ -176,7 +176,7 @@ describe("ai-orchestrator install-cursor", () => {
     expect(packageJson.pi).toEqual({
       extensions: ["./extensions"],
       skills: ["./skills"],
-      image: "https://raw.githubusercontent.com/nguyen-ta-cuong/ai-orchestrator/main/docs/images/ai-orchestrator-workflow.png",
+      image: "https://cdn.jsdelivr.net/npm/@miracle3010/ai-orchestrator/docs/images/ai-orchestrator-workflow.png",
     });
   });
 

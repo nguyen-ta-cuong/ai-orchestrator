@@ -1,6 +1,6 @@
 {
   "name": "@miracle3010/ai-orchestrator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Plan-code-judge AI orchestration for Pi and Cursor.",
   "type": "module",
   "engines": {
@@ -52,7 +52,7 @@
     "skills": [
       "./skills"
     ],
-    "image": "https://raw.githubusercontent.com/nguyen-ta-cuong/ai-orchestrator/main/docs/images/ai-orchestrator-workflow.png"
+    "image": "https://cdn.jsdelivr.net/npm/@miracle3010/ai-orchestrator/docs/images/ai-orchestrator-workflow.png"
   },
   "author": "Cuong Nguyen",
   "license": "ISC",
