@@ -157,6 +157,7 @@ describe("ai-orchestrator install-cursor", () => {
     expect(packageJson.files).toContain("mcp");
     expect(packageJson.files).toContain("CONTRIBUTING.md");
     expect(packageJson.files).toContain("SECURITY.md");
+    expect(packageJson.files).toContain("docs/graph-architecture.md");
     expect(packageJson.files).toContain("docs/images/ai-orchestrator-workflow.png");
     expect(packageJson.files).not.toContain("plans");
     expect(packageJson.files).not.toContain("test");

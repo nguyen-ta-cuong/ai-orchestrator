@@ -27,12 +27,22 @@ How to read the canvas:
 
 - [Setup guide](docs/setup.md): install Pi or Cursor, configure trusted MCP providers/models, and verify the installation.
 - [User guide](docs/user-guide.md): run the fast path, durable lifecycle, routing operations, Cursor handoffs, recovery, and publication gates.
+- [Structured graph architecture](docs/graph-architecture.md): current state ownership, target graph canvases, artifact layouts, recovery levels, and the 0010–0017 migration sequence.
 - [Configuration and trust boundaries](#configuration-and-trust-boundaries): complete routing/catalog reference and security model.
 - [Troubleshooting](#troubleshooting): common Pi, Cursor, MCP, routing, and recovery problems.
 - [Contributing](CONTRIBUTING.md): development workflow, architecture constraints, and validation requirements.
 - [Security policy](SECURITY.md): supported versions and private vulnerability reporting.
 
 ## Architecture and surface parity
+
+```mermaid
+flowchart LR
+    T["User task"] --> R{"Route by complexity and risk"}
+    R -->|"focused"| F["Bounded Plan → Build → Judge loop"]
+    R -->|"durable or parallel"| L["Lifecycle graph around immutable BUILD DAGs"]
+```
+
+The detailed [structured graph architecture](docs/graph-architecture.md) distinguishes today's reducer-owned control flow from the planned graph compiler, durable scheduler, BUILD DAG, stateful MCP, and versioned recovery work.
 
 Automated Pi and MCP surfaces use the same pure routing concepts: stage requirements, task features, capability profiles, pins/preferences, deny rules, cost-aware ranking, policy versions, and maker/checker separation. Cursor's instructions-only surface mirrors the gates and separation rules through manual handoffs but cannot enforce routing itself. The fast planner maps to `plan`; the fast judge maps to `fast-judge`, a combined verification/review policy. Existing loop state machines remain authoritative for counters and escalation.
 
@@ -398,7 +408,7 @@ Change roles, legacy candidate lists, catalog entries, profiles, and policy to m
 
 ## Clean install, package contents, and validation
 
-The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, `src/`, and the user-facing setup guide, user guide, and workflow canvas under `docs/`. npm also includes package metadata and this README. Plans, internal design documents, and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
+The published package includes `dist/`, `bin/`, `cursor/`, `skills/`, `extensions/`, `mcp/`, `src/`, and the user-facing setup guide, user guide, structured graph architecture, and workflow canvas under `docs/`. npm also includes package metadata and this README. Plans, internal execution records, and tests are excluded by the package allowlist. `prepack` rebuilds `dist/`, and the build cleans stale generated output first.
 
 The MCP binary uses the runtime dependencies `@modelcontextprotocol/sdk` and `zod`; it does not require optional Pi peer packages. Pi peers remain optional so a clean MCP/Cursor install does not need Pi.
 

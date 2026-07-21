@@ -28,6 +28,7 @@
     "src",
     "CONTRIBUTING.md",
     "SECURITY.md",
+    "docs/graph-architecture.md",
     "docs/setup.md",
     "docs/user-guide.md",
     "docs/images/ai-orchestrator-workflow.svg",
