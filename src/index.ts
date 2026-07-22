@@ -6,6 +6,7 @@ export * from "./core/lifecycleRouting.js";
 export * from "./core/loop.js";
 export * from "./core/modelRouting.js";
 export * from "./core/prompts.js";
+export * from "./core/recovery.js";
 export * from "./core/routingBudget.js";
 export * from "./core/routingEvidence.js";
 export * from "./core/taskFeatures.js";
