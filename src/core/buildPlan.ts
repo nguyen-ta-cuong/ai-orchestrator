@@ -5,6 +5,7 @@ import {
   type GraphDefinition,
   type SideEffectClass,
 } from "./graph.js";
+import { requireBuildRepositoryPath } from "./repositoryPath.js";
 
 export type BuildHandlerKind = "inspect" | "design" | "implement" | "validate" | "integrate";
 export type BuildToolPolicy = "read-only" | "declared-writes" | "reviewed-validation" | "human-integration";
@@ -19,6 +20,7 @@ export interface BuildOutputContract {
   id: string;
   kind: BuildContractKind;
   validation: BuildValidationKind;
+  validatorRef?: string;
 }
 
 export interface BuildResourceLock {
@@ -36,6 +38,7 @@ export interface BuildNode {
   toolPolicy: BuildToolPolicy;
   sideEffect: SideEffectClass;
   workspace: BuildWorkspace;
+  targetWorktreeNodeId?: string;
   idempotency: BuildIdempotencyPolicy;
   resourceLocks: BuildResourceLock[];
   writeSet: string[];
@@ -91,6 +94,7 @@ export interface BuildNodePolicy {
   handler: BuildHandlerKind;
   toolPolicy: BuildToolPolicy;
   workspace: BuildWorkspace;
+  targetWorktreeNodeId?: string;
   idempotency: BuildIdempotencyPolicy;
   resourceLocks: readonly Readonly<BuildResourceLock>[];
   writeSet: readonly string[];
@@ -127,7 +131,7 @@ const BUILD_PLAN_KEYS = [
 ] as const;
 const BUILD_NODE_KEYS = [
   "id", "handler", "priority", "inputContracts", "outputContracts", "toolPolicy", "sideEffect", "workspace",
-  "idempotency", "resourceLocks", "writeSet", "retryLimit", "timeoutMs",
+  "targetWorktreeNodeId", "idempotency", "resourceLocks", "writeSet", "retryLimit", "timeoutMs",
 ] as const;
 const BUILD_PLAN_LIMIT_KEYS = Object.keys(DEFAULT_BUILD_PLAN_LIMITS) as (keyof BuildPlanLimits)[];
 const HANDLERS = new Set<BuildHandlerKind>(["inspect", "design", "implement", "validate", "integrate"]);
@@ -142,18 +146,18 @@ const RESOURCE_MODES = new Set<BuildResourceMode>(["shared", "exclusive"]);
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
 const LOGICAL_RESOURCE = /^[a-z][a-z0-9]*(?:[-_.:/][a-z0-9]+)*$/;
 const RESERVED_NODE_ID = "build-complete";
-const MAX_PATH_BYTES = 1_024;
+const MAX_IDENTIFIER_BYTES = 128;
 
 export function compileBuildPlan(
   value: unknown,
   limits: Readonly<BuildPlanLimits> = DEFAULT_BUILD_PLAN_LIMITS,
 ): CompiledBuildPlan {
   const effectiveLimits = normalizeLimits(limits);
-  assertSerializedSize(value, effectiveLimits.maxSerializedBytes);
   const normalized = normalizeBuildPlan(value, effectiveLimits);
   assertBuildPlanSemantics(normalized, effectiveLimits);
 
   const canonicalJson = stableJson(normalized);
+  assertSerializedSize(canonicalJson, effectiveLimits.maxSerializedBytes);
   const hash = createHash("sha256").update(canonicalJson).digest("hex");
   const graph = compileGraph(buildGraphDefinition(normalized, hash));
   const schedulerMetadata = deepFreeze({
@@ -163,6 +167,7 @@ export function compileBuildPlan(
     handler: node.handler,
     toolPolicy: node.toolPolicy,
     workspace: node.workspace,
+    ...(node.targetWorktreeNodeId === undefined ? {} : { targetWorktreeNodeId: node.targetWorktreeNodeId }),
     idempotency: node.idempotency,
     resourceLocks: node.resourceLocks.map((resource) => ({ ...resource })),
     writeSet: [...node.writeSet],
@@ -195,10 +200,11 @@ function normalizeBuildPlan(value: unknown, limits: Readonly<BuildPlanLimits>): 
   if (dependencyValues.length > limits.maxDependencies) {
     throw new Error(`BUILD-plan dependency limit exceeded: ${dependencyValues.length} > ${limits.maxDependencies}`);
   }
+  if (joinValues.length > limits.maxNodes) throw new Error(`BUILD-plan join limit exceeded: ${joinValues.length} > ${limits.maxNodes}`);
 
   const nodes = nodeValues.map((node, index) => normalizeNode(node, index, limits)).sort(compareNode);
   const dependencies = dependencyValues.map((edge, index) => normalizeDependency(edge, index, limits)).sort(compareDependency);
-  const joins = joinValues.map((join, index) => normalizeJoin(join, index)).sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+  const joins = joinValues.map((join, index) => normalizeJoin(join, index)).sort((left, right) => compareCodeUnits(left.nodeId, right.nodeId));
   return { schemaVersion: 1, id, planVersion, summary, entry, exit, nodes, dependencies, joins };
 }
 
@@ -215,19 +221,22 @@ function normalizeNode(value: unknown, index: number, limits: Readonly<BuildPlan
     throw new Error(`BUILD node ${id} contract limit exceeded`);
   }
   const outputContracts = outputValues.map((contract, contractIndex) => normalizeOutputContract(contract, id, contractIndex))
-    .sort((left, right) => left.id.localeCompare(right.id));
+    .sort((left, right) => compareCodeUnits(left.id, right.id));
   assertUnique(outputContracts.map((contract) => contract.id), `duplicate output contract for ${id}`);
   if (outputContracts.length === 0) throw new Error(`BUILD node ${id} must declare a non-empty output contract`);
   const toolPolicy = requireEnum(source.toolPolicy, TOOL_POLICIES, `tool policy for ${id}`);
   const sideEffect = requireEnum(source.sideEffect, SIDE_EFFECTS, `side-effect for ${id}`);
   const workspace = requireEnum(source.workspace, WORKSPACES, `workspace for ${id}`);
+  const targetWorktreeNodeId = source.targetWorktreeNodeId === undefined
+    ? undefined
+    : requireIdentifier(source.targetWorktreeNodeId, `target worktree node for ${id}`);
   const idempotency = requireEnum(source.idempotency, IDEMPOTENCY_POLICIES, `idempotency policy for ${id}`);
   const resourceValues = requireArray(source.resourceLocks, `resource locks for ${id}`);
   if (resourceValues.length > limits.maxResourceLocksPerNode) throw new Error(`BUILD node ${id} resource-lock limit exceeded`);
   const resourceLocks = resourceValues.map((resource, resourceIndex) => normalizeResource(resource, id, resourceIndex))
     .sort(compareResource);
   assertUnique(
-    resourceLocks.map((resource) => `${resource.kind}:${resource.value.toLocaleLowerCase("en-US")}:${resource.mode}`),
+    resourceLocks.map((resource) => `${resource.kind}:${resource.value.toLowerCase()}:${resource.mode}`),
     `duplicate resource lock for ${id}`,
   );
   const writeSet = normalizePaths(source.writeSet, `write set for ${id}`, limits.maxWritePathsPerNode);
@@ -245,6 +254,7 @@ function normalizeNode(value: unknown, index: number, limits: Readonly<BuildPlan
     toolPolicy,
     sideEffect,
     workspace,
+    ...(targetWorktreeNodeId === undefined ? {} : { targetWorktreeNodeId }),
     idempotency,
     resourceLocks,
     writeSet,
@@ -257,11 +267,20 @@ function normalizeNode(value: unknown, index: number, limits: Readonly<BuildPlan
 
 function normalizeOutputContract(value: unknown, nodeId: string, index: number): BuildOutputContract {
   const source = requireRecord(value, `output contract ${index} for ${nodeId}`);
-  assertOnlyKeys(source, ["id", "kind", "validation"], `output contract ${index} for ${nodeId}`);
+  assertOnlyKeys(source, ["id", "kind", "validation", "validatorRef"], `output contract ${index} for ${nodeId}`);
+  const validation = requireEnum(source.validation, VALIDATION_KINDS, `output validation for ${nodeId}`);
+  const validatorRef = source.validatorRef === undefined
+    ? undefined
+    : requireIdentifier(source.validatorRef, `output validator reference for ${nodeId}`);
+  const requiresReference = validation === "structured" || validation === "reviewed-command" || validation === "human-review";
+  if (requiresReference !== (validatorRef !== undefined)) {
+    throw new Error(`BUILD output ${String(source.id)} validation ${validation} has an invalid validator reference`);
+  }
   return {
     id: requireIdentifier(source.id, `output contract ${index} for ${nodeId}`),
     kind: requireEnum(source.kind, CONTRACT_KINDS, `output contract kind for ${nodeId}`),
-    validation: requireEnum(source.validation, VALIDATION_KINDS, `output validation for ${nodeId}`),
+    validation,
+    ...(validatorRef === undefined ? {} : { validatorRef }),
   };
 }
 
@@ -271,12 +290,13 @@ function normalizeResource(value: unknown, nodeId: string, index: number): Build
   const kind = requireEnum(source.kind, RESOURCE_KINDS, `resource kind for ${nodeId}`);
   const mode = requireEnum(source.mode, RESOURCE_MODES, `resource mode for ${nodeId}`);
   if (kind === "logical") {
-    if (typeof source.value !== "string" || !LOGICAL_RESOURCE.test(source.value)) {
+    if (typeof source.value !== "string" || Buffer.byteLength(source.value, "utf8") > MAX_IDENTIFIER_BYTES ||
+        !LOGICAL_RESOURCE.test(source.value)) {
       throw new Error(`BUILD node ${nodeId} logical resource must be a bounded canonical token`);
     }
     return { kind, value: source.value, mode };
   }
-  return { kind, value: requireRepositoryPath(source.value, `path resource for ${nodeId}`), mode };
+  return { kind, value: requireBuildRepositoryPath(source.value, `path resource for ${nodeId}`), mode };
 }
 
 function normalizeDependency(value: unknown, index: number, limits: Readonly<BuildPlanLimits>): BuildDependency {
@@ -341,7 +361,40 @@ function assertBuildPlanSemantics(plan: BuildPlan, limits: Readonly<BuildPlanLim
       }
     }
   }
+  const isolatedImplementers = plan.nodes.filter((node) =>
+    node.handler === "implement" && node.workspace === "isolated-worktree");
+  for (const node of plan.nodes.filter((candidate) => candidate.handler === "validate")) {
+    if (node.workspace === "shared") {
+      const isolatedInputs = node.inputContracts.filter((contract) => {
+        const owner = nodesById.get(globalOutputs.get(contract) ?? "");
+        return owner?.handler === "implement" && owner.workspace === "isolated-worktree";
+      });
+      if (isolatedInputs.length > 0) {
+        throw new Error(`BUILD shared validation ${node.id} cannot validate isolated worktree outputs`);
+      }
+      continue;
+    }
+    if (!node.targetWorktreeNodeId) throw new Error(`BUILD validate node ${node.id} requires a target worktree node`);
+    const target = nodesById.get(node.targetWorktreeNodeId);
+    if (!target || target.handler !== "implement" || target.workspace !== "isolated-worktree") {
+      throw new Error(`BUILD validate node ${node.id} target worktree must be an isolated implement node`);
+    }
+    const direct = incoming.get(node.id)?.find((dependency) => dependency.from === target.id);
+    const outputs = target.outputContracts.map((contract) => contract.id);
+    if (!direct || outputs.some((contract) => !direct.contracts.includes(contract))) {
+      throw new Error(`BUILD validate node ${node.id} must bind every output from target worktree ${target.id}`);
+    }
+  }
+  for (const implementer of isolatedImplementers) {
+    if (!plan.nodes.some((node) => node.handler === "validate" &&
+        node.workspace === "isolated-worktree" && node.targetWorktreeNodeId === implementer.id)) {
+      throw new Error(`BUILD isolated implement node ${implementer.id} requires an explicit target-worktree validation`);
+    }
+  }
   if ((incoming.get(plan.entry)?.length ?? 0) > 0) throw new Error(`BUILD-plan entry ${plan.entry} cannot have an incoming dependency`);
+  if (entry.inputContracts.length > 0) {
+    throw new Error(`BUILD-plan entry ${plan.entry} cannot declare an input contract without predecessor provenance`);
+  }
   if ((outgoing.get(plan.exit)?.length ?? 0) > 0) throw new Error(`BUILD-plan exit ${plan.exit} cannot have an outgoing dependency`);
 
   const joinsByNode = new Map<string, BuildJoin>();
@@ -383,6 +436,10 @@ function assertBuildPlanSemantics(plan: BuildPlan, limits: Readonly<BuildPlanLim
       throw new Error(`BUILD integrate handler ${node.id} is speculative; integration must be the plan exit`);
     }
   }
+  if (plan.nodes.some((node) => node.handler === "implement" && node.workspace === "isolated-worktree") &&
+      exit.handler !== "integrate") {
+    throw new Error("BUILD isolated writers must terminate at an explicit human integration node");
+  }
   const externalNodes = plan.nodes.filter((node) => node.sideEffect === "external").length;
   if (externalNodes > limits.maxExternalNodes) {
     throw new Error(`BUILD-plan external-node limit exceeded: ${externalNodes} > ${limits.maxExternalNodes}`);
@@ -407,18 +464,24 @@ function assertNodePolicy(node: Readonly<BuildNode>): void {
     case "inspect":
     case "design":
       assertExactNodePolicy(node, "read-only", "read", "shared", false);
+      if (node.targetWorktreeNodeId !== undefined) throw new Error(`BUILD ${node.handler} node ${node.id} cannot target a worktree`);
       break;
     case "implement":
       assertExactNodePolicy(node, "declared-writes", "write", undefined, true);
+      if (node.targetWorktreeNodeId !== undefined) throw new Error(`BUILD implement node ${node.id} cannot target another worktree`);
       break;
     case "validate":
-      assertExactNodePolicy(node, "reviewed-validation", "read", "shared", false);
+      assertExactNodePolicy(node, "reviewed-validation", "read", undefined, false);
+      if (node.workspace === "shared" && node.targetWorktreeNodeId !== undefined) {
+        throw new Error(`BUILD shared validate node ${node.id} cannot target a worktree`);
+      }
       if (node.outputContracts.some((contract) => contract.validation !== "reviewed-command")) {
         throw new Error(`BUILD validate node ${node.id} outputs must use reviewed-command validation`);
       }
       break;
     case "integrate":
       assertExactNodePolicy(node, "human-integration", "external", "shared", false);
+      if (node.targetWorktreeNodeId !== undefined) throw new Error(`BUILD integrate node ${node.id} cannot target a worktree`);
       if (node.outputContracts.some((contract) => contract.validation !== "human-review")) {
         throw new Error(`BUILD integrate node ${node.id} outputs must use human-review validation`);
       }
@@ -549,32 +612,17 @@ function normalizeContractIds(value: unknown, label: string, maximum: number): s
 function normalizePaths(value: unknown, label: string, maximum: number): string[] {
   const source = requireArray(value, label);
   if (source.length > maximum) throw new Error(`BUILD write-path limit exceeded for ${label}`);
-  const paths = source.map((path, index) => requireRepositoryPath(path, `${label} item ${index}`)).sort(comparePaths);
-  assertUnique(paths.map((path) => path.toLocaleLowerCase("en-US")), `duplicate ${label}`);
+  const paths = source.map((path, index) => requireBuildRepositoryPath(path, `${label} item ${index}`)).sort(comparePaths);
+  assertUnique(paths.map((path) => path.toLowerCase()), `duplicate ${label}`);
   for (let index = 1; index < paths.length; index += 1) {
     if (pathsOverlap(paths[index - 1]!, paths[index]!)) throw new Error(`${label} contains overlapping repository paths`);
   }
   return paths;
 }
 
-function requireRepositoryPath(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > MAX_PATH_BYTES ||
-      value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:/.test(value) || value.includes("\\") ||
-      /[\u0000-\u001f\u007f*?\[\]{}]/.test(value)) {
-    throw new Error(`${label} must be a contained relative canonical repository path`);
-  }
-  const parts = value.split("/");
-  if (parts.some((part) => part.length === 0 || part === "." || part === "..") || parts.join("/") !== value) {
-    throw new Error(`${label} must be a contained relative canonical repository path`);
-  }
-  const first = parts[0]!.toLocaleLowerCase("en-US");
-  if (first === ".git" || first === ".ai-orchestrator") throw new Error(`${label} targets a protected path`);
-  return value;
-}
-
 function pathContains(parent: string, child: string): boolean {
-  const normalizedParent = parent.toLocaleLowerCase("en-US");
-  const normalizedChild = child.toLocaleLowerCase("en-US");
+  const normalizedParent = parent.toLowerCase();
+  const normalizedChild = child.toLowerCase();
   return normalizedParent === normalizedChild || normalizedChild.startsWith(`${normalizedParent}/`);
 }
 
@@ -585,18 +633,34 @@ function pathsOverlap(left: string, right: string): boolean {
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw new Error(`${label} must be a plain object`);
+  const descriptors = Object.values(Object.getOwnPropertyDescriptors(value));
+  if ((prototype !== Object.prototype && prototype !== null) ||
+      descriptors.some((descriptor) => !("value" in descriptor))) {
+    throw new Error(`${label} must be a plain object containing data properties`);
+  }
   if (Object.getOwnPropertySymbols(value).length > 0) throw new Error(`${label} contains unsupported symbol fields`);
   return value as Record<string, unknown>;
 }
 
 function requireArray(value: unknown, label: string): unknown[] {
-  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error(`${label} must be a plain array`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !("value" in descriptor)) throw new Error(`${label} must be a dense data-property array`);
+  }
+  const unexpected = Reflect.ownKeys(descriptors).filter((key) => typeof key !== "string" ||
+    (key !== "length" && (!/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= value.length)));
+  if (unexpected.length > 0) throw new Error(`${label} contains unsupported array properties`);
   return value;
 }
 
 function requireIdentifier(value: unknown, label: string): string {
-  if (typeof value !== "string" || !IDENTIFIER.test(value)) throw new Error(`${label} must be a canonical identifier`);
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > MAX_IDENTIFIER_BYTES || !IDENTIFIER.test(value)) {
+    throw new Error(`${label} must be a bounded canonical identifier`);
+  }
   return value;
 }
 
@@ -629,48 +693,47 @@ function requireBoundedInteger(value: unknown, maximum: number, label: string): 
 }
 
 function assertOnlyKeys(value: Record<string, unknown>, allowed: readonly (string | number | symbol)[], label: string): void {
-  const extras = Object.keys(value).filter((key) => !allowed.includes(key));
-  if (extras.length > 0) throw new Error(`${label} contains unsupported fields: ${extras.join(", ")}`);
+  const extras = Reflect.ownKeys(value).filter((key) => !allowed.includes(key));
+  if (extras.length > 0) throw new Error(`${label} contains unsupported fields`);
 }
 
 function assertUnique(values: readonly string[], label: string): void {
   if (new Set(values).size !== values.length) throw new Error(label);
 }
 
-function assertSerializedSize(value: unknown, maximum: number): void {
-  let serialized: string | undefined;
-  try {
-    serialized = JSON.stringify(value);
-  } catch {
-    throw new Error("BUILD plan must be JSON-serializable");
+function assertSerializedSize(serialized: string, maximum: number): void {
+  if (Buffer.byteLength(serialized, "utf8") > maximum) {
+    throw new Error(`BUILD plan exceeds the ${maximum}-byte serialized limit`);
   }
-  if (serialized === undefined) throw new Error("BUILD plan must be JSON-serializable");
-  if (Buffer.byteLength(serialized, "utf8") > maximum) throw new Error(`BUILD plan exceeds the ${maximum}-byte serialized limit`);
 }
 
 function compareNode(left: Readonly<BuildNode>, right: Readonly<BuildNode>): number {
-  return left.id.localeCompare(right.id);
+  return compareCodeUnits(left.id, right.id);
 }
 
 function compareDependency(left: Readonly<BuildDependency>, right: Readonly<BuildDependency>): number {
-  return left.from.localeCompare(right.from) || left.to.localeCompare(right.to);
+  return compareCodeUnits(left.from, right.from) || compareCodeUnits(left.to, right.to);
 }
 
 function compareResource(left: Readonly<BuildResourceLock>, right: Readonly<BuildResourceLock>): number {
-  return left.kind.localeCompare(right.kind) || comparePaths(left.value, right.value) || left.mode.localeCompare(right.mode);
+  return compareCodeUnits(left.kind, right.kind) || comparePaths(left.value, right.value) || compareCodeUnits(left.mode, right.mode);
 }
 
 function comparePaths(left: string, right: string): number {
-  return left.toLocaleLowerCase("en-US").localeCompare(right.toLocaleLowerCase("en-US")) || left.localeCompare(right);
+  return compareCodeUnits(left.toLowerCase(), right.toLowerCase()) || compareCodeUnits(left, right);
 }
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
-    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+    return `{${Object.entries(value).sort(([left], [right]) => compareCodeUnits(left, right))
       .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function deepFreeze<T>(value: T): T {

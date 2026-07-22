@@ -13,7 +13,14 @@ function output(
   kind: BuildNode["outputContracts"][number]["kind"] = "artifact",
   validation: BuildNode["outputContracts"][number]["validation"] = "sha256",
 ) {
-  return { id, kind, validation };
+  return {
+    id,
+    kind,
+    validation,
+    ...(validation === "structured" || validation === "reviewed-command" || validation === "human-review"
+      ? { validatorRef: `${id}-validator` }
+      : {}),
+  };
 }
 
 function node(id: string, overrides: Partial<BuildNode> = {}): BuildNode {
@@ -81,16 +88,27 @@ function plan(): BuildPlan {
         writeSet: ["src/b.ts"],
         retryLimit: 1,
       }),
-      node("validate", {
+      node("validate-a", {
         handler: "validate",
         priority: 2,
-        inputContracts: ["patch-a", "patch-b"],
-        outputContracts: [output("verification", "evidence", "reviewed-command")],
+        inputContracts: ["patch-a"],
+        outputContracts: [output("verification-a", "evidence", "reviewed-command")],
         toolPolicy: "reviewed-validation",
+        workspace: "isolated-worktree",
+        targetWorktreeNodeId: "implement-a",
+      }),
+      node("validate-b", {
+        handler: "validate",
+        priority: 2,
+        inputContracts: ["patch-b"],
+        outputContracts: [output("verification-b", "evidence", "reviewed-command")],
+        toolPolicy: "reviewed-validation",
+        workspace: "isolated-worktree",
+        targetWorktreeNodeId: "implement-b",
       }),
       node("integrate", {
         handler: "integrate",
-        inputContracts: ["verification"],
+        inputContracts: ["verification-a", "verification-b"],
         outputContracts: [output("integration-decision", "evidence", "human-review")],
         toolPolicy: "human-integration",
         sideEffect: "external",
@@ -101,11 +119,12 @@ function plan(): BuildPlan {
       { from: "inspect", to: "design", contracts: ["inventory"] },
       { from: "design", to: "implement-a", contracts: ["design"] },
       { from: "design", to: "implement-b", contracts: ["design"] },
-      { from: "implement-a", to: "validate", contracts: ["patch-a"] },
-      { from: "implement-b", to: "validate", contracts: ["patch-b"] },
-      { from: "validate", to: "integrate", contracts: ["verification"] },
+      { from: "implement-a", to: "validate-a", contracts: ["patch-a"] },
+      { from: "implement-b", to: "validate-b", contracts: ["patch-b"] },
+      { from: "validate-a", to: "integrate", contracts: ["verification-a"] },
+      { from: "validate-b", to: "integrate", contracts: ["verification-b"] },
     ],
-    joins: [{ nodeId: "validate", mode: "all_of" }],
+    joins: [{ nodeId: "integrate", mode: "all_of" }],
   };
 }
 
@@ -124,15 +143,16 @@ describe("compileBuildPlan", () => {
 
     expect(input).toEqual(before);
     expect(compiled.plan.nodes.map(({ id }) => id)).toEqual([
-      "design", "implement-a", "implement-b", "inspect", "integrate", "validate",
+      "design", "implement-a", "implement-b", "inspect", "integrate", "validate-a", "validate-b",
     ]);
     expect(compiled.plan.dependencies.map(({ from, to }) => `${from}->${to}`)).toEqual([
       "design->implement-a",
       "design->implement-b",
-      "implement-a->validate",
-      "implement-b->validate",
+      "implement-a->validate-a",
+      "implement-b->validate-b",
       "inspect->design",
-      "validate->integrate",
+      "validate-a->integrate",
+      "validate-b->integrate",
     ]);
     expect(compiled.hash).toMatch(/^[a-f0-9]{64}$/);
     expect(compiled.hash).toBe(createHash("sha256").update(compiled.canonicalJson).digest("hex"));
@@ -186,12 +206,13 @@ describe("compileBuildPlan", () => {
         "implement-b": 5,
         inspect: 20,
         integrate: 0,
-        validate: 2,
+        "validate-a": 2,
+        "validate-b": 2,
       },
     });
-    expect(compiled.graph.nodesById.get("validate")).toMatchObject({
-      inputContracts: ["patch-a", "patch-b"],
-      outputContracts: ["verification"],
+    expect(compiled.graph.nodesById.get("validate-a")).toMatchObject({
+      inputContracts: ["patch-a"],
+      outputContracts: ["verification-a"],
       sideEffect: "read",
     });
     const fanOutEvents = compiled.graph.outgoingByNode.get("design")?.map(({ event }) => event) ?? [];
@@ -221,13 +242,34 @@ describe("compileBuildPlan", () => {
     for (const value of cases) expect(() => compileBuildPlan(value)).toThrow(/unsupported fields/);
   });
 
+  it("rejects accessor-backed, sparse, and custom-prototype inputs without evaluating them", () => {
+    let accessed = false;
+    const accessorPlan = plan() as BuildPlan;
+    Object.defineProperty(accessorPlan, "summary", {
+      enumerable: true,
+      get: () => {
+        accessed = true;
+        return "must not be evaluated";
+      },
+    });
+    expect(() => compileBuildPlan(accessorPlan)).toThrow(/plain object|data propert/i);
+    expect(accessed).toBe(false);
+
+    class HostileNodes extends Array<BuildNode> {}
+    expect(() => compileBuildPlan({ ...plan(), nodes: new HostileNodes(...plan().nodes) })).toThrow(/array/i);
+
+    const sparseNodes = Array<BuildNode>(plan().nodes.length);
+    sparseNodes[0] = plan().nodes[0]!;
+    expect(() => compileBuildPlan({ ...plan(), nodes: sparseNodes })).toThrow(/dense|array/i);
+  });
+
   it("requires declared all_of joins and exact dependency contract bindings", () => {
     const missingJoin = plan();
     missingJoin.joins = [];
-    expect(() => compileBuildPlan(missingJoin)).toThrow(/all_of join.*validate/);
+    expect(() => compileBuildPlan(missingJoin)).toThrow(/all_of join.*integrate/);
 
     const speculative = plan() as unknown as { joins: { nodeId: string; mode: string }[] };
-    speculative.joins = [{ nodeId: "validate", mode: "first_success" }];
+    speculative.joins = [{ nodeId: "integrate", mode: "first_success" }];
     expect(() => compileBuildPlan(speculative)).toThrow(/join mode/);
 
     const wrongSource = plan();
@@ -235,7 +277,7 @@ describe("compileBuildPlan", () => {
     expect(() => compileBuildPlan(wrongSource)).toThrow(/source.*output contract/);
 
     const unresolvedInput = plan();
-    unresolvedInput.nodes.find(({ id }) => id === "validate")!.inputContracts.push("unbound");
+    unresolvedInput.nodes.find(({ id }) => id === "validate-a")!.inputContracts.push("unbound");
     expect(() => compileBuildPlan(unresolvedInput)).toThrow(/input contract.*unbound.*not bound/);
 
     const duplicateEdge = plan();
@@ -256,15 +298,16 @@ describe("compileBuildPlan", () => {
       ["implement is non-writing", (value) => { value.nodes[2]!.sideEffect = "read"; }, /side-effect/],
       ["unknown idempotency", (value) => { value.nodes[2]!.idempotency = "sometimes" as BuildNode["idempotency"]; }, /idempotency/],
       ["write retry is not keyed", (value) => { value.nodes[2]!.idempotency = "none"; }, /retry.*idempotency|idempotency.*retry/],
-      ["external retry is not keyed", (value) => { value.nodes[5]!.retryLimit = 1; }, /retry.*idempotency|idempotency.*retry/],
+      ["external retry is not keyed", (value) => { value.nodes.find(({ id }) => id === "integrate")!.retryLimit = 1; }, /retry.*idempotency|idempotency.*retry/],
       ["write claims read replay", (value) => { value.nodes[2]!.idempotency = "read-replay-safe"; }, /read-replay-safe/],
-      ["integrate is irreversible", (value) => { value.nodes[5]!.sideEffect = "irreversible"; }, /irreversible/],
+      ["integrate is irreversible", (value) => { value.nodes.find(({ id }) => id === "integrate")!.sideEffect = "irreversible"; }, /irreversible/],
       ["external before exit", (value) => {
         value.nodes[0]!.handler = "integrate";
         value.nodes[0]!.toolPolicy = "human-integration";
         value.nodes[0]!.sideEffect = "external";
         value.nodes[0]!.idempotency = "none";
         value.nodes[0]!.outputContracts[0]!.validation = "human-review";
+        value.nodes[0]!.outputContracts[0]!.validatorRef = "forged-human-gate";
       }, /external.*exit|integrate.*exit/],
       ["absolute write", (value) => { value.nodes[2]!.writeSet = ["/tmp/a.ts"]; }, /contained relative/],
       ["traversal", (value) => { value.nodes[2]!.writeSet = ["../a.ts"]; }, /contained relative/],
@@ -285,6 +328,22 @@ describe("compileBuildPlan", () => {
     }
   });
 
+  it("rejects non-NFC repository paths before hashing plan identity", () => {
+    const input = plan();
+    const implement = input.nodes.find(({ id }) => id === "implement-a")!;
+    implement.writeSet = ["src/e\u0301.ts"];
+    implement.resourceLocks = [{ kind: "path", value: "src/e\u0301.ts", mode: "exclusive" }];
+
+    expect(() => compileBuildPlan(input)).toThrow(/canonical repository path/i);
+  });
+
+  it("rejects entry inputs because DAG genesis has no predecessor provenance", () => {
+    const input = plan();
+    input.nodes.find(({ id }) => id === input.entry)!.inputContracts = ["ambient-task"];
+
+    expect(() => compileBuildPlan(input)).toThrow(/entry.*input contract/i);
+  });
+
   it("rejects case-folded and ancestor write overlap between unordered nodes", () => {
     for (const [left, right] of [
       ["src/Feature.ts", "src/feature.ts"],
@@ -298,6 +357,49 @@ describe("compileBuildPlan", () => {
       second.writeSet = [right];
       second.resourceLocks = [{ kind: "path", value: right, mode: "exclusive" }];
       expect(() => compileBuildPlan(value)).toThrow(/overlapping write paths/);
+    }
+  });
+
+  it("requires isolated writers to terminate at an explicit human integration node", () => {
+    const value = plan();
+    value.exit = "validate-a";
+    value.nodes = value.nodes.filter(({ id }) => id !== "integrate");
+    value.dependencies = value.dependencies.filter(({ to }) => to !== "integrate");
+    value.joins = [];
+
+    expect(() => compileBuildPlan(value)).toThrow(/isolated.*human integration|integration.*isolated/i);
+  });
+
+  it("requires each isolated candidate to be validated inside its explicitly targeted worktree", () => {
+    const sharedValidation = plan();
+    const shared = sharedValidation.nodes.find(({ id }) => id === "validate-a")!;
+    shared.workspace = "shared";
+    delete shared.targetWorktreeNodeId;
+    expect(() => compileBuildPlan(sharedValidation)).toThrow(/shared validation.*isolated|target.*worktree/i);
+
+    const missingTarget = plan();
+    const validate = missingTarget.nodes.find(({ id }) => id === "validate-a")!;
+    delete validate.targetWorktreeNodeId;
+    expect(() => compileBuildPlan(missingTarget)).toThrow(/target worktree/i);
+  });
+
+  it("rejects filesystem-ambiguous Unicode and Windows-trailing path forms", () => {
+    for (const path of ["src/σ.ts", "src/file.", "src/name "]) {
+      const value = plan();
+      const implement = value.nodes.find(({ id }) => id === "implement-a")!;
+      implement.writeSet = [path];
+      implement.resourceLocks = [{ kind: "path", value: path, mode: "exclusive" }];
+      expect(() => compileBuildPlan(value), path).toThrow(/portable|canonical repository path/i);
+    }
+  });
+
+  it("rejects protected repository metadata in every path segment", () => {
+    for (const path of ["src/.git/config", "src/.ai-orchestrator/state.json"]) {
+      const value = plan();
+      const implement = value.nodes.find(({ id }) => id === "implement-a")!;
+      implement.writeSet = [path];
+      implement.resourceLocks = [{ kind: "path", value: path, mode: "exclusive" }];
+      expect(() => compileBuildPlan(value), path).toThrow(/protected path/i);
     }
   });
 
@@ -324,5 +426,9 @@ describe("compileBuildPlan", () => {
     expect(() => compileBuildPlan(plan(), { ...DEFAULT_BUILD_PLAN_LIMITS, unknown: 1 } as BuildPlanLimits)).toThrow(
       /unsupported fields/,
     );
+  });
+
+  it("bounds identifiers before canonicalization and hashing", () => {
+    expect(() => compileBuildPlan({ ...plan(), id: `a${"b".repeat(256)}` })).toThrow(/bounded canonical identifier/i);
   });
 });

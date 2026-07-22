@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertOwnedWorktree,
+  createBuildWorktreeOwnershipProof,
+  inspectOwnedBuildWorkspace,
   inspectOwnedWorktreeChanges,
   materializeWorktree,
   prepareWorktreeIntent,
@@ -16,6 +18,7 @@ import {
 
 const tempDirs: string[] = [];
 const baseSha = "a".repeat(40);
+const planHash = "b".repeat(64);
 
 afterEach(() => {
   for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
@@ -113,6 +116,7 @@ function prepare(selected = fixture()): { intent: WorktreeExecutionIntent } & Re
     runId: "run-001",
     nodeId: "implement-a",
     planVersion: 1,
+    planHash,
   }, selected.git);
   return { ...selected, intent };
 }
@@ -167,6 +171,7 @@ describe("owned BUILD worktree execution", () => {
       runId: "run-001",
       nodeId: "implement-a",
       planVersion: 1,
+      planHash,
     });
     expect(intent.intentId).toMatch(/^[a-f0-9]{64}$/);
     expect(Object.isFrozen(intent)).toBe(true);
@@ -188,6 +193,7 @@ describe("owned BUILD worktree execution", () => {
       runId: "run-001",
       nodeId: "implement-a",
       planVersion: 1,
+      planHash,
     }, selected.git)).toThrow(/working tree.*clean|dirty|staged/);
     expect(mutatingCalls(selected.git)).toEqual([]);
     expectNoForbiddenGit(selected.git);
@@ -255,6 +261,7 @@ describe("owned BUILD worktree execution", () => {
       runId: "run-001",
       nodeId: "implement-a",
       planVersion: 1,
+      planHash,
     }, outside.git)).toThrow(/inside.*repository|contain/);
 
     const linked = fixture();
@@ -268,6 +275,7 @@ describe("owned BUILD worktree execution", () => {
       runId: "run-001",
       nodeId: "implement-a",
       planVersion: 1,
+      planHash,
     }, linked.git)).toThrow(/symlink|inside.*repository|contain/);
 
     const commonLink = fixture();
@@ -328,7 +336,23 @@ describe("owned BUILD worktree execution", () => {
     selected.git.untracked = ["src/generated/a.ts"];
 
     expect(() => assertOwnedWorktree(selected.record, selected.git)).not.toThrow();
+    expect(createBuildWorktreeOwnershipProof(selected.record, selected.git)).toMatchObject({
+      intentId: selected.record.intentId,
+      runId: "run-001",
+      nodeId: "implement-a",
+      planVersion: 1,
+      planHash,
+      baseSha,
+      reconciled: true,
+      cleanupStatus: "active",
+    });
     expect(inspectOwnedWorktreeChanges(selected.record, ["src/a.ts", "src/generated"], selected.git)).toEqual({
+      changedPaths: ["src/a.ts", "src/generated/a.ts"],
+      stagedPaths: [],
+    });
+    expect(inspectOwnedBuildWorkspace(selected.record, ["src/a.ts", "src/generated"], selected.git)).toMatchObject({
+      schemaVersion: 1,
+      ownership: { intentId: selected.record.intentId, reconciled: true },
       changedPaths: ["src/a.ts", "src/generated/a.ts"],
       stagedPaths: [],
     });
@@ -338,6 +362,9 @@ describe("owned BUILD worktree execution", () => {
     selected.git.untracked = [];
     selected.git.staged = ["src/a.ts"];
     expect(() => inspectOwnedWorktreeChanges(selected.record, ["src/a.ts"], selected.git)).toThrow(/staged.*not allowed/);
+    selected.git.staged = [];
+    selected.git.untracked = ["src/.git/config"];
+    expect(() => inspectOwnedWorktreeChanges(selected.record, ["src"], selected.git)).toThrow(/protected path/i);
     expectNoForbiddenGit(selected.git);
   });
 

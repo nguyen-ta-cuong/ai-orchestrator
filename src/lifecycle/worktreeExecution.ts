@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, parse, relative, resolve } from "node:path";
+import type { BuildWorkspaceInspection, BuildWorktreeOwnershipProof } from "../core/buildScheduler.js";
+import { requireBuildRepositoryPath } from "../core/repositoryPath.js";
 
 export interface GitCommandResult {
   code: number;
@@ -18,6 +20,7 @@ export interface PrepareWorktreeOptions {
   runId: string;
   nodeId: string;
   planVersion: number;
+  planHash: string;
 }
 
 export interface WorktreeExecutionIntent {
@@ -32,6 +35,7 @@ export interface WorktreeExecutionIntent {
   runId: string;
   nodeId: string;
   planVersion: number;
+  planHash: string;
 }
 
 export interface WorktreeOwnershipRecord extends WorktreeExecutionIntent {
@@ -60,6 +64,7 @@ const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const INTENT_KEYS = [
   "schemaVersion", "intentId", "repositoryRoot", "commonDir", "candidateRoot", "worktreePath", "baseSha", "branch",
   "runId", "nodeId", "planVersion",
+  "planHash",
 ] as const;
 const RECORD_KEYS = [...INTENT_KEYS, "reconciled", "cleanupStatus"] as const;
 const SAFE_STATUS_ARGS = ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=all"] as const;
@@ -68,7 +73,6 @@ const SAFE_STAGED_ARGS = ["-c", "core.fsmonitor=false", "diff", "--cached", "--n
 const SAFE_UNTRACKED_ARGS = ["-c", "core.fsmonitor=false", "ls-files", "--others", "--exclude-standard", "-z"] as const;
 const SAFE_IGNORED_ARGS = ["-c", "core.fsmonitor=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"] as const;
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
-const MAX_REPOSITORY_PATH_BYTES = 1_024;
 
 export function prepareWorktreeIntent(
   options: Readonly<PrepareWorktreeOptions>,
@@ -77,6 +81,7 @@ export function prepareWorktreeIntent(
   const runId = requireToken(options.runId, "BUILD worktree run id");
   const nodeId = requireToken(options.nodeId, "BUILD worktree node id");
   const planVersion = requirePositiveInteger(options.planVersion, "BUILD worktree plan version");
+  const planHash = requirePlanHash(options.planHash);
   const repositoryRoot = canonicalExistingDirectory(options.repositoryRoot, "repository root");
   const reportedRoot = readGitPath(git, repositoryRoot, ["rev-parse", "--show-toplevel"], "repository root");
   if (reportedRoot !== repositoryRoot) throw new Error("Git repository root does not match the requested canonical repository");
@@ -109,6 +114,7 @@ export function prepareWorktreeIntent(
     runId,
     nodeId,
     planVersion,
+    planHash,
   });
 }
 
@@ -179,6 +185,26 @@ export function assertOwnedWorktree(recordValue: Readonly<WorktreeOwnershipRecor
   if (!reconciled) throw new Error("BUILD worktree ownership no longer exists");
 }
 
+/** Reconcile Git immediately before minting the bounded proof consumed by pure dispatch policy. */
+export function createBuildWorktreeOwnershipProof(
+  recordValue: Readonly<WorktreeOwnershipRecord>,
+  git: GitRunner,
+): Readonly<BuildWorktreeOwnershipProof> {
+  const record = validateOwnershipRecord(recordValue);
+  assertOwnedWorktree(record, git);
+  return Object.freeze({
+    schemaVersion: 1,
+    intentId: record.intentId,
+    runId: record.runId,
+    nodeId: record.nodeId,
+    planVersion: record.planVersion,
+    planHash: record.planHash,
+    baseSha: record.baseSha,
+    reconciled: true,
+    cleanupStatus: record.cleanupStatus,
+  });
+}
+
 export function inspectOwnedWorktreeChanges(
   recordValue: Readonly<WorktreeOwnershipRecord>,
   declaredWriteSet: readonly string[],
@@ -201,6 +227,22 @@ export function inspectOwnedWorktreeChanges(
   return Object.freeze({ changedPaths: Object.freeze(changedPaths), stagedPaths: Object.freeze([]) });
 }
 
+/** Inspect candidate changes and reconcile Git again before returning trusted completion evidence. */
+export function inspectOwnedBuildWorkspace(
+  recordValue: Readonly<WorktreeOwnershipRecord>,
+  declaredWriteSet: readonly string[],
+  git: GitRunner,
+): Readonly<BuildWorkspaceInspection> {
+  const changes = inspectOwnedWorktreeChanges(recordValue, declaredWriteSet, git);
+  const ownership = createBuildWorktreeOwnershipProof(recordValue, git);
+  return Object.freeze({
+    schemaVersion: 1,
+    ownership,
+    changedPaths: changes.changedPaths,
+    stagedPaths: changes.stagedPaths,
+  });
+}
+
 function createIntent(
   fields: Omit<WorktreeExecutionIntent, "schemaVersion" | "intentId">,
 ): WorktreeExecutionIntent {
@@ -220,6 +262,7 @@ function validateIntent(value: Readonly<WorktreeExecutionIntent>): WorktreeExecu
   const runId = requireToken(source.runId, "BUILD worktree run id");
   const nodeId = requireToken(source.nodeId, "BUILD worktree node id");
   const planVersion = requirePositiveInteger(source.planVersion, "BUILD worktree plan version");
+  const planHash = requirePlanHash(source.planHash);
   const repositoryRoot = canonicalExistingDirectory(source.repositoryRoot, "repository root");
   const commonDir = canonicalExistingDirectory(source.commonDir, "Git common directory");
   const candidateRoot = canonicalExistingDirectory(source.candidateRoot, "candidate worktree root");
@@ -245,6 +288,7 @@ function validateIntent(value: Readonly<WorktreeExecutionIntent>): WorktreeExecu
     runId,
     nodeId,
     planVersion,
+    planHash,
   });
   if (normalized.intentId !== source.intentId) throw new Error("BUILD worktree intent identity does not match its contents");
   return normalized;
@@ -343,7 +387,7 @@ function readGitPaths(
   if (!output.endsWith("\u0000")) throw new Error(`${label} did not return NUL-delimited paths`);
   const values = output.slice(0, -1).split("\u0000");
   if (values.some((value) => value.length === 0)) throw new Error(`${label} returned an empty path`);
-  return uniquePaths(values.map((value) => requireRepositoryPath(value, `${label} path`)));
+  return uniquePaths(values.map((value) => requireBuildRepositoryPath(value, `${label} path`)));
 }
 
 function runGit(git: GitRunner, cwd: string, args: readonly string[], label: string): GitCommandResult {
@@ -408,39 +452,35 @@ function assertStrictlyContained(root: string, target: string, message: string):
 }
 
 function normalizeDeclaredPaths(paths: readonly string[]): string[] {
-  if (!Array.isArray(paths)) throw new Error("Declared BUILD write set must be an array");
-  return uniquePaths(paths.map((path) => requireRepositoryPath(path, "declared BUILD write path")));
-}
-
-function requireRepositoryPath(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > MAX_REPOSITORY_PATH_BYTES ||
-      value !== value.normalize("NFC") || value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:/.test(value) ||
-      value.includes("\\") || /[\u0000-\u001f\u007f*?\[\]{}]/.test(value)) {
-    throw new Error(`${label} must be a safe canonical repository path`);
+  if (!Array.isArray(paths) || Object.getPrototypeOf(paths) !== Array.prototype) {
+    throw new Error("Declared BUILD write set must be a plain array");
   }
-  const parts = value.split("/");
-  if (parts.some((part) => part.length === 0 || part === "." || part === "..") || parts.join("/") !== value) {
-    throw new Error(`${label} must be a safe canonical repository path`);
+  const descriptors = Object.getOwnPropertyDescriptors(paths);
+  for (let index = 0; index < paths.length; index += 1) {
+    if (!descriptors[String(index)] || !("value" in descriptors[String(index)]!)) {
+      throw new Error("Declared BUILD write set must be a dense data-property array");
+    }
   }
-  const first = parts[0]!.toLocaleLowerCase("en-US");
-  if (first === ".git" || first === ".ai-orchestrator") throw new Error(`${label} targets a protected path`);
-  return value;
+  const unexpected = Reflect.ownKeys(descriptors).filter((key) => typeof key !== "string" ||
+    (key !== "length" && (!/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= paths.length)));
+  if (unexpected.length > 0) throw new Error("Declared BUILD write set contains unsupported array properties");
+  return uniquePaths(paths.map((path) => requireBuildRepositoryPath(path, "declared BUILD write path")));
 }
 
 function uniquePaths(paths: readonly string[]): string[] {
   const byFoldedPath = new Map<string, string>();
-  for (const path of paths) byFoldedPath.set(path.toLocaleLowerCase("en-US"), path);
+  for (const path of paths) byFoldedPath.set(path.toLowerCase(), path);
   return [...byFoldedPath.values()].sort(comparePaths);
 }
 
 function pathContains(parent: string, child: string): boolean {
-  const normalizedParent = parent.toLocaleLowerCase("en-US");
-  const normalizedChild = child.toLocaleLowerCase("en-US");
+  const normalizedParent = parent.toLowerCase();
+  const normalizedChild = child.toLowerCase();
   return normalizedParent === normalizedChild || normalizedChild.startsWith(`${normalizedParent}/`);
 }
 
 function comparePaths(left: string, right: string): number {
-  return left.toLocaleLowerCase("en-US").localeCompare(right.toLocaleLowerCase("en-US")) || left.localeCompare(right);
+  return compareCodeUnits(left.toLowerCase(), right.toLowerCase()) || compareCodeUnits(left, right);
 }
 
 function requireToken(value: unknown, label: string): string {
@@ -461,6 +501,13 @@ function requireSha(value: unknown, label: string): string {
   return value;
 }
 
+function requirePlanHash(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error("BUILD worktree plan hash must be a full SHA-256 digest");
+  }
+  return value;
+}
+
 function requirePositiveInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new Error(`${label} must be a positive integer`);
   return value as number;
@@ -469,13 +516,17 @@ function requirePositiveInteger(value: unknown, label: string): number {
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw new Error(`${label} must be a plain object`);
+  const descriptors = Object.values(Object.getOwnPropertyDescriptors(value));
+  if ((prototype !== Object.prototype && prototype !== null) ||
+      descriptors.some((descriptor) => !("value" in descriptor)) || Object.getOwnPropertySymbols(value).length > 0) {
+    throw new Error(`${label} must be a plain object containing data properties`);
+  }
   return value as Record<string, unknown>;
 }
 
 function assertOnlyKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
-  const extras = Object.keys(value).filter((key) => !allowed.includes(key));
-  if (extras.length > 0) throw new Error(`${label} contains unsupported fields: ${extras.join(", ")}`);
+  const extras = Reflect.ownKeys(value).filter((key) => typeof key !== "string" || !allowed.includes(key));
+  if (extras.length > 0) throw new Error(`${label} contains unsupported fields`);
 }
 
 function hashIdentity(value: Omit<WorktreeExecutionIntent, "intentId">): string {
@@ -485,10 +536,14 @@ function hashIdentity(value: Omit<WorktreeExecutionIntent, "intentId">): string 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
-    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+    return `{${Object.entries(value).sort(([left], [right]) => compareCodeUnits(left, right))
       .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isNodeErrorWithCode(error: unknown, code: string): boolean {
