@@ -1,5 +1,6 @@
 import { decideRejectedBuildOutcome, type LoopConfig } from "./loop.js";
 import type { LifecycleRoutedStage, ThinkingLevel } from "./config.js";
+import type { GraphExecutionState } from "./scheduler.js";
 
 export type LifecyclePhase =
   | "idle"
@@ -58,7 +59,7 @@ export interface LifecycleModelSelection {
 }
 
 export interface LifecycleState {
-  version: 1;
+  version: 1 | 2;
   runId: string;
   phase: LifecyclePhase;
   task: string;
@@ -88,6 +89,7 @@ export interface LifecycleState {
   shipReport?: string;
   yolo: boolean;
   originalModel?: LifecycleOriginalModelState;
+  graphExecution?: GraphExecutionState;
 }
 
 export type LifecycleEvent =
@@ -146,6 +148,7 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
   state.baselineStagedPaths = overrides.baselineStagedPaths ? [...overrides.baselineStagedPaths] : undefined;
   state.finalization = overrides.finalization ? { ...overrides.finalization } : undefined;
   state.originalModel = overrides.originalModel ? { ...overrides.originalModel } : undefined;
+  state.graphExecution = overrides.graphExecution ? structuredClone(overrides.graphExecution) : undefined;
   return state;
 }
 
@@ -160,19 +163,23 @@ export function nextStage(
     if (state.phase !== "idle" && state.phase !== "done" && state.phase !== "failed") {
       return cloneLifecycleState(state);
     }
+    if (state.version === 2 && (state.phase === "done" || state.phase === "failed")) {
+      return cloneLifecycleState(state);
+    }
     return createIdleLifecycleState({
+      version: state.version,
       runId: state.runId,
       phase: "defining",
       task: event.task,
       yolo: event.yolo,
+      graphExecution: state.graphExecution,
     });
   }
 
   if (event.type === "cancelled") {
-    return createIdleLifecycleState({
-      runId: state.runId,
-      originalModel: state.originalModel ? { ...state.originalModel } : undefined,
-    });
+    const cancelled = cloneLifecycleState(state);
+    cancelled.phase = "idle";
+    return cancelled;
   }
 
   const next = cloneLifecycleState(state);
@@ -367,6 +374,7 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
     finalization: state.finalization ? { ...state.finalization } : undefined,
     pendingCheckerVerdict: state.pendingCheckerVerdict ? { ...state.pendingCheckerVerdict } : undefined,
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
+    graphExecution: state.graphExecution ? structuredClone(state.graphExecution) : undefined,
   };
 }
 

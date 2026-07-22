@@ -140,6 +140,12 @@ function cloneAndValidateNode(node: GraphNodeDefinition): Readonly<GraphNodeDefi
   }
   const inputContracts = validateContracts(node.inputContracts, node.id, "input");
   const outputContracts = validateContracts(node.outputContracts, node.id, "output");
+  if (node.terminal && outputContracts.length > 0) {
+    throw new Error(`Terminal node ${node.id} is a run-state marker and cannot declare output contracts`);
+  }
+  if (node.terminal && node.sideEffect !== "none") {
+    throw new Error(`Terminal node ${node.id} is a run-state marker and cannot perform side effects`);
+  }
   if ((node.sideEffect === "external" || node.sideEffect === "irreversible") && outputContracts.length === 0) {
     throw new Error(`High-impact node ${node.id} must declare an output contract`);
   }

@@ -1,19 +1,43 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
-import { isAbsolute, join, parse, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createIdleLifecycleState, type LifecyclePhase, type LifecycleState } from "../core/lifecycle.js";
+import { compileGraph } from "../core/graph.js";
+import {
+  DEFAULT_EXECUTION_LIMITS,
+  applySchedulerEvent,
+  assertScheduleValid,
+  createGraphExecutionState,
+  type GraphEvent,
+} from "../core/scheduler.js";
+import { lifecycleWorkflowGraph } from "../core/workflowGraphs.js";
+import {
+  appendGraphEvent,
+  type CheckpointFailurePoint,
+  type GraphCheckpointPaths,
+} from "../runtime/graphCheckpoint.js";
 
-export interface RunPaths {
-  root: string;
+export interface RunPaths extends GraphCheckpointPaths {
   spec: string;
   plan: string;
   debug: string;
-  state: string;
   journal: string;
   routing: string;
   evidence: string;
-  executionLease: string;
 }
 
 export interface RoutingTraceRecord {
@@ -60,6 +84,8 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeFileSync(paths.journal, `# AI Orchestrator Lifecycle Journal\n\nRun: ${runId}\nTask: ${task}\n\n`);
       writeFileSync(paths.routing, "");
       writeFileSync(paths.evidence, "");
+      writeFileSync(paths.events, "");
+      mkdirSync(paths.nodes, { recursive: true });
       writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
       mkdirSync(join(registryPath, ".."), { recursive: true });
       assertNoSymlinkComponents(registryPath);
@@ -100,12 +126,13 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
   if (!existsSync(paths.state)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(paths.state, "utf8")) as unknown;
-    if (!isLifecycleState(parsed)) return undefined;
+    if (!isLifecycleStateEnvelope(parsed)) return undefined;
+    const migrated = migrateLifecycleState(parsed);
     return {
-      ...parsed,
-      rejectionFingerprints: parsed.rejectionFingerprints ? [...parsed.rejectionFingerprints] : [],
-      buildEvidenceFingerprints: parsed.buildEvidenceFingerprints ? [...parsed.buildEvidenceFingerprints] : [],
-      modelSelections: parsed.modelSelections?.map((selection) => ({
+      ...migrated,
+      rejectionFingerprints: migrated.rejectionFingerprints ? [...migrated.rejectionFingerprints] : [],
+      buildEvidenceFingerprints: migrated.buildEvidenceFingerprints ? [...migrated.buildEvidenceFingerprints] : [],
+      modelSelections: migrated.modelSelections?.map((selection) => ({
         ...selection,
         routing: selection.routing ? {
           ...selection.routing,
@@ -113,6 +140,7 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
           failureCategories: [...selection.routing.failureCategories],
         } : undefined,
       })) ?? [],
+      graphExecution: structuredClone(migrated.graphExecution),
     };
   } catch {
     return undefined;
@@ -123,16 +151,186 @@ export function writeState(paths: RunPaths, state: LifecycleState): void {
   assertRunPathsSafe(paths);
   mkdirSync(paths.root, { recursive: true });
   assertRunPathsSafe(paths);
-  const tempPath = `${paths.state}.${process.pid}.${Date.now()}.tmp`;
-  let completed = false;
-  try {
-    writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`);
-    renameSync(tempPath, paths.state);
-    completed = true;
-  } finally {
-    if (!completed) {
-      rmSync(tempPath, { force: true });
+  const migrated = migrateLifecycleState(state);
+  writeLifecycleEnvelopeAtomic(paths, migrated, `${process.pid}-${Date.now()}`);
+}
+
+export function checkpointLifecycleGraphEvent(
+  paths: RunPaths,
+  current: LifecycleState,
+  event: Readonly<GraphEvent>,
+  options: {
+    owner: string;
+    tempId: string;
+    nextState?: LifecycleState;
+    failAt?(point: CheckpointFailurePoint): void;
+  },
+): LifecycleState {
+  assertRunPathsSafe(paths);
+  if (!ownsRunLease(paths, options.owner)) throw new Error(`Lifecycle graph checkpoint requires current lease owner ${options.owner}`);
+  const graph = compiledLifecycleGraph();
+  const migratedCurrent = migrateLifecycleState(current);
+  const nextGraph = applySchedulerEvent(graph, migratedCurrent.graphExecution!, event);
+  const candidate = cloneLifecycleEnvelope(options.nextState ?? migratedCurrent);
+  if (candidate.runId !== migratedCurrent.runId) throw new Error("Lifecycle graph checkpoint cannot change run identity");
+  candidate.version = 2;
+  candidate.graphExecution = nextGraph;
+  assertLifecycleGraphAlignment(candidate, graph);
+
+  appendGraphEvent(paths, event, { owner: options.owner });
+  options.failAt?.("after-event-append");
+  writeLifecycleEnvelopeAtomic(paths, candidate, options.tempId, {
+    owner: options.owner,
+    expectedGraphRevision: migratedCurrent.graphExecution!.revision,
+    failAt: options.failAt,
+  });
+  return candidate;
+}
+
+function compiledLifecycleGraph() {
+  return compileGraph(lifecycleWorkflowGraph());
+}
+
+function migrateLifecycleState(state: LifecycleState): LifecycleState {
+  const graph = compiledLifecycleGraph();
+  if (state.version === 2) {
+    if (!state.graphExecution) throw new Error("Lifecycle version 2 state is missing graphExecution");
+    assertScheduleValid(graph, state.graphExecution);
+    const migrated = cloneLifecycleEnvelope(state);
+    assertLifecycleGraphAlignment(migrated, graph);
+    return migrated;
+  }
+  const graphExecution = createGraphExecutionState(graph, {
+    runId: state.runId,
+    now: runStartedAt(state.runId),
+    limits: {
+      ...DEFAULT_EXECUTION_LIMITS,
+      backEdgeBudgets: { ...DEFAULT_EXECUTION_LIMITS.backEdgeBudgets },
+    },
+    currentNodeId: state.phase,
+  });
+  const migrated: LifecycleState = {
+    ...cloneLifecycleEnvelope(state),
+    version: 2,
+    graphExecution,
+  };
+  assertLifecycleGraphAlignment(migrated, graph);
+  return migrated;
+}
+
+function cloneLifecycleEnvelope(state: LifecycleState): LifecycleState {
+  return {
+    ...state,
+    verdicts: state.verdicts.map((verdict) => ({ ...verdict })),
+    modelSelections: state.modelSelections?.map((selection) => ({
+      ...selection,
+      routing: selection.routing ? {
+        ...selection.routing,
+        attemptedModels: [...selection.routing.attemptedModels],
+        failureCategories: [...selection.routing.failureCategories],
+      } : undefined,
+    })) ?? [],
+    rejectionFingerprints: [...(state.rejectionFingerprints ?? [])],
+    buildEvidenceFingerprints: [...(state.buildEvidenceFingerprints ?? [])],
+    pendingCheckerVerdict: state.pendingCheckerVerdict ? { ...state.pendingCheckerVerdict } : undefined,
+    baselinePaths: state.baselinePaths ? [...state.baselinePaths] : undefined,
+    baselineStagedPaths: state.baselineStagedPaths ? [...state.baselineStagedPaths] : undefined,
+    finalization: state.finalization ? { ...state.finalization } : undefined,
+    originalModel: state.originalModel ? { ...state.originalModel } : undefined,
+    graphExecution: state.graphExecution ? structuredClone(state.graphExecution) : undefined,
+  };
+}
+
+function assertLifecycleGraphAlignment(state: LifecycleState, graph: ReturnType<typeof compiledLifecycleGraph>): void {
+  if (state.version !== 2 || !state.graphExecution) throw new Error("Lifecycle graph state is missing");
+  if (state.graphExecution.runId !== state.runId) throw new Error("Lifecycle and graph run identities do not match");
+  const phaseNode = state.graphExecution.nodeStates[state.phase];
+  if (!phaseNode) throw new Error(`Lifecycle phase ${state.phase} does not exist in its graph`);
+  const terminal = graph.nodesById.get(state.phase)!.terminal === true;
+  if (terminal) {
+    if (phaseNode.status !== "executed") throw new Error(`Lifecycle terminal phase ${state.phase} is not complete in graph state`);
+    return;
+  }
+  if (state.phase === "idle" && state.graphExecution.ready.length === 0 &&
+      Object.values(state.graphExecution.nodeStates).some((node) => node.status === "cancelled")) {
+    return;
+  }
+  if (phaseNode.status !== "ready" && phaseNode.status !== "running" && phaseNode.status !== "waiting_human") {
+    throw new Error(`Lifecycle phase ${state.phase} is not the active graph node`);
+  }
+}
+
+function runStartedAt(runId: string): string {
+  const match = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})-[a-f0-9]{6}$/.exec(runId);
+  if (!match) throw new Error("Lifecycle run id cannot provide a migration start time");
+  const date = new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+  );
+  if (date.getFullYear() !== Number(match[1]) || date.getMonth() !== Number(match[2]) - 1 || date.getDate() !== Number(match[3]) ||
+      date.getHours() !== Number(match[4]) || date.getMinutes() !== Number(match[5])) {
+    throw new Error("Lifecycle run id contains an invalid migration start time");
+  }
+  return date.toISOString();
+}
+
+function writeLifecycleEnvelopeAtomic(
+  paths: RunPaths,
+  state: LifecycleState,
+  tempId: string,
+  options?: {
+    owner: string;
+    expectedGraphRevision: number;
+    failAt?(point: CheckpointFailurePoint): void;
+  },
+): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(tempId)) throw new Error("Lifecycle snapshot temp id is invalid");
+  const migrated = migrateLifecycleState(state);
+  if (options) {
+    if (!ownsRunLease(paths, options.owner)) throw new Error(`Lifecycle graph checkpoint requires current lease owner ${options.owner}`);
+    const disk = readState(paths);
+    if (!disk?.graphExecution) throw new Error("Current lifecycle snapshot is missing or corrupt; refusing CAS overwrite");
+    if (disk.graphExecution.revision !== options.expectedGraphRevision) {
+      throw new Error(`Lifecycle graph revision conflict: expected ${options.expectedGraphRevision}, found ${disk.graphExecution.revision}`);
     }
+  }
+  const tempPath = `${paths.state}.${tempId}.tmp`;
+  assertPathInsideRun(paths, tempPath);
+  assertNoSymlinkComponents(tempPath);
+  let renamed = false;
+  const file = openSync(tempPath, "wx", 0o600);
+  try {
+    writeFileSync(file, `${JSON.stringify(migrated, null, 2)}\n`);
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
+  try {
+    options?.failAt?.("after-snapshot-temp-write");
+    if (options && !ownsRunLease(paths, options.owner)) throw new Error("Lifecycle graph lease ownership changed before snapshot rename");
+    renameSync(tempPath, paths.state);
+    renamed = true;
+    fsyncDirectory(dirname(paths.state));
+    options?.failAt?.("after-snapshot-rename");
+  } finally {
+    if (!renamed) rmSync(tempPath, { force: true });
+  }
+}
+
+function assertPathInsideRun(paths: RunPaths, target: string): void {
+  const contained = relative(resolve(paths.root), resolve(target));
+  if (contained.startsWith("..") || isAbsolute(contained)) throw new Error("Lifecycle snapshot temp path escapes its run");
+}
+
+function fsyncDirectory(path: string): void {
+  const file = openSync(path, "r");
+  try {
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
   }
 }
 
@@ -202,6 +400,9 @@ export function pathsForRun(cwd: string, artifactsDir: string, runId: string): R
     journal: join(root, "journal.md"),
     routing: join(root, "routing.jsonl"),
     evidence: join(root, "evidence.jsonl"),
+    graph: join(root, "graph.json"),
+    events: join(root, "events.jsonl"),
+    nodes: join(root, "nodes"),
     executionLease: join(root, "execution.lock"),
   };
 }
@@ -492,11 +693,11 @@ function isActivePhase(phase: LifecycleState["phase"]): boolean {
   return phase !== "idle" && phase !== "done" && phase !== "failed";
 }
 
-function isLifecycleState(value: unknown): value is LifecycleState {
+function isLifecycleStateEnvelope(value: unknown): value is LifecycleState {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<LifecycleState>;
   return (
-    candidate.version === 1 &&
+    (candidate.version === 1 || candidate.version === 2) &&
     typeof candidate.runId === "string" &&
     isRunId(candidate.runId) &&
     typeof candidate.phase === "string" &&
@@ -523,6 +724,7 @@ function isLifecycleState(value: unknown): value is LifecycleState {
     (candidate.modelRestored === undefined || typeof candidate.modelRestored === "boolean") &&
     isLifecycleOriginalModel(candidate.originalModel) &&
     isLifecycleFinalization(candidate.finalization) &&
+    (candidate.version === 1 ? candidate.graphExecution === undefined : !!candidate.graphExecution && typeof candidate.graphExecution === "object") &&
     typeof candidate.yolo === "boolean"
   );
 }
