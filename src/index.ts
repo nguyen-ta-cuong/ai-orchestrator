@@ -1,5 +1,7 @@
 export * from "./core/config.js";
+export * from "./core/executionRouting.js";
 export * from "./core/graph.js";
+export * from "./core/graphEvidence.js";
 export * from "./core/lifecycle.js";
 export * from "./core/lifecyclePrompts.js";
 export * from "./core/lifecycleRouting.js";
