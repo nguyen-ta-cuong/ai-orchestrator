@@ -7,15 +7,25 @@ import {
   acquireRunLease,
   appendJournal,
   appendRoutingTrace,
+  checkpointLifecycleGraphEvent,
   createRun,
   currentRun,
   ownsRunLease,
+  pathsForRun,
   readState,
   releaseRun,
   releaseRunLease,
   writeState,
 } from "../src/lifecycle/artifacts.js";
 import { createIdleLifecycleState } from "../src/core/lifecycle.js";
+import {
+  DEFAULT_EXECUTION_LIMITS,
+  evaluateExecutionGuard,
+  executionLimitsFingerprint,
+  type GraphEvent,
+} from "../src/core/scheduler.js";
+import { compileGraph } from "../src/core/graph.js";
+import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
 
 const tempDirs: string[] = [];
 const artifactsDir = ".ai-orchestrator/runs";
@@ -44,6 +54,9 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(run.paths.plan)).toBe(true);
     expect(existsSync(run.paths.debug)).toBe(true);
     expect(readFileSync(run.paths.routing, "utf8")).toBe("");
+    expect(readFileSync(run.paths.events, "utf8")).toBe("");
+    expect(existsSync(run.paths.nodes)).toBe(true);
+    expect(existsSync(run.paths.graph)).toBe(false);
     expect(readFileSync(join(cwd, ".ai-orchestrator", "runs", "current"), "utf8").trim()).toBe(run.runId);
     expect(readFileSync(run.paths.journal, "utf8")).toContain("Task: ship a feature");
     expect(readState(run.paths)).toMatchObject({ runId: run.runId, phase: "defining", task: "ship a feature" });
@@ -76,7 +89,11 @@ describe("lifecycle artifacts", () => {
 
     writeState(run.paths, state);
 
-    expect(readState(run.paths)).toEqual(state);
+    expect(readState(run.paths)).toMatchObject({
+      ...state,
+      version: 2,
+      graphExecution: { schemaVersion: 2, runId: run.runId, ready: ["defining"] },
+    });
     expect(readFileSync(run.paths.state, "utf8")).toContain('"phase": "defining"');
   });
 
@@ -145,9 +162,173 @@ describe("lifecycle artifacts", () => {
     const run = createRun(cwd, artifactsDir, "task");
     const oldState = createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "task" }) as unknown as Record<string, unknown>;
     delete oldState.modelSelections;
-    writeFileSync(run.paths.state, JSON.stringify(oldState));
+    const bytes = JSON.stringify(oldState);
+    writeFileSync(run.paths.state, bytes);
 
-    expect(readState(run.paths)?.modelSelections).toEqual([]);
+    expect(readState(run.paths)).toMatchObject({
+      version: 2,
+      modelSelections: [],
+      graphExecution: { schemaVersion: 2, ready: ["defining"] },
+    });
+    expect(readFileSync(run.paths.state, "utf8")).toBe(bytes);
+  });
+
+  it("preserves lifecycle fields through phase entry and transition checkpoints", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    const initial = readState(run.paths)!;
+    const rich = {
+      ...initial,
+      specPath: "spec.md",
+      debugPath: "debug.md",
+      buildIterations: 2,
+      consecutiveRejections: 1,
+      verdicts: [{ stage: "verify" as const, verdict: "reject" as const, reasons: "kept" }],
+      rejectionFingerprints: ["a".repeat(16)],
+      buildEvidenceFingerprints: ["b".repeat(16)],
+      pendingCheckerVerdict: {
+        phase: "verifying" as const,
+        kind: "verify" as const,
+        verdict: "reject" as const,
+        reasons: "structured checkpoint",
+      },
+      finalization: { commitSha: "abcdef1", commitMessage: "kept state" },
+    };
+    writeState(run.paths, rich);
+    acquireRunLease(run.paths, "owner-a");
+
+    const graphState = rich.graphExecution!;
+    const start: GraphEvent = {
+      schemaVersion: 1,
+      kind: "node-status",
+      sequence: 1,
+      eventId: "defining-start",
+      runId: run.runId,
+      graphId: graphState.graphId,
+      graphVersion: graphState.graphVersion,
+      graphDigest: graphState.graphDigest,
+      planVersion: 1,
+      nodeId: "defining",
+      priorStatus: "ready",
+      nextStatus: "running",
+      attempt: 1,
+      timestamp: new Date().toISOString(),
+      artifactRefs: [],
+    };
+    const entered = checkpointLifecycleGraphEvent(run.paths, rich, start, {
+      owner: "owner-a", tempId: "phase-entry",
+    });
+    expect(entered.graphExecution!.nodeStates.defining!.status).toBe("running");
+
+    const resultRef = {
+      planVersion: 1,
+      nodeId: "defining",
+      contract: "spec",
+      path: "nodes/1/defining/spec.json",
+      sha256: "c".repeat(64),
+      sizeBytes: 12,
+    };
+    const transition: GraphEvent = {
+      ...start,
+      sequence: 2,
+      eventId: "defining-complete",
+      priorStatus: "running",
+      nextStatus: "blocked",
+      chosenEdge: {
+        from: "defining",
+        to: "awaiting_spec_approval",
+        event: "spec_produced",
+        guard: "human-approval-required",
+        boundedBy: "run-transition-budget",
+      },
+      validatorResult: { status: "passed", contracts: ["spec"] },
+      artifactRefs: [resultRef],
+    };
+    const transitioned = checkpointLifecycleGraphEvent(run.paths, entered, transition, {
+      owner: "owner-a",
+      tempId: "phase-transition",
+      nextState: { ...entered, phase: "awaiting_spec_approval", specPath: "spec.md" },
+    });
+    const disk = readState(run.paths)!;
+    expect(disk).toMatchObject({
+      phase: "awaiting_spec_approval",
+      buildIterations: 2,
+      consecutiveRejections: 1,
+      specPath: "spec.md",
+      debugPath: "debug.md",
+      pendingCheckerVerdict: { reasons: "structured checkpoint" },
+      finalization: { commitSha: "abcdef1", commitMessage: "kept state" },
+      graphExecution: { revision: 2, lastAppliedEventSequence: 2 },
+    });
+    expect(disk.verdicts).toEqual(rich.verdicts);
+    expect(disk.rejectionFingerprints).toEqual(rich.rejectionFingerprints);
+    expect(transitioned.graphExecution!.nodeStates.awaiting_spec_approval!.status).toBe("ready");
+    expect(releaseRunLease(run.paths, "owner-a")).toBe(true);
+  });
+
+  it("counts pre-migration downtime against the frozen wall-time guard", () => {
+    const cwd = makeTempDir();
+    const current = createRun(cwd, artifactsDir, "current");
+    const currentState = readState(current.paths)!;
+    const graph = compileGraph(lifecycleWorkflowGraph());
+    expect(evaluateExecutionGuard(graph, currentState.graphExecution!, currentState.graphExecution!.effectiveLimits, {
+      action: "node", nodeId: "defining", nodeAttempts: 1, concurrency: 1,
+      now: new Date().toISOString(), unattended: false,
+    })).toEqual({ allowed: true });
+
+    const expiredId = "20000101-0000-abcdef";
+    const expiredPaths = pathsForRun(cwd, ".expired/runs", expiredId);
+    mkdirSync(expiredPaths.root, { recursive: true });
+    const old = createIdleLifecycleState({ runId: expiredId, phase: "defining", task: "old" });
+    writeFileSync(expiredPaths.state, JSON.stringify(old));
+    const migrated = readState(expiredPaths)!;
+    expect(evaluateExecutionGuard(graph, migrated.graphExecution!, migrated.graphExecution!.effectiveLimits, {
+      action: "node", nodeId: "defining", nodeAttempts: 1, concurrency: 1,
+      now: new Date().toISOString(), unattended: true,
+    })).toMatchObject({ allowed: false, code: "wall-time-limit" });
+  });
+
+  it("freezes configured execution ceilings when a new run is created", () => {
+    const cwd = makeTempDir();
+    const limits = {
+      ...DEFAULT_EXECUTION_LIMITS,
+      maxGraphSteps: 17,
+      humanWait: "deny" as const,
+      backEdgeBudgets: { "run-transition-budget": 9 },
+    };
+
+    const run = createRun(cwd, artifactsDir, "bounded", false, { executionLimits: limits });
+    const state = readState(run.paths)!;
+    expect(state.graphExecution!.effectiveLimits).toEqual(limits);
+    expect(state.graphExecution!.limitsFingerprint).toBe(executionLimitsFingerprint(limits));
+  });
+
+  it("uses current config only for v1 migration and keeps the persisted v2 policy on resume", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "legacy");
+    const v1 = createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "legacy" });
+    writeFileSync(run.paths.state, JSON.stringify(v1));
+    const migrationLimits = {
+      ...DEFAULT_EXECUTION_LIMITS,
+      maxGraphSteps: 11,
+      maxEstimatedCostUsd: 3,
+      humanWait: "deny" as const,
+      backEdgeBudgets: { "run-transition-budget": 7 },
+    };
+
+    const migrated = readState(run.paths, { migrationLimits })!;
+    expect(migrated.graphExecution!.effectiveLimits).toEqual(migrationLimits);
+    writeState(run.paths, migrated);
+
+    const changedConfig = {
+      ...DEFAULT_EXECUTION_LIMITS,
+      maxGraphSteps: 999,
+      maxEstimatedCostUsd: 99,
+      backEdgeBudgets: { "run-transition-budget": 999 },
+    };
+    const resumed = readState(run.paths, { migrationLimits: changedConfig })!;
+    expect(resumed.graphExecution!.effectiveLimits).toEqual(migrationLimits);
+    expect(resumed.graphExecution!.limitsFingerprint).toBe(executionLimitsFingerprint(migrationLimits));
   });
 
   it("blocks creating a new run immediately while the current state is active", () => {

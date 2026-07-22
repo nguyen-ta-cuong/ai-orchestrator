@@ -16,8 +16,8 @@ export function fastWorkflowGraph(): GraphDefinition {
       node("coding", "produce-code", "write", ["plan"], ["source-changes"]),
       node("judging", "judge-code", "read", ["source-changes"], ["judge-report"]),
       node("replanning", "revise-plan", "write", ["judge-report"], ["plan"]),
-      node("done", "finish-run", "none", [], ["run-result"], true),
-      node("failed", "fail-run", "none", [], ["run-failure"], true),
+      node("done", "finish-run", "none", [], [], true),
+      node("failed", "fail-run", "none", [], [], true),
     ],
     edges: withRunBounds([
       edge("idle", "planning", "start", "start-new-run"),
@@ -59,8 +59,8 @@ export function lifecycleWorkflowGraph(): GraphDefinition {
       node("shipping", "decide-shipping", "read", ["review-verdict"], ["ship-decision"]),
       node("awaiting_ship_approval", "request-publication-consent", "external", ["ship-decision"], ["approval-decision"]),
       node("finalizing", "finalize-run", "external", ["approval-decision"], ["finalization-result"]),
-      node("done", "finish-lifecycle-run", "none", [], ["run-result"], true),
-      node("failed", "fail-lifecycle-run", "none", [], ["run-failure"], true),
+      node("done", "finish-lifecycle-run", "none", [], [], true),
+      node("failed", "fail-lifecycle-run", "none", [], [], true),
     ],
     edges: withRunBounds([
       edge("idle", "defining", "start", "start-new-run"),
