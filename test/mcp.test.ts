@@ -306,6 +306,39 @@ describe("MCP server", () => {
     });
   });
 
+  it("runs the default durable stateful adapter through the built MCP server", async () => {
+    await withServer(async (client) => {
+      const startedResult = await client.request("tools/call", {
+        name: "orchestrator_run_start",
+        arguments: {
+          requestId: "packed-stateful-start",
+          task: "add a durable flag",
+          coderIdentity: "openai-codex/gpt-5.5",
+        },
+      });
+      const started = toolStructuredContent(startedResult) as {
+        runId: string;
+        revision: number;
+        currentNode: string;
+        plan: string;
+      } | undefined;
+      if (!started) throw new Error(`Stateful start failed: ${JSON.stringify(startedResult)}`);
+      expect(started).toMatchObject({ currentNode: "awaiting_approval" });
+      expect(started.plan).toContain("Inspect the relevant files");
+
+      const currentResult = await client.request("tools/call", {
+        name: "orchestrator_run_get",
+        arguments: { runId: started.runId },
+      });
+      expect(toolStructuredContent(currentResult)).toMatchObject({
+        runId: started.runId,
+        revision: started.revision,
+        outcome: "current",
+        currentNode: "awaiting_approval",
+      });
+    });
+  });
+
   it("calls orchestrator_plan for fresh plans and replans", async () => {
     await withServer(async (client) => {
       const fresh = await client.request("tools/call", {

@@ -32,6 +32,7 @@ import {
   MCP_PROVIDER_DEFINITE_FAILURE_CODES,
   MCP_PROVIDER_UNCERTAIN_FAILURE_CODES,
 } from "./failureCodes.js";
+import type { ArtifactReference } from "../src/core/scheduler.js";
 
 type RunRoutingDecision = McpRunResponse["routing"][number];
 type PlanRoutingDecision = z.infer<typeof mcpRunPlanRoutingDecisionSchema>;
@@ -100,6 +101,15 @@ const providerAttemptReservationSchema = providerAttemptSchema.extend({
   providerAttemptIdempotencyKey: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 
+const artifactReferenceSchema = z.object({
+  planVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/),
+  contract: z.string().min(1).max(128).refine((value) => !/[\u0000-\u001f\u007f]/.test(value)),
+  path: z.string().min(1).max(4_096),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sizeBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+}).strict();
+
 export type ProviderAttemptReservation = z.infer<typeof providerAttemptReservationSchema>;
 
 class ProviderCheckpointError extends Error {
@@ -131,10 +141,17 @@ const providerAttemptEvidenceSchema = z.discriminatedUnion("phase", [
     failureCode: z.enum(MCP_PROVIDER_UNCERTAIN_FAILURE_CODES),
   }).strict(),
   providerAttemptReservationSchema.extend({
-    phase: z.enum(["awaiting_output_commit", "output_committed", "discarded"]),
+    phase: z.enum(["awaiting_output_commit", "discarded"]),
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
     kind: z.enum(["plan", "judge"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  }).strict(),
+  providerAttemptReservationSchema.extend({
+    phase: z.literal("output_committed"),
+    effectId: z.string().regex(/^[a-f0-9]{64}$/),
+    kind: z.enum(["plan", "judge"]),
+    ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    resultRef: artifactReferenceSchema,
   }).strict(),
 ]);
 
@@ -271,6 +288,14 @@ export interface McpRunPublication {
   request: McpRunRequestRecord;
 }
 
+export interface McpRunProviderOutput {
+  runId: string;
+  effect: ProviderEffectBase;
+  attempt: ProviderAttemptReservation;
+  contract: "mcp-plan-output-v1" | "mcp-judge-output-v1";
+  bytes: Uint8Array;
+}
+
 /**
  * Must be called synchronously while the repository's exclusive lease is held,
  * after revision/request assignment and immediately before any bytes become
@@ -293,6 +318,8 @@ export interface McpRunStartTransaction {
     request: McpRunRequestUpdate,
     beforePublication: McpRunPublicationGuard,
   ): Promise<McpRunRecord | undefined>;
+  /** Write immutable provider-result bytes while this lease generation is held. */
+  writeProviderOutput(input: McpRunProviderOutput): Promise<ArtifactReference>;
 }
 
 export interface McpRunTransaction {
@@ -305,6 +332,8 @@ export interface McpRunTransaction {
     request: McpRunRequestUpdate,
     beforePublication: McpRunPublicationGuard,
   ): Promise<McpRunRecord | undefined>;
+  /** Write immutable provider-result bytes while this lease generation is held. */
+  writeProviderOutput(input: McpRunProviderOutput): Promise<ArtifactReference>;
 }
 
 /**
@@ -450,11 +479,26 @@ const requestRecordSchema = z.discriminatedUnion("state", [
   }).strict(),
 ]);
 
+const runPublicationSchema = z.object({
+  record: runRecordSchema,
+  request: requestRecordSchema,
+}).strict();
+
+/** Parse and authenticate one exact repository publication at a disk boundary. */
+export function parseMcpRunPublicationAuthority(unparsed: unknown): McpRunPublication {
+  const publication = parseCanonical(runPublicationSchema, unparsed, "run publication authority") as McpRunPublication;
+  // Exercise all semantic and response bounds in addition to the structural schema.
+  const record = recordForAuthority(publication.record, publication.record.runId, publication.record.revision);
+  if (!record) throw new Error("Run publication authority is missing its record");
+  assertRequestReceiptAuthority(publication.request, record);
+  return { record, request: structuredClone(publication.request) };
+}
+
 export interface CreateMcpRunServiceOptions {
   repository: McpRunRepository;
   provider: McpRunProvider;
   loop: LoopConfig;
-  createRunId?: () => string;
+  createRunId?: (requestRef: string) => string;
   maxProviderCalls?: number;
   /** Test/recovery hook executed after provider return and before settlement. */
   afterProviderResult?: (context: { runId: string; effect: ProviderEffect }) => void | Promise<void>;
@@ -487,7 +531,7 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
         if (preflight.requireDifferentCheckerFamily && preflight.coderFamily === undefined) {
           throw new Error("Coder family is required for checker family separation");
         }
-        const runId = mcpRunIdSchema.parse(createRunId());
+        const runId = mcpRunIdSchema.parse(createRunId(identity.requestRef));
         const planning = nextPhase(createIdleState(), { type: "start", task: input.task, yolo: false }, loop);
         const effect: ProviderEffect = newProviderEffect(runId, "plan", 1);
         const request = pendingRequest(identity, effect);
@@ -532,6 +576,13 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
         }
         await options.afterProviderResult?.({ runId, effect });
         const providerCheckpoint = tracker.current();
+        const resultRef = await writeProviderOutput(
+          transaction,
+          providerCheckpoint,
+          effect,
+          "mcp-plan-output-v1",
+          Buffer.from(completion.plan, "utf8"),
+        );
         const withPlan = nextPhase(providerCheckpoint.state, { type: "plan_produced", plan: completion.plan }, providerCheckpoint.loop);
         const settled = await compareAndSwapValidated(
           transaction,
@@ -539,7 +590,7 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
           draftFrom(providerCheckpoint, {
             state: withPlan,
             routing: [...providerCheckpoint.routing, completion.routing],
-            providerEvidence: markProviderOutput(providerCheckpoint.providerEvidence, effect, "output_committed"),
+            providerEvidence: markProviderOutput(providerCheckpoint.providerEvidence, effect, "output_committed", resultRef),
             pendingProviderIntent: false,
           }),
           settledRequestFor(providerCheckpoint, identity, "started"),
@@ -669,6 +720,13 @@ async function revisePlan(
   }
   await options.afterProviderResult?.({ runId: current.runId, effect });
   const providerCheckpoint = tracker.current();
+  const resultRef = await writeProviderOutput(
+    transaction,
+    providerCheckpoint,
+    effect,
+    "mcp-plan-output-v1",
+    Buffer.from(completion.plan, "utf8"),
+  );
   const withPlan = nextPhase(providerCheckpoint.state, { type: "plan_produced", plan: completion.plan }, providerCheckpoint.loop);
   const committed = await compareAndSwapValidated(
     transaction,
@@ -677,7 +735,7 @@ async function revisePlan(
       state: withPlan,
       planVersion: current.planVersion + 1,
       routing: [...providerCheckpoint.routing, completion.routing],
-      providerEvidence: markProviderOutput(providerCheckpoint.providerEvidence, effect, "output_committed"),
+      providerEvidence: markProviderOutput(providerCheckpoint.providerEvidence, effect, "output_committed", resultRef),
       pendingProviderIntent: false,
     }),
     settledRequestFor(providerCheckpoint, identity, "advanced"),
@@ -746,11 +804,18 @@ async function submitCode(
   const lastVerdict: RunVerdict = verdict.verdict === "reject"
     ? { verdict: "reject", reasons: verdict.reasons, requiredFixes: verdict.requiredFixes }
     : { verdict: "approve", reasons: verdict.reasons };
+  const judgeResultRef = await writeProviderOutput(
+    transaction,
+    judgeCheckpoint,
+    judgeEffect,
+    "mcp-judge-output-v1",
+    Buffer.from(stableJson(lastVerdict), "utf8"),
+  );
   const afterJudge = draftFrom(judgeCheckpoint, {
     state: judged,
     status: statusFor(judged),
     routing: [...judgeCheckpoint.routing, verdict.routing],
-    providerEvidence: markProviderOutput(judgeCheckpoint.providerEvidence, judgeEffect, "output_committed"),
+    providerEvidence: markProviderOutput(judgeCheckpoint.providerEvidence, judgeEffect, "output_committed", judgeResultRef),
     lastVerdict,
     terminalMessage: judged.phase === "failed" ? "Maximum coder iterations reached; the run failed closed." : undefined,
   });
@@ -808,6 +873,13 @@ async function submitCode(
   }
   await options.afterProviderResult?.({ runId: current.runId, effect: planEffect });
   const planCheckpoint = planTracker.current();
+  const planResultRef = await writeProviderOutput(
+    transaction,
+    planCheckpoint,
+    planEffect,
+    "mcp-plan-output-v1",
+    Buffer.from(completion.plan, "utf8"),
+  );
   const withPlan = nextPhase(planCheckpoint.state, { type: "plan_produced", plan: completion.plan }, planCheckpoint.loop);
   const committed = await compareAndSwapValidated(
     transaction,
@@ -817,7 +889,7 @@ async function submitCode(
       status: "active",
       planVersion: current.planVersion + 1,
       routing: [...planCheckpoint.routing, completion.routing],
-      providerEvidence: markProviderOutput(planCheckpoint.providerEvidence, planEffect, "output_committed"),
+      providerEvidence: markProviderOutput(planCheckpoint.providerEvidence, planEffect, "output_committed", planResultRef),
       pendingProviderIntent: false,
     }),
     settledRequestFor(planCheckpoint, identity, "advanced"),
@@ -1159,6 +1231,7 @@ function markProviderOutput(
   evidence: readonly ProviderAttemptEvidence[],
   effect: ProviderEffectBase,
   phase: "output_committed" | "discarded",
+  resultRef?: ArtifactReference,
 ): ProviderAttemptEvidence[] {
   const copy: ProviderAttemptEvidence[] = evidence.map((item) => structuredClone(item));
   const index = findLastEvidenceIndex(copy, (item) => item.effectId === effect.effectId
@@ -1166,8 +1239,45 @@ function markProviderOutput(
   if (index < 0) throw new Error(`No returned ${effect.kind} provider output is available to mark ${phase}`);
   const current = copy[index]!;
   if (current.phase !== "awaiting_output_commit") throw new Error("Provider evidence changed during output settlement");
-  copy[index] = { ...current, phase };
+  if (phase === "output_committed") {
+    copy[index] = { ...current, phase, resultRef: artifactReferenceSchema.parse(resultRef) };
+  } else {
+    if (resultRef !== undefined) throw new Error("Discarded provider output must not retain a result artifact");
+    copy[index] = { ...current, phase };
+  }
   return copy;
+}
+
+async function writeProviderOutput(
+  transaction: Pick<McpRunTransaction, "writeProviderOutput">,
+  record: McpRunRecord,
+  effect: ProviderEffectBase,
+  contract: McpRunProviderOutput["contract"],
+  bytes: Uint8Array,
+): Promise<ArtifactReference> {
+  const index = findLastEvidenceIndex(record.providerEvidence, (item) => item.effectId === effect.effectId
+    && item.phase === "awaiting_output_commit");
+  const evidence = index < 0 ? undefined : record.providerEvidence[index];
+  if (!evidence || evidence.phase !== "awaiting_output_commit") {
+    throw new Error(`No returned ${effect.kind} provider output is available to artifact`);
+  }
+  const resultRef = await transaction.writeProviderOutput({
+    runId: record.runId,
+    effect: providerEffectBase(effect),
+    attempt: {
+      attempt: evidence.attempt,
+      providerRequestRef: evidence.providerRequestRef,
+      routingDecision: structuredClone(evidence.routingDecision),
+      identity: structuredClone(evidence.identity),
+      thinking: evidence.thinking,
+      ...(evidence.requestedOutputTokens === undefined ? {} : { requestedOutputTokens: evidence.requestedOutputTokens }),
+      ...(evidence.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: evidence.estimatedCostUsd }),
+      providerAttemptIdempotencyKey: evidence.providerAttemptIdempotencyKey,
+    },
+    contract,
+    bytes: Buffer.from(bytes),
+  });
+  return artifactReferenceSchema.parse(resultRef);
 }
 
 function discardReturnedProviderOutput(record: McpRunRecord): ProviderAttemptEvidence[] {

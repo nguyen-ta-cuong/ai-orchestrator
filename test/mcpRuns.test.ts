@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { RoutedCompletionAttempt, RoutedCompletionRequest, RoutedCompletionResult } from "../mcp/llm.js";
 import { createRoutedMcpRunProvider } from "../mcp/runProvider.js";
-import { createMcpRunRequestRecord, createMcpRunService, providerAttemptIdempotencyKey, providerEffectIdentity, type McpRunCheckpointReference, type McpRunPlanRequest, type McpRunPreflightRequest, type McpRunProvider, type McpRunPublicationGuard, type McpRunRecord, type McpRunRecordDraft, type McpRunRepository, type McpRunRequestRecord, type McpRunRequestUpdate, type McpRunStartTransaction, type McpRunTransaction, type ProviderEffect } from "../mcp/runService.js";
+import { createMcpRunRequestRecord, createMcpRunService, providerAttemptIdempotencyKey, providerEffectIdentity, type McpRunCheckpointReference, type McpRunPlanRequest, type McpRunPreflightRequest, type McpRunProvider, type McpRunProviderOutput, type McpRunPublicationGuard, type McpRunRecord, type McpRunRecordDraft, type McpRunRepository, type McpRunRequestRecord, type McpRunRequestUpdate, type McpRunStartTransaction, type McpRunTransaction, type ProviderEffect } from "../mcp/runService.js";
+import type { ArtifactReference } from "../src/core/scheduler.js";
 import {
   mcpRunAdvanceInputSchema,
   mcpRunCancelInputSchema,
@@ -1918,6 +1920,7 @@ class InMemoryRunRepository implements McpRunRepository {
         return this.write(undefined, draft, update, true, beforePublication);
       },
       compareAndSwap: async (expectedRevision, draft, update, beforePublication) => this.write(expectedRevision, draft, update, true, beforePublication),
+      writeProviderOutput: async (input) => this.writeProviderOutput(input),
     });
   }
 
@@ -1926,6 +1929,7 @@ class InMemoryRunRepository implements McpRunRepository {
       get: async () => clone(this.runs.get(targetRunId)),
       getRequest: async (requestRef) => clone(this.runRequests.get(targetRunId)?.get(requestRef)),
       compareAndSwap: async (expectedRevision, draft, update, beforePublication) => this.write(expectedRevision, draft, update, false, beforePublication),
+      writeProviderOutput: async (input) => this.writeProviderOutput(input),
     });
   }
 
@@ -1989,6 +1993,19 @@ class InMemoryRunRepository implements McpRunRepository {
     if (start) this.startRequests.set(update.requestRef, clone(request));
     return clone(record);
   }
+
+  private writeProviderOutput(input: McpRunProviderOutput): ArtifactReference {
+    const bytes = Buffer.from(input.bytes);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    return {
+      planVersion: 1,
+      nodeId: "authority",
+      contract: input.contract,
+      path: `nodes/1/authority/${digest}.artifact`,
+      sha256: digest,
+      sizeBytes: bytes.byteLength,
+    };
+  }
 }
 
 interface RepositoryProxyHooks {
@@ -2013,6 +2030,7 @@ function repositoryProxy(base: McpRunRepository, hooks: RepositoryProxyHooks): M
         update,
         beforePublication,
       ),
+      writeProviderOutput: (input) => transaction.writeProviderOutput(input),
     })),
     withRunLease: (targetRunId, work) => base.withRunLease(targetRunId, (transaction) => work({
       get: async () => {
@@ -2029,6 +2047,7 @@ function repositoryProxy(base: McpRunRepository, hooks: RepositoryProxyHooks): M
         update,
         beforePublication,
       ),
+      writeProviderOutput: (input) => transaction.writeProviderOutput(input),
     })),
     get: async (targetRunId) => {
       const record = await base.get(targetRunId);
@@ -2074,6 +2093,7 @@ class UnsafePublicationRepository implements McpRunRepository {
         return record;
       },
       compareAndSwap: async () => { throw new Error("unreachable"); },
+      writeProviderOutput: async () => { throw new Error("unreachable"); },
     });
   }
 

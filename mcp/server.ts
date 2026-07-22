@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod/v3";
-import { loadConfig, loopConfigFrom } from "../src/core/config.js";
+import { executionLimitsFrom, loadConfig, loopConfigFrom } from "../src/core/config.js";
 import { nextPhase, type OrchestratorState } from "../src/core/loop.js";
 import { completeMcpJudge, completeMcpPlan, type JudgeJson } from "./routedCompletion.js";
 import { mergeTaskFeatures, resolveMcpRoute } from "./routing.js";
@@ -14,9 +14,11 @@ import {
   mcpRunResponseSchema,
   mcpRunStartInputSchema,
   mcpRunToolResult,
-  unavailableMcpRunAdapter,
   type McpRunAdapter,
 } from "./runProtocol.js";
+import { createRoutedMcpRunProvider } from "./runProvider.js";
+import { createMcpRunService } from "./runService.js";
+import { createMcpRunStore } from "./runStore.js";
 
 const MCP_TEXT_MAX = 2_000_000;
 const MCP_REPORT_TEXT_MAX = 50_000;
@@ -108,12 +110,12 @@ export interface CreateServerOptions {
 export { judgeMcpPrompt, parseJudgeJson } from "./routedCompletion.js";
 
 export function createServer(cwd = process.cwd(), options: CreateServerOptions = {}): McpServer {
-  const runAdapter = options.runAdapter ?? unavailableMcpRunAdapter;
+  const runAdapter = options.runAdapter ?? createDefaultRunAdapter(cwd);
   const server = new McpServer(
     { name: "ai-orchestrator", version: packageVersion },
     {
       instructions:
-        "Use orchestrator_plan before non-trivial implementation work, wait for user approval, then use orchestrator_judge after coding with diff and test output.",
+        "Prefer orchestrator_run_start/get/advance/cancel for server-owned durable runs. Wait for explicit plan approval, submit code and test evidence with the returned revision exactly, and read the run after a revision conflict. The stateless orchestrator_plan and orchestrator_judge tools remain available for compatibility.",
     },
   );
 
@@ -305,6 +307,22 @@ export async function main(): Promise<void> {
 
 function loadMcpConfig(cwd: string): ReturnType<typeof loadConfig> {
   return loadConfig(cwd, { ignoreProjectMcpProviders: true });
+}
+
+function createDefaultRunAdapter(cwd: string): McpRunAdapter {
+  const config = loadMcpConfig(cwd);
+  const repository = createMcpRunStore({
+    cwd,
+    storage: config.mcp.runs,
+    limits: executionLimitsFrom(config),
+  });
+  return createMcpRunService({
+    repository,
+    provider: createRoutedMcpRunProvider(cwd),
+    loop: loopConfigFrom(config),
+    maxProviderCalls: repository.providerCallLimit,
+    createRunId: (requestRef) => repository.runIdForRequest(requestRef),
+  });
 }
 
 function validateJudgeCounters(input: {
