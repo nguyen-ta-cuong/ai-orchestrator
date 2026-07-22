@@ -22,6 +22,7 @@ import {
   applySchedulerEvent,
   assertScheduleValid,
   createGraphExecutionState,
+  type ExecutionLimits,
   type GraphEvent,
 } from "../core/scheduler.js";
 import { lifecycleWorkflowGraph } from "../core/workflowGraphs.js";
@@ -49,7 +50,21 @@ export interface RoutingTraceRecord {
   attempts: readonly { provider: string; model: string; outcome: "selected" | "unavailable" | "unconfigured" }[];
 }
 
-export function createRun(cwd: string, artifactsDir: string, task: string, yolo = false): { runId: string; paths: RunPaths } {
+export interface CreateRunOptions {
+  executionLimits?: Readonly<ExecutionLimits>;
+}
+
+export interface LifecycleMigrationOptions {
+  migrationLimits?: Readonly<ExecutionLimits>;
+}
+
+export function createRun(
+  cwd: string,
+  artifactsDir: string,
+  task: string,
+  yolo = false,
+  options: CreateRunOptions = {},
+): { runId: string; paths: RunPaths } {
   assertArtifactRootSafe(cwd, artifactsDir);
   ensureArtifactsExcludedFromGit(cwd, artifactsDir);
   return withCurrentRunLock(cwd, artifactsDir, () => {
@@ -58,7 +73,7 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
     const activeRegistry = readActiveRunRegistry(cwd);
     const active = currentRun(cwd, artifactsDir);
     if (active) {
-      const activeState = readState(active.paths);
+      const activeState = readState(active.paths, { migrationLimits: options.executionLimits });
       if (!activeState) {
         throw new Error(`Lifecycle run ${active.runId} has missing or corrupt state; explicit recovery is required`);
       }
@@ -86,7 +101,9 @@ export function createRun(cwd: string, artifactsDir: string, task: string, yolo 
       writeFileSync(paths.evidence, "");
       writeFileSync(paths.events, "");
       mkdirSync(paths.nodes, { recursive: true });
-      writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }));
+      writeState(paths, createIdleLifecycleState({ runId, phase: "defining", task, yolo }), {
+        migrationLimits: options.executionLimits,
+      });
       mkdirSync(join(registryPath, ".."), { recursive: true });
       assertNoSymlinkComponents(registryPath);
       writeFileSync(registryPath, `${JSON.stringify({ runId, artifactsDir: normalizeArtifactsDir(artifactsDir), runCwd: realpathSync(cwd) })}\n`, { flag: "wx" });
@@ -121,13 +138,13 @@ export function currentRun(cwd: string, artifactsDir: string): { runId: string; 
   return { runId, paths: pathsForRun(cwd, artifactsDir, runId) };
 }
 
-export function readState(paths: RunPaths): LifecycleState | undefined {
+export function readState(paths: RunPaths, options: LifecycleMigrationOptions = {}): LifecycleState | undefined {
   assertRunPathsSafe(paths);
   if (!existsSync(paths.state)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(paths.state, "utf8")) as unknown;
     if (!isLifecycleStateEnvelope(parsed)) return undefined;
-    const migrated = migrateLifecycleState(parsed);
+    const migrated = migrateLifecycleState(parsed, options.migrationLimits);
     return {
       ...migrated,
       rejectionFingerprints: migrated.rejectionFingerprints ? [...migrated.rejectionFingerprints] : [],
@@ -147,11 +164,11 @@ export function readState(paths: RunPaths): LifecycleState | undefined {
   }
 }
 
-export function writeState(paths: RunPaths, state: LifecycleState): void {
+export function writeState(paths: RunPaths, state: LifecycleState, options: LifecycleMigrationOptions = {}): void {
   assertRunPathsSafe(paths);
   mkdirSync(paths.root, { recursive: true });
   assertRunPathsSafe(paths);
-  const migrated = migrateLifecycleState(state);
+  const migrated = migrateLifecycleState(state, options.migrationLimits);
   writeLifecycleEnvelopeAtomic(paths, migrated, `${process.pid}-${Date.now()}`);
 }
 
@@ -191,7 +208,7 @@ function compiledLifecycleGraph() {
   return compileGraph(lifecycleWorkflowGraph());
 }
 
-function migrateLifecycleState(state: LifecycleState): LifecycleState {
+function migrateLifecycleState(state: LifecycleState, migrationLimits?: Readonly<ExecutionLimits>): LifecycleState {
   const graph = compiledLifecycleGraph();
   if (state.version === 2) {
     if (!state.graphExecution) throw new Error("Lifecycle version 2 state is missing graphExecution");
@@ -203,10 +220,7 @@ function migrateLifecycleState(state: LifecycleState): LifecycleState {
   const graphExecution = createGraphExecutionState(graph, {
     runId: state.runId,
     now: runStartedAt(state.runId),
-    limits: {
-      ...DEFAULT_EXECUTION_LIMITS,
-      backEdgeBudgets: { ...DEFAULT_EXECUTION_LIMITS.backEdgeBudgets },
-    },
+    limits: cloneExecutionLimits(migrationLimits ?? DEFAULT_EXECUTION_LIMITS),
     currentNodeId: state.phase,
   });
   const migrated: LifecycleState = {
@@ -216,6 +230,13 @@ function migrateLifecycleState(state: LifecycleState): LifecycleState {
   };
   assertLifecycleGraphAlignment(migrated, graph);
   return migrated;
+}
+
+function cloneExecutionLimits(limits: Readonly<ExecutionLimits>): ExecutionLimits {
+  return {
+    ...limits,
+    backEdgeBudgets: { ...limits.backEdgeBudgets },
+  };
 }
 
 function cloneLifecycleEnvelope(state: LifecycleState): LifecycleState {

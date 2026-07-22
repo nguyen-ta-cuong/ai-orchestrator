@@ -14,6 +14,7 @@ import {
   type RoutingBudgets,
   type RoutingCircuitBreakers,
 } from "./routingBudget.js";
+import { DEFAULT_EXECUTION_LIMITS, type ExecutionLimits } from "./scheduler.js";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -54,6 +55,12 @@ export type ShipCommitMode = "ask" | "never" | "auto";
 export type ShipOpenPrMode = "ask" | "never";
 export type ExecutionEngine = "legacy" | "graph-shadow" | "graph";
 
+export interface ExecutionConfig {
+  engine: ExecutionEngine;
+  allowProjectGraph: boolean;
+  limits: ExecutionLimits;
+}
+
 export interface LifecycleRoutingConfig {
   enabled: boolean;
   stages: Record<LifecycleRoutedStage, ModelCandidate[]>;
@@ -75,10 +82,7 @@ export interface RoutingEvidenceConfig {
 }
 
 export interface OrchestratorConfig {
-  execution: {
-    engine: ExecutionEngine;
-    allowProjectGraph: boolean;
-  };
+  execution: ExecutionConfig;
   roles: Record<RoleName, RoleConfig>;
   loop: {
     maxCoderIterations: number;
@@ -109,8 +113,14 @@ export interface OrchestratorConfig {
   };
 }
 
+type ExecutionConfigPatch = Partial<Omit<ExecutionConfig, "limits">> & {
+  limits?: Partial<Omit<ExecutionLimits, "backEdgeBudgets">> & {
+    backEdgeBudgets?: Record<string, number>;
+  };
+};
+
 type ConfigPatch = Partial<{
-  execution: Partial<OrchestratorConfig["execution"]>;
+  execution: ExecutionConfigPatch;
   roles: Partial<Record<keyof OrchestratorConfig["roles"], Partial<RoleConfig>>>;
   loop: Partial<OrchestratorConfig["loop"]>;
   approval: Partial<OrchestratorConfig["approval"]>;
@@ -140,6 +150,33 @@ const CAPABILITY_NAMES = [
   "requirements", "architecture", "coding", "debugging", "verification", "review", "release",
   "structuredOutput", "longContext", "speed", "economy",
 ] as const;
+const POSITIVE_EXECUTION_LIMIT_KEYS = [
+  "maxGraphSteps",
+  "maxNodeAttempts",
+  "maxPlanVersions",
+  "maxGraphNodes",
+  "maxGraphEdges",
+  "maxReadyWidth",
+  "maxConcurrency",
+  "maxModelConcurrency",
+  "maxProviderConcurrency",
+  "maxWallTimeMs",
+  "maxInputTokens",
+  "maxOutputTokens",
+  "maxSideEffectAttempts",
+  "maxHumanWaitMs",
+  "maxNoProgressRepeats",
+] as const satisfies readonly (keyof ExecutionLimits)[];
+const NON_NEGATIVE_EXECUTION_LIMIT_KEYS = [
+  "maxEstimatedCostUsd",
+  "maxObservedCostUsd",
+] as const satisfies readonly (keyof ExecutionLimits)[];
+const EXECUTION_LIMIT_KEYS = new Set<string>([
+  ...POSITIVE_EXECUTION_LIMIT_KEYS,
+  ...NON_NEGATIVE_EXECUTION_LIMIT_KEYS,
+  "humanWait",
+  "backEdgeBudgets",
+]);
 const FABLE: ModelCandidate = { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" };
 const GPT_56_SOL: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "xhigh" };
 const GPT_56_TERRA: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-terra", thinking: "xhigh" };
@@ -153,6 +190,10 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   execution: {
     engine: "graph-shadow",
     allowProjectGraph: false,
+    limits: {
+      ...DEFAULT_EXECUTION_LIMITS,
+      backEdgeBudgets: { ...DEFAULT_EXECUTION_LIMITS.backEdgeBudgets },
+    },
   },
   roles: {
     planner: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
@@ -309,6 +350,14 @@ export function loopConfigFrom(config: OrchestratorConfig): {
   };
 }
 
+export function executionLimitsFrom(config: OrchestratorConfig): ExecutionLimits {
+  validateExecutionLimits(config.execution.limits);
+  return {
+    ...config.execution.limits,
+    backEdgeBudgets: { ...config.execution.limits.backEdgeBudgets },
+  };
+}
+
 function readJsonIfPresent(path: string): ConfigPatch {
   if (!existsSync(path)) {
     return {};
@@ -375,6 +424,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
 
   requireStringEnum(execution.engine, "execution.engine", ["legacy", "graph-shadow", "graph"] as const);
   requireBoolean(execution.allowProjectGraph, "execution.allowProjectGraph");
+  validateExecutionLimits(execution.limits);
 
   requireBoolean(lifecycleRouting.enabled, "routing.lifecycle.enabled");
   for (const stage of ["define", "plan", "verify", "review", "debug", "ship"] as const) {
@@ -414,6 +464,28 @@ function validateConfig(value: unknown): OrchestratorConfig {
   }
 
   return config as unknown as OrchestratorConfig;
+}
+
+function validateExecutionLimits(value: unknown): void {
+  const limits = requirePlainObject(value, "execution.limits");
+  for (const key of Object.keys(limits)) {
+    if (!EXECUTION_LIMIT_KEYS.has(key)) throw new Error(`execution.limits.${key} is not recognized`);
+  }
+  for (const key of POSITIVE_EXECUTION_LIMIT_KEYS) {
+    requirePositiveInteger(limits[key], `execution.limits.${key}`);
+  }
+  for (const key of NON_NEGATIVE_EXECUTION_LIMIT_KEYS) {
+    requireNonNegativeNumber(limits[key], `execution.limits.${key}`);
+  }
+  requireStringEnum(limits.humanWait, "execution.limits.humanWait", ["allow", "deny"] as const);
+  const backEdgeBudgets = requirePlainObject(limits.backEdgeBudgets, "execution.limits.backEdgeBudgets");
+  if (!Object.hasOwn(backEdgeBudgets, "run-transition-budget")) {
+    throw new Error("execution.limits.backEdgeBudgets.run-transition-budget must be configured");
+  }
+  for (const [name, budget] of Object.entries(backEdgeBudgets)) {
+    requireMetadataToken(name, "execution.limits.backEdgeBudgets key");
+    requirePositiveInteger(budget, `execution.limits.backEdgeBudgets.${name}`);
+  }
 }
 
 function validateCapabilityRouting(routing: Record<string, unknown>): void {
@@ -678,6 +750,7 @@ function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: Orche
       patch.execution.engine = "graph-shadow";
     }
     patch.execution.allowProjectGraph = trusted.execution.allowProjectGraph;
+    constrainProjectExecutionLimits(patch.execution, trusted.execution.limits);
   }
   if (patch.approval) {
     patch.approval.requirePlanApproval = protectedBoolean(
@@ -705,6 +778,25 @@ function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: Orche
     patch.ship.commit = stricterMode<ShipCommitMode>(trusted.ship.commit, patch.ship.commit, ["never", "ask", "auto"]);
     patch.ship.openPr = stricterMode<ShipOpenPrMode>(trusted.ship.openPr, patch.ship.openPr, ["never", "ask"]);
   }
+}
+
+function constrainProjectExecutionLimits(patch: ExecutionConfigPatch, trusted: ExecutionLimits): void {
+  if (patch.limits === undefined || !isPlainObject(patch.limits)) return;
+  const limits = patch.limits as Record<string, unknown>;
+  for (const key of [...POSITIVE_EXECUTION_LIMIT_KEYS, ...NON_NEGATIVE_EXECUTION_LIMIT_KEYS]) {
+    limits[key] = protectedMinimum(trusted[key], limits[key]);
+  }
+  limits.humanWait = stricterMode(trusted.humanWait, limits.humanWait, ["deny", "allow"] as const);
+
+  if (limits.backEdgeBudgets === undefined || !isPlainObject(limits.backEdgeBudgets)) return;
+  const requested = limits.backEdgeBudgets;
+  const constrained: Record<string, number> = {};
+  for (const [name, trustedBudget] of Object.entries(trusted.backEdgeBudgets)) {
+    if (Object.hasOwn(requested, name)) {
+      constrained[name] = protectedMinimum(trustedBudget, requested[name]) as number;
+    }
+  }
+  limits.backEdgeBudgets = constrained;
 }
 
 function constrainProjectMcpRoles(patch: ConfigPatch): void {

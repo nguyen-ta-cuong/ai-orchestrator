@@ -7,6 +7,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
   DEFAULT_CONFIG,
+  executionLimitsFrom,
   loadConfig,
   loadConfigWithProvenance,
   loopConfigFrom,
@@ -599,7 +600,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const resolved = loadPiResolvedConfig(ctx.cwd);
     const config = resolved.config;
     const yolo = parsed.yolo || pi.getFlag("lifecycle-yolo") === true;
-    const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
+    const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo, {
+      executionLimits: executionLimitsFrom(config),
+    });
     const state = readState(created.paths);
     if (!state) throw new Error("new lifecycle state could not be read");
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
@@ -638,7 +641,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const resolved = loadPiResolvedConfig(ctx.cwd);
     const config = resolved.config;
     const yolo = parsed.yolo || pi.getFlag("lifecycle-yolo") === true;
-    const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo);
+    const created = createRun(ctx.cwd, config.lifecycle.artifactsDir, parsed.task, yolo, {
+      executionLimits: executionLimitsFrom(config),
+    });
     const state = readState(created.paths);
     if (!state) throw new Error("new lifecycle state could not be read");
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
@@ -792,7 +797,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const leaseOwner = randomUUID();
     acquireRunLease(paths, leaseOwner);
     const active = currentRun(cwd, config.lifecycle.artifactsDir);
-    const freshState = readState(paths);
+    const freshState = readState(paths, { migrationLimits: executionLimitsFrom(config) });
     if (active?.runId !== state.runId || active.paths.root !== paths.root || !freshState || freshState.runId !== state.runId) {
       releaseRunLease(paths, leaseOwner);
       throw new Error("Lifecycle state changed before execution lease acquisition; retry from the active run");
@@ -2167,7 +2172,7 @@ function loadCurrent(cwd: string): { paths: RunPaths; state: LifecycleState } | 
   }
   const active = currentRun(cwd, config.lifecycle.artifactsDir);
   if (!active) return undefined;
-  const state = readState(active.paths);
+  const state = readState(active.paths, { migrationLimits: executionLimitsFrom(config) });
   return state?.runId === active.runId ? { paths: active.paths, state } : undefined;
 }
 

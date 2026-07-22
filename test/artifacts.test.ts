@@ -18,7 +18,12 @@ import {
   writeState,
 } from "../src/lifecycle/artifacts.js";
 import { createIdleLifecycleState } from "../src/core/lifecycle.js";
-import { evaluateExecutionGuard, type GraphEvent } from "../src/core/scheduler.js";
+import {
+  DEFAULT_EXECUTION_LIMITS,
+  evaluateExecutionGuard,
+  executionLimitsFingerprint,
+  type GraphEvent,
+} from "../src/core/scheduler.js";
 import { compileGraph } from "../src/core/graph.js";
 import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
 
@@ -281,6 +286,49 @@ describe("lifecycle artifacts", () => {
       action: "node", nodeId: "defining", nodeAttempts: 1, concurrency: 1,
       now: new Date().toISOString(), unattended: true,
     })).toMatchObject({ allowed: false, code: "wall-time-limit" });
+  });
+
+  it("freezes configured execution ceilings when a new run is created", () => {
+    const cwd = makeTempDir();
+    const limits = {
+      ...DEFAULT_EXECUTION_LIMITS,
+      maxGraphSteps: 17,
+      humanWait: "deny" as const,
+      backEdgeBudgets: { "run-transition-budget": 9 },
+    };
+
+    const run = createRun(cwd, artifactsDir, "bounded", false, { executionLimits: limits });
+    const state = readState(run.paths)!;
+    expect(state.graphExecution!.effectiveLimits).toEqual(limits);
+    expect(state.graphExecution!.limitsFingerprint).toBe(executionLimitsFingerprint(limits));
+  });
+
+  it("uses current config only for v1 migration and keeps the persisted v2 policy on resume", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "legacy");
+    const v1 = createIdleLifecycleState({ runId: run.runId, phase: "defining", task: "legacy" });
+    writeFileSync(run.paths.state, JSON.stringify(v1));
+    const migrationLimits = {
+      ...DEFAULT_EXECUTION_LIMITS,
+      maxGraphSteps: 11,
+      maxEstimatedCostUsd: 3,
+      humanWait: "deny" as const,
+      backEdgeBudgets: { "run-transition-budget": 7 },
+    };
+
+    const migrated = readState(run.paths, { migrationLimits })!;
+    expect(migrated.graphExecution!.effectiveLimits).toEqual(migrationLimits);
+    writeState(run.paths, migrated);
+
+    const changedConfig = {
+      ...DEFAULT_EXECUTION_LIMITS,
+      maxGraphSteps: 999,
+      maxEstimatedCostUsd: 99,
+      backEdgeBudgets: { "run-transition-budget": 999 },
+    };
+    const resumed = readState(run.paths, { migrationLimits: changedConfig })!;
+    expect(resumed.graphExecution!.effectiveLimits).toEqual(migrationLimits);
+    expect(resumed.graphExecution!.limitsFingerprint).toBe(executionLimitsFingerprint(migrationLimits));
   });
 
   it("blocks creating a new run immediately while the current state is active", () => {
