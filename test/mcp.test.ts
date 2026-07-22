@@ -191,6 +191,13 @@ describe("MCP server", () => {
       .toThrow(/required JSON shape/);
     expect(() => parseJudgeJson("{\"verdict\":\"reject\",\"reasons\":\"Missing tests.\"}"))
       .toThrow(/required JSON shape/);
+    const rawMarker = "RAW_JUDGE_RESPONSE_MARKER";
+    try {
+      parseJudgeJson(`{not-json:${rawMarker}}`);
+      throw new Error("Expected malformed judge output to be rejected");
+    } catch (error) {
+      expect(String(error)).not.toContain(rawMarker);
+    }
   });
 
   it("serializes judge inputs as JSON string values instead of injectable prompt blocks", () => {
@@ -215,7 +222,25 @@ describe("MCP server", () => {
     await withServer(async (client) => {
       const result = (await client.request("tools/list")) as { tools: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown>; required?: string[] }; outputSchema?: { properties?: Record<string, unknown>; required?: string[] } }> };
       const names = result.tools.map((tool) => tool.name).sort();
-      expect(names).toEqual(["orchestrator_judge", "orchestrator_models", "orchestrator_plan"]);
+      expect(names).toEqual([
+        "orchestrator_judge",
+        "orchestrator_models",
+        "orchestrator_plan",
+        "orchestrator_run_advance",
+        "orchestrator_run_cancel",
+        "orchestrator_run_get",
+        "orchestrator_run_start",
+      ]);
+
+      for (const name of [
+        "orchestrator_run_start",
+        "orchestrator_run_get",
+        "orchestrator_run_advance",
+        "orchestrator_run_cancel",
+      ]) {
+        const tool = result.tools.find((candidate) => candidate.name === name);
+        expect(tool?.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
+      }
 
       const plan = result.tools.find((tool) => tool.name === "orchestrator_plan");
       expect(plan?.inputSchema?.properties).toHaveProperty("task");
@@ -269,7 +294,15 @@ describe("MCP server", () => {
   it("starts through the packaged MCP bin", async () => {
     await withServerCommand([resolve("bin/ai-orchestrator-mcp.js")], async (client) => {
       const result = (await client.request("tools/list")) as { tools: Array<{ name: string }> };
-      expect(result.tools.map((tool) => tool.name).sort()).toEqual(["orchestrator_judge", "orchestrator_models", "orchestrator_plan"]);
+      expect(result.tools.map((tool) => tool.name).sort()).toEqual([
+        "orchestrator_judge",
+        "orchestrator_models",
+        "orchestrator_plan",
+        "orchestrator_run_advance",
+        "orchestrator_run_cancel",
+        "orchestrator_run_get",
+        "orchestrator_run_start",
+      ]);
     });
   });
 

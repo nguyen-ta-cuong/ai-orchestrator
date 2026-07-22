@@ -131,8 +131,42 @@ describe("completeWithRole", () => {
 
     expect(result.text).toBe("backup result");
     expect(result.selectedIndex).toBe(1);
-    expect(result.fallbackHistory).toEqual([{ identity: "test/primary", reason: "LLM request failed (503)" }]);
+    expect(result.fallbackHistory).toEqual([{ identity: "test/primary", reason: "http_error" }]);
     expect(JSON.stringify(result)).not.toContain(apiKey);
+  });
+
+  it("checkpoints each candidate before its network call and does not start an unreserved fallback", async () => {
+    const config = configFor("openai-responses");
+    config.mcp.providers.backup = { baseUrl: "https://backup.example/v1", api: "openai-responses", apiKey: "backup-secret" };
+    const fetchMock = vi.fn(async () => new Response("failed", { status: 503, statusText: "Unavailable" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const events: string[] = [];
+    let remaining = 1;
+
+    await expect(completeRouted({
+      config,
+      role: "planner",
+      prompt: "plan",
+      candidates: [
+        { provider: "test", model: "primary", thinking: "off", estimatedCostUsd: 0.1 },
+        { provider: "backup", model: "secondary", thinking: "off", estimatedCostUsd: 0.2 },
+      ],
+      beforeAttempt: async (attempt) => {
+        events.push(`before:${attempt.identity.provider}/${attempt.identity.model}`);
+        if (remaining === 0) throw new Error("provider budget exhausted");
+        remaining -= 1;
+      },
+      afterAttempt: async (result) => {
+        events.push(`after:${result.identity.provider}/${result.identity.model}:${result.outcome}`);
+      },
+    })).rejects.toThrow("provider budget exhausted");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      "before:test/primary",
+      "after:test/primary:failed",
+      "before:backup/secondary",
+    ]);
   });
 
   it("falls back when a candidate fails structured-output validation", async () => {
@@ -154,7 +188,7 @@ describe("completeWithRole", () => {
     });
 
     expect(result.selectedIndex).toBe(1);
-    expect(result.fallbackHistory).toEqual([{ identity: "test/primary", reason: "candidate output failed required schema validation" }]);
+    expect(result.fallbackHistory).toEqual([{ identity: "test/primary", reason: "schema_validation_failed" }]);
   });
 
   it("caps provider output tokens to the trusted catalog entry", async () => {

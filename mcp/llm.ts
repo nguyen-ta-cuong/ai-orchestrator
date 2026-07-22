@@ -1,5 +1,6 @@
 import type { OrchestratorConfig, ThinkingLevel } from "../src/core/config.js";
 import type { McpCompletionCandidate } from "./routing.js";
+import { classifyMcpProviderFailure, type McpProviderFailureCode } from "./failureCodes.js";
 
 export type ModelRole = "planner" | "judge";
 
@@ -14,12 +15,28 @@ export interface RoutedCompletionRequest extends CompletionRequest {
   candidates: readonly McpCompletionCandidate[];
   /** Reject candidate output before accepting it, allowing an eligible fallback. */
   validateText?: (text: string) => void;
+  /** Called before each paid provider attempt. Callback failures stop fallback. */
+  beforeAttempt?: (attempt: RoutedCompletionAttempt) => void | Promise<void>;
+  /** Called after each provider attempt. Callback failures stop fallback. */
+  afterAttempt?: (result: RoutedCompletionAttemptResult) => void | Promise<void>;
 }
+
+export interface RoutedCompletionAttempt {
+  attempt: number;
+  identity: { provider: string; model: string; family?: string };
+  thinking: ThinkingLevel;
+  requestedOutputTokens?: number;
+  estimatedCostUsd?: number;
+}
+
+export type RoutedCompletionAttemptResult =
+  | (RoutedCompletionAttempt & { outcome: "succeeded" })
+  | (RoutedCompletionAttempt & { outcome: "failed"; failureCode: McpProviderFailureCode });
 
 export interface RoutedCompletionResult {
   text: string;
   selectedIndex: number;
-  fallbackHistory: Array<{ identity: string; reason: string }>;
+  fallbackHistory: Array<{ identity: string; reason: McpProviderFailureCode }>;
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
@@ -32,12 +49,37 @@ export async function completeWithRole({ config, role, prompt, signal }: Complet
   return (await completeRouted({ config, role, prompt, signal, candidates: [config.roles[role]] })).text;
 }
 
-export async function completeRouted({ config, role, prompt, signal, candidates, validateText }: RoutedCompletionRequest): Promise<RoutedCompletionResult> {
+export async function completeRouted({
+  config,
+  role,
+  prompt,
+  signal,
+  candidates,
+  validateText,
+  beforeAttempt,
+  afterAttempt,
+}: RoutedCompletionRequest): Promise<RoutedCompletionResult> {
   const fallbackHistory: RoutedCompletionResult["fallbackHistory"] = [];
   for (let index = 0; index < candidates.length; index += 1) {
     const roleConfig = candidates[index]!;
+    const attempt: RoutedCompletionAttempt = {
+      attempt: index + 1,
+      identity: {
+        provider: roleConfig.provider,
+        model: roleConfig.model,
+        ...(roleConfig.family === undefined ? {} : { family: roleConfig.family }),
+      },
+      thinking: roleConfig.thinking,
+      ...(roleConfig.requestedOutputTokens === undefined ? {} : { requestedOutputTokens: roleConfig.requestedOutputTokens }),
+      ...(roleConfig.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: roleConfig.estimatedCostUsd }),
+    };
+
+    // These callbacks are outside the provider catch boundary deliberately:
+    // a failed durable reservation/settlement must never trigger another call.
+    await beforeAttempt?.(attempt);
+    let text: string;
     try {
-      const text = await completeCandidate(config, role, roleConfig, prompt, signal);
+      text = await completeCandidate(config, role, roleConfig, prompt, signal);
       if (validateText) {
         try {
           validateText(text);
@@ -45,12 +87,18 @@ export async function completeRouted({ config, role, prompt, signal, candidates,
           throw new Error("Candidate output failed required schema validation");
         }
       }
-      return { text, selectedIndex: index, fallbackHistory };
     } catch (error) {
-      const reason = sanitizeError(error, Object.values(config.mcp.providers).flatMap((provider) => provider.apiKey ? [provider.apiKey] : []));
-      fallbackHistory.push({ identity: `${roleConfig.provider}/${roleConfig.model}`, reason });
-      if (signal?.aborted || index === candidates.length - 1) throw new Error(`All eligible MCP completion candidates failed: ${fallbackHistory.map((item) => `${item.identity}: ${item.reason}`).join("; ")}`);
+      const safeSummary = sanitizeError(error, Object.values(config.mcp.providers).flatMap((provider) => provider.apiKey ? [provider.apiKey] : []));
+      const failureCode = classifyMcpProviderFailure(safeSummary);
+      await afterAttempt?.({ ...attempt, outcome: "failed", failureCode });
+      fallbackHistory.push({ identity: `${roleConfig.provider}/${roleConfig.model}`, reason: failureCode });
+      if (signal?.aborted || index === candidates.length - 1) {
+        throw new Error(`All eligible MCP completion candidates failed: ${roleConfig.provider}/${roleConfig.model}: ${safeSummary}`);
+      }
+      continue;
     }
+    await afterAttempt?.({ ...attempt, outcome: "succeeded" });
+    return { text, selectedIndex: index, fallbackHistory };
   }
   throw new Error("No MCP completion candidates were supplied");
 }
