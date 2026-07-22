@@ -68,6 +68,7 @@ describe("loadConfig", () => {
 
     const config = loadConfig(project);
 
+    expect(config.execution).toEqual({ engine: "graph-shadow", allowProjectGraph: false });
     expect(config.roles.planner).toEqual({
       provider: DEFAULT_CONFIG.roles.planner.provider,
       model: "project-planner",
@@ -82,6 +83,30 @@ describe("loadConfig", () => {
     expect(config.loop.plannerEscalationAfterRejections).toBe(2);
     expect(config.approval.requirePlanApproval).toBe(true);
     expect(config.judge.runTests).toBe(false);
+  });
+
+  it("allows repositories to activate graph execution only with user consent", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(project, ".ai-orchestrator.json"), { execution: { engine: "graph", allowProjectGraph: true } });
+
+    expect(loadConfig(project).execution).toEqual({ engine: "graph-shadow", allowProjectGraph: false });
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), { execution: { allowProjectGraph: true } });
+    expect(loadConfig(project).execution).toEqual({ engine: "graph", allowProjectGraph: true });
+  });
+
+  it("accepts user-selected legacy and active graph engines and rejects unknown engines", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), { execution: { engine: "graph" } });
+    expect(loadConfig(project).execution.engine).toBe("graph");
+    writeJson(join(home, ".ai-orchestrator", "config.json"), { execution: { engine: "automatic" } });
+    expect(() => loadConfig(project)).toThrow("execution.engine must be one of");
   });
 
   it("interpolates mcp provider apiKey values from environment variables only", () => {
