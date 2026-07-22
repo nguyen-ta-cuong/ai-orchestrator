@@ -54,8 +54,11 @@ export function createRoutedMcpRunProvider(
     },
 
     plan: async (input) => {
+      const config = configForCall();
+      const routingDecisionId = createDecisionId("plan");
       const completion = await completeMcpPlan({
-        config: configForCall(),
+        config,
+        routingDecisionId,
         task: input.task,
         ...(input.repoContext === undefined ? {} : { repoContext: input.repoContext }),
         ...(input.previousPlan === undefined ? {} : { previousPlan: input.previousPlan }),
@@ -70,13 +73,16 @@ export function createRoutedMcpRunProvider(
       });
       return {
         plan: mcpRunPlanTextSchema.parse(completion.plan),
-        routing: runRoutingDecision("plan", completion.routing, createDecisionId),
+        routing: runRoutingDecision("plan", completion.routing),
       };
     },
 
     judge: async (input) => {
+      const config = configForCall();
+      const routingDecisionId = createDecisionId("fast-judge");
       const completion = await completeMcpJudge({
-        config: configForCall(),
+        config,
+        routingDecisionId,
         task: input.task,
         plan: input.plan,
         diff: input.diff,
@@ -90,7 +96,7 @@ export function createRoutedMcpRunProvider(
       });
       return {
         ...completion.verdict,
-        routing: runRoutingDecision("fast-judge", completion.routing, createDecisionId),
+        routing: runRoutingDecision("fast-judge", completion.routing),
       };
     },
   };
@@ -99,24 +105,26 @@ export function createRoutedMcpRunProvider(
 function runRoutingDecision(
   stage: "plan",
   routing: McpRoutingMetadata,
-  createDecisionId: (stage: RunRoutingStage) => string,
 ): PlanRoutingDecision;
 function runRoutingDecision(
   stage: "fast-judge",
   routing: McpRoutingMetadata,
-  createDecisionId: (stage: RunRoutingStage) => string,
 ): JudgeRoutingDecision;
 function runRoutingDecision(
   stage: RunRoutingStage,
   routing: McpRoutingMetadata,
-  createDecisionId: (stage: RunRoutingStage) => string,
 ): RunRoutingDecision {
+  if (!routing.decision) throw new Error(`Missing frozen routing decision for ${stage}`);
   const decision = {
-    decisionId: createDecisionId(stage),
+    decisionId: routing.decision.decisionId,
     stage,
+    selectedIndex: routing.selectedIndex,
     selectedIdentity: routing.selectedIdentity,
     thinking: routing.thinking,
     policyVersion: routing.policyVersion,
+    policyDigest: routing.decision.policyDigest,
+    configDigest: routing.decision.configDigest,
+    candidatesDigest: routing.decision.candidatesDigest,
     fallbackHistory: routing.fallbackHistory.map(({ identity, reason }) => ({
       identity,
       failureCode: classifyMcpProviderFailure(reason),

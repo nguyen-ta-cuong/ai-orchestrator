@@ -1,9 +1,53 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RoutedCompletionRequest, RoutedCompletionResult } from "../mcp/llm.js";
+import type { RoutedCompletionAttempt, RoutedCompletionRequest, RoutedCompletionResult } from "../mcp/llm.js";
 import { createRoutedMcpRunProvider } from "../mcp/runProvider.js";
 import { DEFAULT_CONFIG, type OrchestratorConfig } from "../src/core/config.js";
 
 describe("routed MCP run provider", () => {
+  it("freezes routing authority before beforeAttempt and carries it unchanged to the result", async () => {
+    const config = routedConfig();
+    let observedDecision: RoutedCompletionAttempt["routingDecision"] | undefined;
+    const beforeAttempt = vi.fn(async (attempt: RoutedCompletionAttempt) => {
+      observedDecision = structuredClone(attempt.routingDecision);
+    });
+    const afterAttempt = vi.fn(async () => undefined);
+    const complete = vi.fn(async (request: RoutedCompletionRequest): Promise<RoutedCompletionResult> => {
+      expect(request.routingDecision).toMatchObject({
+        decisionId: "decision-plan",
+        policyVersion: config.routing.version,
+        policyDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        configDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        candidatesDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+      const candidate = request.candidates[0]!;
+      const attempt: RoutedCompletionAttempt = {
+        attempt: 1,
+        providerRequestRef: "a".repeat(64),
+        routingDecision: structuredClone(request.routingDecision!),
+        identity: {
+          provider: candidate.provider,
+          model: candidate.model,
+          ...(candidate.family === undefined ? {} : { family: candidate.family }),
+        },
+        thinking: candidate.thinking,
+      };
+      await request.beforeAttempt?.(attempt);
+      await request.afterAttempt?.({ ...attempt, outcome: "succeeded" });
+      return { text: "1. Plan", selectedIndex: 0, fallbackHistory: [] };
+    });
+    const provider = createRoutedMcpRunProvider("/unused", {
+      loadConfig: () => config,
+      complete,
+      createDecisionId: (stage) => `decision-${stage}`,
+    });
+
+    const result = await provider.plan({ task: "task", beforeAttempt, afterAttempt });
+
+    expect(beforeAttempt).toHaveBeenCalledOnce();
+    expect(afterAttempt).toHaveBeenCalledOnce();
+    expect(result.routing).toMatchObject(observedDecision!);
+  });
+
   it("uses the trusted plan route and preserves fallback evidence", async () => {
     const config = routedConfig();
     const calls: RoutedCompletionRequest[] = [];
@@ -36,6 +80,7 @@ describe("routed MCP run provider", () => {
       routing: {
         decisionId: "decision-plan",
         stage: "plan",
+        selectedIndex: 1,
         selectedIdentity: { provider: "p2", model: "checker", family: "family-b" },
         fallbackHistory: [{ identity: "p1/maker", failureCode: "schema_validation_failed" }],
       },
@@ -79,6 +124,7 @@ describe("routed MCP run provider", () => {
       routing: {
         decisionId: "decision-fast-judge",
         stage: "fast-judge",
+        selectedIndex: 0,
         selectedIdentity: { provider: "p2", model: "checker", family: "family-b" },
       },
     });

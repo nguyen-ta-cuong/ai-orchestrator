@@ -1,5 +1,5 @@
 import { z } from "zod/v3";
-import { MCP_PROVIDER_FAILURE_CODES } from "./failureCodes.js";
+import { MCP_PROVIDER_DEFINITE_FAILURE_CODES } from "./failureCodes.js";
 
 const MCP_RUN_TEXT_MAX = 2_000_000;
 const MCP_RUN_REPORT_TEXT_MAX = 50_000;
@@ -86,6 +86,7 @@ export const mcpRunCancelInputSchema = z.object({
 export const mcpRunRoutingDecisionSchema = z.object({
   decisionId: z.string().regex(/^[A-Za-z0-9._:@/-]{1,128}$/),
   stage: z.enum(["plan", "fast-judge"]),
+  selectedIndex: z.number().int().min(0).max(99),
   selectedIdentity: z.object({
     provider: z.string().trim().min(1).max(200),
     model: z.string().trim().min(1).max(500),
@@ -93,9 +94,12 @@ export const mcpRunRoutingDecisionSchema = z.object({
   }).strict(),
   thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
   policyVersion: z.string().trim().min(1).max(256),
+  policyDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  configDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  candidatesDigest: z.string().regex(/^[a-f0-9]{64}$/),
   fallbackHistory: z.array(z.object({
     identity: z.string().trim().min(1).max(700),
-    failureCode: z.enum(MCP_PROVIDER_FAILURE_CODES),
+    failureCode: z.enum(MCP_PROVIDER_DEFINITE_FAILURE_CODES),
   }).strict()).max(100),
 }).strict();
 

@@ -44,6 +44,7 @@ const taskFeaturesSchema = z.object({
 });
 
 const routingMetadataSchema = z.object({
+  selectedIndex: z.number().int().min(0),
   selectedIdentity: z.object({ provider: z.string(), model: z.string(), family: z.string().optional() }),
   thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
   policyVersion: z.string(),
@@ -51,6 +52,13 @@ const routingMetadataSchema = z.object({
   fallbackHistory: z.array(z.object({ identity: z.string(), reason: z.string() })),
   separation: z.object({ required: z.boolean(), satisfied: z.boolean(), builderIdentity: z.string().optional(), reason: z.string() }),
   legacyFallback: z.boolean(),
+  decision: z.object({
+    decisionId: z.string(),
+    policyVersion: z.string(),
+    policyDigest: z.string(),
+    configDigest: z.string(),
+    candidatesDigest: z.string(),
+  }).optional(),
 });
 
 const planInputSchema = {

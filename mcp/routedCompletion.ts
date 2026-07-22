@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { z } from "zod/v3";
 import type { OrchestratorConfig } from "../src/core/config.js";
 import type { JudgeReport } from "../src/core/loop.js";
@@ -5,6 +6,7 @@ import type { TaskFeatures } from "../src/core/modelRouting.js";
 import { plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import {
   completeRouted,
+  freezeRoutingDecision,
   type RoutedCompletionAttempt,
   type RoutedCompletionAttemptResult,
   type RoutedCompletionRequest,
@@ -31,6 +33,7 @@ interface CompletionDependencies {
   complete?: McpCompletionExecutor;
   beforeAttempt?: (attempt: RoutedCompletionAttempt) => void | Promise<void>;
   afterAttempt?: (result: RoutedCompletionAttemptResult) => void | Promise<void>;
+  routingDecisionId?: string;
 }
 
 export interface CompleteMcpPlanInput extends CompletionDependencies {
@@ -76,18 +79,25 @@ export async function completeMcpPlan(input: CompleteMcpPlanInput): Promise<{
     role: "planner",
     task: mergeTaskFeatures(prompt, input.taskFeatures),
   });
+  const routingDecision = freezeRoutingDecision(
+    input.config,
+    route.candidates,
+    route.policyVersion,
+    input.routingDecisionId ?? `plan-${randomUUID()}`,
+  );
   const completion = await (input.complete ?? completeRouted)({
     config: input.config,
     role: "planner",
     prompt,
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     candidates: route.candidates,
+    routingDecision,
     ...(input.beforeAttempt === undefined ? {} : { beforeAttempt: input.beforeAttempt }),
     ...(input.afterAttempt === undefined ? {} : { afterAttempt: input.afterAttempt }),
   });
   return {
     plan: completion.text,
-    routing: metadataFor(route, completion.selectedIndex, completion.fallbackHistory),
+    routing: metadataFor(route, completion.selectedIndex, completion.fallbackHistory, routingDecision),
   };
 }
 
@@ -104,19 +114,26 @@ export async function completeMcpJudge(input: CompleteMcpJudgeInput): Promise<{
     task: mergeTaskFeatures(prompt, input.taskFeatures),
     coderIdentity: input.coderIdentity,
   });
+  const routingDecision = freezeRoutingDecision(
+    input.config,
+    route.candidates,
+    route.policyVersion,
+    input.routingDecisionId ?? `fast-judge-${randomUUID()}`,
+  );
   const completion = await (input.complete ?? completeRouted)({
     config: input.config,
     role: "judge",
     prompt,
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     candidates: route.candidates,
+    routingDecision,
     validateText: (text) => { parseJudgeJson(text); },
     ...(input.beforeAttempt === undefined ? {} : { beforeAttempt: input.beforeAttempt }),
     ...(input.afterAttempt === undefined ? {} : { afterAttempt: input.afterAttempt }),
   });
   return {
     verdict: parseJudgeJson(completion.text),
-    routing: metadataFor(route, completion.selectedIndex, completion.fallbackHistory),
+    routing: metadataFor(route, completion.selectedIndex, completion.fallbackHistory, routingDecision),
   };
 }
 
