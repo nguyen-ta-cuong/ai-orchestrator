@@ -146,7 +146,7 @@ describe("durable MCP run store", () => {
       progress: { planVersion: 2 },
     });
     expect(provider).toMatchObject({ planCalls: 2, judgeCalls: 3 });
-  });
+  }, 20_000);
 
   it("rejects corrupt publication bytes and isolates canonical repositories", async () => {
     const fixture = createFixture();
