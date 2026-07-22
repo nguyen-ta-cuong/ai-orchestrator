@@ -6,7 +6,7 @@ export function fastWorkflowGraph(): GraphDefinition {
   return {
     schemaVersion: 1,
     id: "fast-workflow",
-    version: "1.0.0",
+    version: "1.1.0",
     kind: "state-machine",
     entry: "idle",
     nodes: [
@@ -34,7 +34,7 @@ export function fastWorkflowGraph(): GraphDefinition {
       edge("judging", "coding", "verdict", "judge-retry"),
       edge("judging", "replanning", "verdict", "judge-replan"),
       edge("judging", "failed", "verdict", "build-cap-exhausted"),
-      ...cancellationEdges(["planning", "awaiting_approval", "coding", "judging", "replanning", "done", "failed"]),
+      ...cancellationEdges(["planning", "awaiting_approval", "coding", "judging", "replanning"]),
     ]),
   };
 }
@@ -43,7 +43,7 @@ export function lifecycleWorkflowGraph(): GraphDefinition {
   return {
     schemaVersion: 1,
     id: "lifecycle-workflow",
-    version: "1.0.0",
+    version: "1.1.0",
     kind: "state-machine",
     entry: "idle",
     nodes: [
@@ -102,8 +102,6 @@ export function lifecycleWorkflowGraph(): GraphDefinition {
         "shipping",
         "awaiting_ship_approval",
         "finalizing",
-        "done",
-        "failed",
       ]),
     ]),
   };

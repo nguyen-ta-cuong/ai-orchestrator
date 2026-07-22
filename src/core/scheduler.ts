@@ -32,11 +32,13 @@ export interface StructuredNodeError {
 export interface SideEffectExecutionState {
   visit: number;
   attempt: number;
+  ordinal: number;
   idempotencyKey: string;
   class: "model" | "tool" | "write" | "external" | "irreversible";
   status: "intent_recorded" | "succeeded" | "failed" | "unknown";
   requestRef: string;
   outcome?: "succeeded" | "failed" | "unknown";
+  reconciled?: boolean;
   resultRef?: ArtifactReference;
 }
 
@@ -46,6 +48,8 @@ export interface NodeExecutionState {
   visits: number;
   attempts: number;
   retryAttempts: number;
+  sideEffectOrdinal: number;
+  succeededSideEffectKeys: string[];
   startedAt?: string;
   completedAt?: string;
   outputRefs: ArtifactReference[];
@@ -82,6 +86,8 @@ export interface GraphExecutionState {
   lastAppliedEventSequence: number;
   lastAppliedEventId?: string;
   lastAppliedEventHash?: string;
+  lastAppliedEventTimestamp?: string;
+  eventChainHash: string;
   recentEventIds: string[];
   nodeStates: Record<string, NodeExecutionState>;
   ready: string[];
@@ -193,9 +199,11 @@ export interface GraphEvent {
   progressFingerprint?: string;
   sideEffect?: {
     phase: "intent" | "result";
+    ordinal: number;
     idempotencyKey: string;
     class: "model" | "tool" | "write" | "external" | "irreversible";
     outcome?: "succeeded" | "failed" | "unknown";
+    reconciliation?: boolean;
     resultRef?: ArtifactReference;
   };
   usage?: {
@@ -292,6 +300,8 @@ export function createGraphExecutionState(
       visits: node.id === currentNodeId ? 1 : 0,
       attempts: 0,
       retryAttempts: 0,
+      sideEffectOrdinal: 0,
+      succeededSideEffectKeys: [],
       outputRefs: [],
     } satisfies NodeExecutionState,
   ]));
@@ -305,6 +315,15 @@ export function createGraphExecutionState(
     planVersion,
     revision: 0,
     lastAppliedEventSequence: 0,
+    eventChainHash: genesisEventChainHash({
+      runId: options.runId,
+      graphDigest: graphDefinitionDigest(graph),
+      planVersion,
+      startedAt: options.now,
+      currentNodeId,
+      limitsFingerprint: executionLimitsFingerprint(effectiveLimits),
+      metadataFingerprint: schedulerMetadataFingerprint(schedulerMetadata),
+    }),
     recentEventIds: [],
     nodeStates,
     ready: current.terminal ? [] : [currentNodeId],
@@ -361,6 +380,10 @@ export function applySchedulerEvent(
     throw new Error(`Graph event sequence ${event.sequence} is out of order; expected ${state.lastAppliedEventSequence + 1}`);
   }
   if (state.recentEventIds.includes(event.eventId)) throw new Error(`Duplicate graph event id: ${event.eventId}`);
+  const previousTimestamp = state.lastAppliedEventTimestamp ?? state.guard.startedAt;
+  if (Date.parse(event.timestamp) < Date.parse(previousTimestamp)) {
+    throw new Error("Graph event timestamp predates the last durable event");
+  }
 
   const next = cloneExecutionState(state);
   const node = next.nodeStates[event.nodeId]!;
@@ -388,6 +411,8 @@ export function applySchedulerEvent(
   next.lastAppliedEventSequence = event.sequence;
   next.lastAppliedEventId = event.eventId;
   next.lastAppliedEventHash = eventHash;
+  next.lastAppliedEventTimestamp = event.timestamp;
+  next.eventChainHash = sha256(`${next.eventChainHash}:${eventHash}`);
   next.revision += 1;
   next.recentEventIds = [...next.recentEventIds, event.eventId];
   assertScheduleValid(graph, next, metadata);
@@ -400,6 +425,11 @@ export function evaluateExecutionGuard(
   limits: ExecutionLimits,
   probe: ExecutionGuardProbe,
 ): ExecutionGuardDecision {
+  try {
+    assertScheduleValid(graph, state);
+  } catch (error) {
+    return denied("invalid-state", errorMessage(error));
+  }
   try {
     assertExecutionLimitsValid(limits);
   } catch (error) {
@@ -473,11 +503,18 @@ export function assertScheduleValid(
   assertNonNegativeInteger(state.lastAppliedEventSequence, "last applied event sequence");
   if (state.revision !== state.lastAppliedEventSequence) throw new Error("Scheduler revision must equal its last applied event sequence");
   if (state.lastAppliedEventSequence === 0) {
-    if (state.lastAppliedEventId !== undefined || state.lastAppliedEventHash !== undefined) throw new Error("Initial scheduler state cannot have last-event identity");
+    if (state.lastAppliedEventId !== undefined || state.lastAppliedEventHash !== undefined || state.lastAppliedEventTimestamp !== undefined) {
+      throw new Error("Initial scheduler state cannot have last-event identity");
+    }
   } else {
     assertToken(state.lastAppliedEventId, "last applied event id");
     if (typeof state.lastAppliedEventHash !== "string" || !SHA256.test(state.lastAppliedEventHash)) throw new Error("Scheduler last event hash is invalid");
+    assertIsoTimestamp(state.lastAppliedEventTimestamp, "last applied event timestamp");
+    if (Date.parse(state.lastAppliedEventTimestamp) < Date.parse(state.guard.startedAt)) {
+      throw new Error("Scheduler last event timestamp predates graph start");
+    }
   }
+  if (typeof state.eventChainHash !== "string" || !SHA256.test(state.eventChainHash)) throw new Error("Scheduler event-chain hash is invalid");
   assertExecutionLimitsValid(state.effectiveLimits);
   if (executionLimitsFingerprint(state.effectiveLimits) !== state.limitsFingerprint) throw new Error("Scheduler execution limits fingerprint is invalid");
 
@@ -565,17 +602,16 @@ function assertGraphEventKindFields(event: Readonly<GraphEvent>): void {
     if (!completion && (event.artifactRefs.length > 0 || event.validatorResult !== undefined)) {
       throw new Error("Non-completion node-status event cannot carry completion fields");
     }
-    if (event.nextStatus === "cancelled" && event.chosenEdge !== undefined) {
-      throw new Error("A cancelled node-status event cannot carry a chosen edge");
-    }
-    if (event.nextStatus !== "blocked" && event.chosenEdge !== undefined) {
+    if (event.nextStatus !== "blocked" && event.nextStatus !== "cancelled" && event.chosenEdge !== undefined) {
       throw new Error(`Node-status ${event.nextStatus} cannot carry a chosen edge`);
     }
     return;
   }
 
-  if (event.priorStatus !== "running" || event.nextStatus !== "running") {
-    throw new Error(`${event.kind} event requires a running node without changing status`);
+  const observesRunning = event.priorStatus === "running" && event.nextStatus === "running";
+  const observesHumanWait = event.priorStatus === "waiting_human" && event.nextStatus === "waiting_human";
+  if (!observesRunning && !(event.kind !== "progress" && observesHumanWait)) {
+    throw new Error(`${event.kind} event requires a running node${event.kind === "progress" ? "" : " or waiting-human node"} without changing status`);
   }
   if (event.artifactRefs.length > 0) throw new Error(`${event.kind} event cannot carry completion artifact references`);
   assertFieldsAbsent(event, ["chosenEdge", "errorCategory", "validatorResult", "routingDecisionId", "recoveryLevel"], `${event.kind} event`);
@@ -588,26 +624,47 @@ function assertGraphEventKindFields(event: Readonly<GraphEvent>): void {
 
   if (event.progressFingerprint !== undefined) throw new Error(`${event.kind} event cannot carry a progress fingerprint`);
   if (!event.requestRef || !event.sideEffect) throw new Error(`${event.kind} event requires requestRef and side-effect data`);
-  const expectedRequestRef = sha256(event.sideEffect.idempotencyKey);
-  if (event.requestRef !== expectedRequestRef) throw new Error(`${event.kind} event requestRef does not match its idempotency key`);
+  const modelEffect = event.sideEffect.class === "model";
   if (event.kind === "side-effect-intent") {
     if (event.sideEffect.phase !== "intent") throw new Error("Side-effect intent event requires an intent payload");
-    if (event.sideEffect.outcome !== undefined || event.sideEffect.resultRef !== undefined) {
-      throw new Error("Side-effect intent cannot carry an outcome or result reference");
+    if (event.sideEffect.outcome !== undefined || event.sideEffect.resultRef !== undefined || event.sideEffect.reconciliation !== undefined) {
+      throw new Error("Side-effect intent cannot carry an outcome, result reference, or reconciliation flag");
     }
     if (event.usage !== undefined) throw new Error("Side-effect intent cannot carry observed usage");
-    if (event.reservation && (event.reservation.modelCalls < 0 || event.reservation.providerCalls < 0)) {
-      throw new Error("Side-effect intent cannot release concurrency reservations");
-    }
+    if (modelEffect) {
+      if (event.reservation?.modelCalls !== 1 || event.reservation.providerCalls !== 1) {
+        throw new Error("Model side-effect intent requires exact model/provider reservations");
+      }
+    } else if (event.reservation !== undefined) throw new Error("Non-model side-effect intent cannot reserve model/provider capacity");
     return;
   }
   if (event.sideEffect.phase !== "result") throw new Error("Side-effect result event requires a result payload");
   if (event.sideEffect.outcome === undefined) throw new Error("Side-effect result requires a structured outcome");
+  if (event.sideEffect.reconciliation === true && event.sideEffect.outcome === "unknown") {
+    throw new Error("Side-effect reconciliation must settle the unknown outcome");
+  }
   if (event.sideEffect.outcome === "succeeded" && event.sideEffect.resultRef === undefined) {
     throw new Error("Successful side-effect result requires an artifact reference");
   }
-  if (event.reservation && (event.reservation.modelCalls > 0 || event.reservation.providerCalls > 0)) {
-    throw new Error("Side-effect result cannot acquire concurrency reservations");
+  if (event.sideEffect.reconciliation === true) {
+    if (event.reservation !== undefined || event.usage !== undefined) {
+      throw new Error("Side-effect reconciliation cannot alter reservations or usage");
+    }
+  } else if (modelEffect) {
+    if (event.reservation?.modelCalls !== -1 || event.reservation.providerCalls !== -1) {
+      throw new Error("Model side-effect result requires exact model/provider reservation release");
+    }
+    assertCompleteUsage(event.usage);
+  } else {
+    if (event.reservation !== undefined) throw new Error("Non-model side-effect result cannot alter model/provider capacity");
+    if (event.usage !== undefined) throw new Error("Non-model side-effect result cannot carry model usage");
+  }
+}
+
+function assertCompleteUsage(usage: GraphEvent["usage"]): void {
+  if (!usage || usage.estimatedCostUsd === undefined || usage.observedCostUsd === undefined ||
+      usage.inputTokens === undefined || usage.outputTokens === undefined) {
+    throw new Error("Model side-effect result requires explicit cost and token usage");
   }
 }
 
@@ -625,11 +682,12 @@ function applyNodeStatusEvent(
   if (!ALLOWED_STATUS_TRANSITIONS[node.status].has(event.nextStatus)) {
     throw new Error(`Invalid scheduler status transition ${node.status} -> ${event.nextStatus} for ${node.nodeId}`);
   }
-  if (graph.definition.kind === "state-machine" && event.nextStatus === "blocked" && event.chosenEdge === undefined) {
-    throw new Error("A completed state-machine transition requires one chosen edge");
+  if (graph.definition.kind === "state-machine" &&
+      (event.nextStatus === "blocked" || event.nextStatus === "cancelled") && event.chosenEdge === undefined) {
+    throw new Error("A completed or cancelled state-machine transition requires one chosen edge");
   }
   if (graph.definition.kind === "dag" && event.chosenEdge !== undefined) throw new Error("DAG node events cannot carry a chosen edge");
-  if (event.nextStatus === "running") {
+  if (event.nextStatus === "running" || (node.status === "ready" && event.nextStatus === "waiting_human")) {
     if (event.attempt !== node.attempts + 1) throw new Error(`Running attempt for ${node.nodeId} must increment by one`);
     node.attempts = event.attempt;
     node.startedAt = event.timestamp;
@@ -648,6 +706,17 @@ function applyNodeStatusEvent(
     throw new Error(`Graph event attempt ${event.attempt} does not match ${node.nodeId} attempts ${node.attempts}`);
   }
 
+  const latestEffect = node.sideEffect;
+  if (event.nextStatus === "blocked" || event.nextStatus === "executed") {
+    if (graph.nodesById.get(node.nodeId)!.sideEffect !== "none" &&
+        (!latestEffect || latestEffect.status !== "succeeded" || latestEffect.visit !== node.visits || latestEffect.attempt !== node.attempts)) {
+      throw new Error(`Node ${node.nodeId} cannot complete without a succeeded side-effect result`);
+    }
+  }
+  if (event.nextStatus === "failed_retryable" && latestEffect &&
+      (latestEffect.status === "intent_recorded" || latestEffect.status === "unknown" || latestEffect.status === "succeeded")) {
+    throw new Error(`Node ${node.nodeId} cannot retry with an unresolved, unknown, or succeeded side effect`);
+  }
   assertEventArtifacts(graph, event);
   assertCompletionContracts(graph, event);
   node.status = event.nextStatus;
@@ -676,16 +745,22 @@ function applyObservationEvent(
   if (event.kind === "side-effect-intent") {
     if (event.sideEffect?.phase !== "intent") throw new Error("Side-effect intent event requires an intent payload");
     assertSideEffectPermitted(graph, node.nodeId, event.sideEffect.class);
-    if (node.sideEffect?.visit === node.visits && node.sideEffect.attempt === node.attempts) {
-      throw new Error(`Node ${node.nodeId} side-effect intent already recorded for this attempt`);
+    const prior = node.sideEffect;
+    if (prior?.status === "intent_recorded" || prior?.status === "unknown") {
+      throw new Error(`Node ${node.nodeId} has an unresolved side effect requiring reconciliation`);
     }
-    if (node.sideEffect?.visit === node.visits && node.sideEffect.idempotencyKey !== event.sideEffect.idempotencyKey) {
-      throw new Error(`Node ${node.nodeId} side-effect retry must preserve its idempotency key`);
+    if (event.sideEffect.ordinal !== node.sideEffectOrdinal + 1) {
+      throw new Error(`Node ${node.nodeId} side-effect ordinal must increment by one`);
+    }
+    if (node.succeededSideEffectKeys.includes(event.sideEffect.idempotencyKey)) {
+      throw new Error(`Node ${node.nodeId} cannot repeat a succeeded idempotency key`);
     }
     node.idempotencyKey = event.sideEffect.idempotencyKey;
+    node.sideEffectOrdinal = event.sideEffect.ordinal;
     node.sideEffect = {
       visit: node.visits,
       attempt: node.attempts,
+      ordinal: event.sideEffect.ordinal,
       idempotencyKey: event.sideEffect.idempotencyKey,
       class: event.sideEffect.class,
       status: "intent_recorded",
@@ -695,17 +770,25 @@ function applyObservationEvent(
   } else if (event.kind === "side-effect-result") {
     if (event.sideEffect?.phase !== "result") throw new Error("Side-effect result event requires a result payload");
     const pending = node.sideEffect;
-    if (!pending || pending.status !== "intent_recorded") throw new Error("Side-effect result has no unresolved persisted intent");
+    const reconciliation = event.sideEffect.reconciliation === true;
+    if (!pending || (reconciliation ? pending.status !== "unknown" : pending.status !== "intent_recorded")) {
+      throw new Error(reconciliation
+        ? "Side-effect reconciliation has no unknown persisted result"
+        : "Side-effect result has no unresolved persisted intent");
+    }
     if (pending.visit !== node.visits || pending.attempt !== node.attempts) throw new Error("Side-effect result does not match the active node attempt");
-    if (pending.idempotencyKey !== event.sideEffect.idempotencyKey || pending.class !== event.sideEffect.class || pending.requestRef !== event.requestRef) {
+    if (pending.ordinal !== event.sideEffect.ordinal || pending.idempotencyKey !== event.sideEffect.idempotencyKey ||
+        pending.class !== event.sideEffect.class || pending.requestRef !== event.requestRef) {
       throw new Error("Side-effect result does not match the persisted intent");
     }
     node.sideEffect = {
       ...pending,
       status: event.sideEffect.outcome!,
       outcome: event.sideEffect.outcome,
+      ...(reconciliation ? { reconciled: true } : {}),
       ...(event.sideEffect.resultRef ? { resultRef: cloneArtifactReference(event.sideEffect.resultRef) } : {}),
     };
+    if (event.sideEffect.outcome === "succeeded") node.succeededSideEffectKeys.push(event.sideEffect.idempotencyKey);
   } else if (event.kind === "progress" && event.sideEffect !== undefined) {
     throw new Error("Progress event cannot carry side-effect data");
   }
@@ -716,14 +799,19 @@ function applyChosenEdge(graph: CompiledGraph, state: GraphExecutionState, event
   if (selected.from !== event.nodeId) throw new Error("Chosen graph edge source does not match event node");
   const matches = (graph.outgoingByNode.get(selected.from) ?? []).filter((candidate) => sameEdge(candidate, selected));
   if (matches.length !== 1) throw new Error(`Chosen graph edge matched ${matches.length} compiled edges`);
+  if (event.nextStatus === "cancelled" && selected.event !== "cancelled") {
+    throw new Error("A cancelled state-machine transition requires its exact cancellation edge");
+  }
   if (selected.boundedBy) {
     const remaining = state.guard.backEdgeRemaining[selected.boundedBy];
     if (!Number.isInteger(remaining) || remaining <= 0) throw new Error(`Back-edge budget ${selected.boundedBy} is exhausted`);
     state.guard.backEdgeRemaining[selected.boundedBy] = remaining - 1;
   }
-  if (event.nextStatus === "cancelled" || event.nextStatus === "failed") return;
+  if (event.nextStatus === "failed") return;
   if (graph.definition.kind !== "state-machine") return;
-  if (event.nextStatus !== "blocked") throw new Error("A successful state-machine edge must leave its source blocked");
+  if (event.nextStatus !== "blocked" && event.nextStatus !== "cancelled") {
+    throw new Error("A state-machine edge must leave its source blocked or cancelled");
+  }
   const target = state.nodeStates[selected.to]!;
   if (TERMINAL_STATUSES.has(target.status)) throw new Error(`State-machine target ${selected.to} has absorbing status ${target.status}`);
   if (target.status === "running" || target.status === "waiting_human") throw new Error(`State-machine target ${selected.to} is already active`);
@@ -821,6 +909,12 @@ function assertNodeStateValid(graph: CompiledGraph, state: Readonly<GraphExecuti
   assertNonNegativeInteger(node.visits, `scheduler visits for ${node.nodeId}`);
   assertNonNegativeInteger(node.attempts, `scheduler attempts for ${node.nodeId}`);
   assertNonNegativeInteger(node.retryAttempts, `scheduler retry attempts for ${node.nodeId}`);
+  assertNonNegativeInteger(node.sideEffectOrdinal, `scheduler side-effect ordinal for ${node.nodeId}`);
+  if (!Array.isArray(node.succeededSideEffectKeys) || node.succeededSideEffectKeys.length > state.effectiveLimits.maxSideEffectAttempts ||
+      new Set(node.succeededSideEffectKeys).size !== node.succeededSideEffectKeys.length) {
+    throw new Error(`Scheduler succeeded side-effect keys are invalid for ${node.nodeId}`);
+  }
+  node.succeededSideEffectKeys.forEach((key) => assertToken(key, `succeeded side-effect key for ${node.nodeId}`));
   if (node.retryAttempts > definition.retryBudget) throw new Error(`Scheduler retry budget is invalid for ${node.nodeId}`);
   if (node.status === "pending" && node.visits !== 0) throw new Error(`Pending scheduler node ${node.nodeId} cannot have visits`);
   if (node.status !== "pending" && node.visits === 0) throw new Error(`Activated scheduler node ${node.nodeId} must have a visit`);
@@ -877,9 +971,11 @@ function assertPersistedSideEffect(
 ): void {
   assertPositiveInteger(sideEffect.visit, `side-effect visit for ${node.nodeId}`);
   assertPositiveInteger(sideEffect.attempt, `side-effect attempt for ${node.nodeId}`);
+  assertPositiveInteger(sideEffect.ordinal, `side-effect ordinal for ${node.nodeId}`);
+  if (sideEffect.ordinal !== node.sideEffectOrdinal) throw new Error(`Side-effect ordinal is inconsistent for ${node.nodeId}`);
   if (sideEffect.visit > node.visits || sideEffect.attempt > node.attempts) throw new Error(`Side-effect state is ahead of node ${node.nodeId}`);
   assertToken(sideEffect.idempotencyKey, `side-effect idempotency key for ${node.nodeId}`);
-  if (!SHA256.test(sideEffect.requestRef) || sideEffect.requestRef !== sha256(sideEffect.idempotencyKey)) {
+  if (!SHA256.test(sideEffect.requestRef)) {
     throw new Error(`Side-effect request reference is invalid for ${node.nodeId}`);
   }
   assertSideEffectPermitted(graph, node.nodeId, sideEffect.class);
@@ -887,12 +983,23 @@ function assertPersistedSideEffect(
     throw new Error(`Side-effect status is invalid for ${node.nodeId}`);
   }
   if (sideEffect.status === "intent_recorded") {
-    if (sideEffect.outcome !== undefined || sideEffect.resultRef !== undefined) throw new Error(`Pending side effect for ${node.nodeId} cannot have a result`);
+    if (sideEffect.outcome !== undefined || sideEffect.resultRef !== undefined || sideEffect.reconciled !== undefined) {
+      throw new Error(`Pending side effect for ${node.nodeId} cannot have a result`);
+    }
   } else if (sideEffect.outcome !== sideEffect.status) {
     throw new Error(`Settled side-effect outcome is inconsistent for ${node.nodeId}`);
   }
+  if (sideEffect.reconciled !== undefined && sideEffect.reconciled !== true) {
+    throw new Error(`Side-effect reconciliation flag is invalid for ${node.nodeId}`);
+  }
+  if (sideEffect.reconciled === true && sideEffect.status === "unknown") {
+    throw new Error(`Reconciled side effect remains unknown for ${node.nodeId}`);
+  }
   if (sideEffect.status === "succeeded" && !sideEffect.resultRef) throw new Error(`Successful side effect for ${node.nodeId} requires a result reference`);
-  if (sideEffect.resultRef) assertArtifactReference(graph, state.planVersion, node.nodeId, sideEffect.resultRef);
+  if (sideEffect.status === "succeeded" && !node.succeededSideEffectKeys.includes(sideEffect.idempotencyKey)) {
+    throw new Error(`Successful side-effect key is not indexed for ${node.nodeId}`);
+  }
+  if (sideEffect.resultRef) assertEvidenceArtifactReference(state.planVersion, node.nodeId, sideEffect.resultRef);
   if (node.idempotencyKey !== sideEffect.idempotencyKey) throw new Error(`Node ${node.nodeId} idempotency key does not match side-effect state`);
 }
 
@@ -965,7 +1072,8 @@ function assertGuardProbeValid(
     throw new Error(`Guard probe action is invalid: ${String(probe.action)}`);
   }
   assertIsoTimestamp(probe.now, "guard timestamp");
-  if (Date.parse(probe.now) < Date.parse(state.guard.startedAt)) throw new Error("Guard timestamp predates graph start");
+  const lastDurableTimestamp = state.lastAppliedEventTimestamp ?? state.guard.startedAt;
+  if (Date.parse(probe.now) < Date.parse(lastDurableTimestamp)) throw new Error("Guard timestamp predates the last durable event");
   if (typeof probe.unattended !== "boolean") throw new Error("Guard unattended flag must be boolean");
   if (probe.nodeId !== undefined) {
     assertToken(probe.nodeId, "guard node id");
@@ -1077,7 +1185,7 @@ function assertEventIdentity(state: Readonly<GraphExecutionState>, event: Readon
 
 function assertEventArtifacts(graph: CompiledGraph, event: Readonly<GraphEvent>): void {
   for (const reference of event.artifactRefs) assertArtifactReference(graph, event.planVersion, event.nodeId, reference);
-  if (event.sideEffect?.resultRef) assertArtifactReference(graph, event.planVersion, event.nodeId, event.sideEffect.resultRef);
+  if (event.sideEffect?.resultRef) assertEvidenceArtifactReference(event.planVersion, event.nodeId, event.sideEffect.resultRef);
 }
 
 function assertCompletionContracts(graph: CompiledGraph, event: Readonly<GraphEvent>): void {
@@ -1116,12 +1224,20 @@ function assertArtifactReference(
   nodeId: string,
   reference: Readonly<ArtifactReference>,
 ): void {
-  assertArtifactReferenceShape(reference);
-  if (reference.planVersion !== planVersion) throw new Error(`Artifact reference plan version ${reference.planVersion} does not match ${planVersion}`);
-  if (reference.nodeId !== nodeId) throw new Error(`Artifact reference node ${reference.nodeId} does not match ${nodeId}`);
+  assertEvidenceArtifactReference(planVersion, nodeId, reference);
   if (!graph.nodesById.get(nodeId)!.outputContracts.includes(reference.contract)) {
     throw new Error(`Artifact reference contract ${reference.contract} is not declared by ${nodeId}`);
   }
+}
+
+function assertEvidenceArtifactReference(
+  planVersion: number,
+  nodeId: string,
+  reference: Readonly<ArtifactReference>,
+): void {
+  assertArtifactReferenceShape(reference);
+  if (reference.planVersion !== planVersion) throw new Error(`Artifact reference plan version ${reference.planVersion} does not match ${planVersion}`);
+  if (reference.nodeId !== nodeId) throw new Error(`Artifact reference node ${reference.nodeId} does not match ${nodeId}`);
   const expectedDirectory = `nodes/${planVersion}/${nodeId}/`;
   if (!reference.path.startsWith(expectedDirectory)) {
     throw new Error(`Artifact reference must remain inside node artifact directory ${expectedDirectory}`);
@@ -1166,12 +1282,19 @@ function assertValidatorResult(value: unknown): void {
 function assertSideEffect(value: unknown): void {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Graph side-effect data must be an object");
   const sideEffect = value as Record<string, unknown>;
-  assertOnlyKeys(sideEffect, ["phase", "idempotencyKey", "class", "outcome", "resultRef"], "graph side effect");
+  assertOnlyKeys(sideEffect, ["phase", "ordinal", "idempotencyKey", "class", "outcome", "reconciliation", "resultRef"], "graph side effect");
   if (sideEffect.phase !== "intent" && sideEffect.phase !== "result") throw new Error("Graph side-effect phase is invalid");
+  assertPositiveInteger(sideEffect.ordinal, "graph side-effect ordinal");
   assertToken(sideEffect.idempotencyKey, "graph side-effect idempotency key");
   if (!new Set(["model", "tool", "write", "external", "irreversible"]).has(sideEffect.class as string)) throw new Error("Graph side-effect class is invalid");
   if (sideEffect.outcome !== undefined && sideEffect.outcome !== "succeeded" && sideEffect.outcome !== "failed" && sideEffect.outcome !== "unknown") {
     throw new Error("Graph side-effect outcome is invalid");
+  }
+  if (sideEffect.reconciliation !== undefined && typeof sideEffect.reconciliation !== "boolean") {
+    throw new Error("Graph side-effect reconciliation flag is invalid");
+  }
+  if (sideEffect.reconciliation !== undefined && sideEffect.reconciliation !== true) {
+    throw new Error("Graph side-effect reconciliation flag must be true when present");
   }
   if (sideEffect.resultRef !== undefined) assertArtifactReferenceShape(sideEffect.resultRef);
 }
@@ -1242,6 +1365,7 @@ function cloneExecutionState(state: Readonly<GraphExecutionState>): GraphExecuti
     recentEventIds: [...state.recentEventIds],
     nodeStates: Object.fromEntries(Object.entries(state.nodeStates).map(([id, node]) => [id, {
       ...node,
+      succeededSideEffectKeys: [...node.succeededSideEffectKeys],
       outputRefs: node.outputRefs.map(cloneArtifactReference),
       sideEffect: node.sideEffect ? {
         ...node.sideEffect,
@@ -1266,6 +1390,18 @@ function cloneArtifactReference(reference: Readonly<ArtifactReference>): Artifac
 
 function graphEventHash(event: Readonly<GraphEvent>): string {
   return sha256(canonicalJson(event));
+}
+
+function genesisEventChainHash(identity: {
+  runId: string;
+  graphDigest: string;
+  planVersion: number;
+  startedAt: string;
+  currentNodeId: string;
+  limitsFingerprint: string;
+  metadataFingerprint: string;
+}): string {
+  return sha256(canonicalJson({ schemaVersion: 1, kind: "scheduler-genesis", ...identity }));
 }
 
 function canonicalJson(value: unknown): string {

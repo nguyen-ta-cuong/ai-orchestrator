@@ -14,6 +14,7 @@ import {
   appendGraphEvent,
   checkpointGraphEvent,
   createGraphCheckpointPaths,
+  graphSnapshotDigest,
   ownsGraphCheckpointLease,
   readGraphEvents,
   readGraphSnapshot,
@@ -66,6 +67,8 @@ function setup(owner = "owner-a") {
     limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
     metadata: { priorities: { start: 1 } },
   });
+  writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, state, { owner });
+  writeGraphSnapshot(paths, graph, state, { owner, tempId: "genesis" });
   return { graph, owner, paths, state };
 }
 
@@ -92,9 +95,9 @@ function started(state: GraphExecutionState, eventId = "event-1", sequence = 1):
 describe("graph checkpoints", () => {
   it("writes canonical immutable graph and metadata bytes once", () => {
     const { graph, owner, paths, state } = setup();
-    writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, { owner });
+    writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, state, { owner });
     const first = readFileSync(paths.graph, "utf8");
-    writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, { owner });
+    writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, state, { owner });
     expect(readFileSync(paths.graph, "utf8")).toBe(first);
     expect(readImmutableGraphCheckpoint(paths)).toMatchObject({
       graphDigest: state.graphDigest,
@@ -106,7 +109,7 @@ describe("graph checkpoints", () => {
       nodes: graph.definition.nodes.map((node) => node.id === "start" ? { ...node, handler: "changed-handler" } : { ...node }),
       edges: graph.definition.edges.map((edge) => ({ ...edge })),
     });
-    expect(() => writeImmutableGraphCheckpoint(paths, mutated, state.schedulerMetadata, { owner })).toThrow(/immutable graph checkpoint/);
+    expect(() => writeImmutableGraphCheckpoint(paths, mutated, state.schedulerMetadata, state, { owner })).toThrow(/immutable graph checkpoint|compiled graph|graph digest/);
   });
 
   it("writes contained immutable node artifacts and verifies bytes, size, and hash", () => {
@@ -123,6 +126,21 @@ describe("graph checkpoints", () => {
 
     writeFileSync(join(paths.root, reference.path), "tampered");
     expect(() => readNodeArtifact(paths, reference)).toThrow(/size|SHA-256/);
+  });
+
+  it("publishes immutable artifacts atomically despite an orphaned pre-publish temp file", () => {
+    const { owner, paths } = setup();
+    const bytes = Buffer.from("atomic artifact\n");
+    const reference = writeNodeArtifact(paths, {
+      owner, planVersion: 1, nodeId: "start", contract: "result", bytes,
+    });
+    const target = join(paths.root, reference.path);
+    rmSync(target);
+    writeFileSync(`${target}.publish.orphan.tmp`, "partial");
+    expect(writeNodeArtifact(paths, {
+      owner, planVersion: 1, nodeId: "start", contract: "result", bytes,
+    })).toEqual(reference);
+    expect(readNodeArtifact(paths, reference)).toEqual(bytes);
   });
 
   it("appends and reads a bounded unique strictly sequenced JSONL log", () => {
@@ -166,13 +184,36 @@ describe("graph checkpoints", () => {
     const replayed = replayGraphEvents(graph, disk, readGraphEvents(paths));
     expect(replayed).toMatchObject({ lastAppliedEventSequence: 1, revision: 1 });
     expect(replayed.nodeStates.start!.status).toBe("running");
-    writeGraphSnapshot(paths, graph, replayed, { owner, tempId: "replayed", expectedRevision: 0 });
+    writeGraphSnapshot(paths, graph, replayed, {
+      owner, tempId: "replayed", expectedRevision: 0, expectedSnapshotHash: graphSnapshotDigest(state),
+    });
     expect(replayGraphEvents(graph, readGraphSnapshot(paths, graph), readGraphEvents(paths))).toEqual(replayed);
+  });
+
+  it("rejects a caught-up same-revision snapshot whose guard fields do not match full genesis replay", () => {
+    const { graph, owner, paths, state } = setup();
+    const next = checkpointGraphEvent({
+      graph, paths, state, event: started(state), owner, tempId: "valid-next",
+    });
+    const forged = structuredClone(next);
+    forged.guard.estimatedCostUsd = 12;
+    writeFileSync(paths.state, `${JSON.stringify(forged)}\n`);
+    expect(() => readGraphSnapshot(paths, graph)).toThrow(/exactly match replay from immutable genesis/);
+  });
+
+  it("binds immutable scheduler genesis to the run id and canonical zero-revision state", () => {
+    const { graph, owner, paths, state } = setup();
+    rmSync(paths.graph);
+    const forged = structuredClone(state);
+    forged.runId = "different-run";
+    expect(() => writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, forged, { owner })).toThrow(/canonical scheduler genesis/);
+    expect(existsSync(paths.graph)).toBe(false);
   });
 
   it("validates transitions and complete scheduler state before either durable write", () => {
     const { graph, owner, paths, state } = setup();
     const before = existsSync(paths.events) ? readFileSync(paths.events) : undefined;
+    const stateBefore = readFileSync(paths.state);
     expect(() => checkpointGraphEvent({
       graph,
       paths,
@@ -186,21 +227,23 @@ describe("graph checkpoints", () => {
     const malformed = structuredClone(state);
     malformed.ready = ["done"];
     expect(() => writeGraphSnapshot(paths, graph, malformed, { owner, tempId: "invalid-state" })).toThrow(/ready node|ready order/);
-    expect(existsSync(paths.state)).toBe(false);
+    expect(readFileSync(paths.state)).toEqual(stateBefore);
   });
 
   it("keeps the old atomic snapshot on a pre-rename failure and accepts post-rename recovery", () => {
     const { graph, owner, paths, state } = setup();
     writeGraphSnapshot(paths, graph, state, { owner, tempId: "initial" });
-    const next = replayGraphEvents(graph, state, [started(state)]);
+    const startEvent = started(state);
+    appendGraphEvent(paths, startEvent, { owner });
+    const next = replayGraphEvents(graph, state, [startEvent]);
     expect(() => writeGraphSnapshot(paths, graph, next, {
-      owner, tempId: "before-rename", expectedRevision: 0,
+      owner, tempId: "before-rename", expectedRevision: 0, expectedSnapshotHash: graphSnapshotDigest(state),
       failAt(point) { if (point === "after-snapshot-temp-write") throw new Error("injected pre-rename crash"); },
     })).toThrow(/pre-rename crash/);
     expect(readGraphSnapshot(paths, graph).revision).toBe(0);
 
     expect(() => writeGraphSnapshot(paths, graph, next, {
-      owner, tempId: "after-rename", expectedRevision: 0,
+      owner, tempId: "after-rename", expectedRevision: 0, expectedSnapshotHash: graphSnapshotDigest(state),
       failAt(point) { if (point === "after-snapshot-rename") throw new Error("injected post-rename crash"); },
     })).toThrow(/post-rename crash/);
     expect(readGraphSnapshot(paths, graph).revision).toBe(1);
@@ -212,9 +255,11 @@ describe("graph checkpoints", () => {
     const corrupt = { ...state, ready: ["done"] };
     writeFileSync(paths.state, `${JSON.stringify(corrupt)}\n`);
     const bytes = readFileSync(paths.state);
-    const next = replayGraphEvents(graph, state, [started(state)]);
+    const startEvent = started(state);
+    appendGraphEvent(paths, startEvent, { owner });
+    const next = replayGraphEvents(graph, state, [startEvent]);
     expect(() => writeGraphSnapshot(paths, graph, next, {
-      owner, tempId: "must-not-overwrite", expectedRevision: 0,
+      owner, tempId: "must-not-overwrite", expectedRevision: 0, expectedSnapshotHash: graphSnapshotDigest(state),
     })).toThrow(/current snapshot|snapshot is invalid|ready node/i);
     expect(readFileSync(paths.state)).toEqual(bytes);
   });
@@ -250,7 +295,7 @@ describe("graph checkpoints", () => {
       const operation = field === "executionLease"
         ? () => acquireGraphCheckpointLease(paths, "owner-a", { now, pid: 101, isProcessAlive: () => true })
         : field === "graph"
-          ? () => writeImmutableGraphCheckpoint(paths, graph, {}, { owner: "owner-a" })
+          ? () => writeImmutableGraphCheckpoint(paths, graph, {}, state, { owner: "owner-a" })
           : field === "events"
             ? () => readGraphEvents(paths)
             : () => readGraphSnapshot(paths, graph);
@@ -262,7 +307,7 @@ describe("graph checkpoints", () => {
 
   it("checks ownership for every mutation and contains snapshot temp names", () => {
     const { graph, owner, paths, state } = setup();
-    expect(() => writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, { owner: "other" })).toThrow(/lease owner/);
+    expect(() => writeImmutableGraphCheckpoint(paths, graph, state.schedulerMetadata, state, { owner: "other" })).toThrow(/lease owner/);
     expect(() => writeNodeArtifact(paths, {
       owner: "other", planVersion: 1, nodeId: "start", contract: "result", bytes: Buffer.from("x"),
     })).toThrow(/lease owner/);
@@ -282,9 +327,57 @@ describe("graph checkpoints", () => {
     expect(releaseGraphCheckpointLease(paths, "owner-b")).toBe(false);
     expect(releaseGraphCheckpointLease(paths, owner)).toBe(true);
 
-    writeFileSync(paths.executionLease, `${JSON.stringify({ owner: "dead", pid: 999, createdAt: now })}\n`);
+    writeFileSync(paths.executionLease, `${JSON.stringify({ owner: "dead", nonce: "dead-nonce", pid: 999, createdAt: now })}\n`);
     acquireGraphCheckpointLease(paths, "owner-b", { now, pid: 202, isProcessAlive: () => false });
     expect(ownsGraphCheckpointLease(paths, "owner-b")).toBe(true);
     expect(releaseGraphCheckpointLease(paths, "owner-b")).toBe(true);
+  });
+
+  it("preserves a replacement lease across reclaim and release races", () => {
+    const { owner, paths } = setup();
+    expect(releaseGraphCheckpointLease(paths, owner, {
+      beforeLeaseRemove() {
+        rmSync(paths.executionLease);
+        writeFileSync(paths.executionLease, `${JSON.stringify({
+          owner: "replacement", nonce: "replacement-nonce", pid: 303, createdAt: now,
+        })}\n`);
+      },
+    })).toBe(false);
+    expect(ownsGraphCheckpointLease(paths, "replacement")).toBe(true);
+
+    rmSync(paths.executionLease);
+    writeFileSync(paths.executionLease, `${JSON.stringify({ owner: "dead", nonce: "dead-nonce", pid: 999, createdAt: now })}\n`);
+    expect(() => acquireGraphCheckpointLease(paths, "slow-reclaimer", {
+      now,
+      pid: 404,
+      isProcessAlive(pid) { return pid === 505; },
+      beforeStaleLeaseRemove() {
+        rmSync(paths.executionLease);
+        writeFileSync(paths.executionLease, `${JSON.stringify({
+          owner: "fast-owner", nonce: "fast-nonce", pid: 505, createdAt: now,
+        })}\n`);
+      },
+    })).toThrow(/already executing.*fast-owner/);
+    expect(ownsGraphCheckpointLease(paths, "fast-owner")).toBe(true);
+  });
+
+  it("rejects backdated event-log records without changing durable bytes", () => {
+    const { owner, paths, state } = setup();
+    const first = started(state);
+    first.timestamp = "2026-07-22T00:00:02.000Z";
+    appendGraphEvent(paths, first, { owner });
+    const before = readFileSync(paths.events);
+    expect(() => appendGraphEvent(paths, {
+      ...first,
+      kind: "progress",
+      sequence: 2,
+      eventId: "event-2",
+      priorStatus: "running",
+      nextStatus: "running",
+      attempt: 1,
+      timestamp: "2026-07-22T00:00:01.000Z",
+      progressFingerprint: "a".repeat(16),
+    }, { owner })).toThrow(/predates the last durable event/);
+    expect(readFileSync(paths.events)).toEqual(before);
   });
 });

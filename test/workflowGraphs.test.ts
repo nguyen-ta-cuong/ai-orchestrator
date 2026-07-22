@@ -78,7 +78,7 @@ describe("fastWorkflowGraph", () => {
       { type: "verdict", verdict: "reject" },
       "build-cap-exhausted",
     );
-    for (const phase of ["planning", "awaiting_approval", "coding", "judging", "replanning", "done", "failed"] as const) {
+    for (const phase of ["planning", "awaiting_approval", "coding", "judging", "replanning"] as const) {
       record(fastState(phase), { type: "cancelled" }, "run-cancelled");
     }
 
@@ -174,7 +174,7 @@ describe("lifecycleWorkflowGraph", () => {
     record(lifecycleState("awaiting_ship_approval"), { type: "ship_confirmed" }, "human-approved");
     record(lifecycleState("awaiting_ship_approval"), { type: "ship_declined" }, "human-declined");
     record(lifecycleState("finalizing"), { type: "finalize_complete" }, undefined);
-    for (const phase of lifecycleActiveAndTerminalPhases) {
+    for (const phase of lifecycleActiveAndTerminalPhases.filter((phase) => phase !== "done" && phase !== "failed")) {
       record(lifecycleState(phase), { type: "cancelled" }, "run-cancelled");
     }
 

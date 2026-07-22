@@ -170,6 +170,9 @@ function validateContracts(contracts: string[], nodeId: string, direction: strin
     if (typeof contract !== "string" || contract.trim() === "") {
       throw new Error(`Node ${nodeId} has an empty ${direction} contract`);
     }
+    if (contract.length > 128 || /[\u0000-\u001f\u007f]/.test(contract)) {
+      throw new Error(`Node ${nodeId} has an invalid ${direction} contract`);
+    }
     return contract;
   });
   if (new Set(copy).size !== copy.length) throw new Error(`Node ${nodeId} has duplicate ${direction} contracts`);

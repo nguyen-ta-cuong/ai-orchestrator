@@ -177,6 +177,7 @@ export function nextStage(
   }
 
   if (event.type === "cancelled") {
+    if (state.phase === "done" || state.phase === "failed") return cloneLifecycleState(state);
     const cancelled = cloneLifecycleState(state);
     cancelled.phase = "idle";
     return cancelled;
