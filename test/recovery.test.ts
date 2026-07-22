@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyRecoveryReleaseToLedger,
   applyRecoveryDecision,
   applyRecoveryDecisionToLedger,
+  applyRecoverySuccessorEventToLedger,
   classifyFailure,
   createRecoveryLedger,
   fingerprintFailure,
+  recoveryBudgetKey,
+  recoveryDirectiveDigest,
   registerRecovery,
   recoveryRankingTuple,
   resumeRecoveryState,
@@ -24,13 +28,21 @@ import {
 
 const hashA = "a".repeat(64);
 const hashB = "b".repeat(64);
+const hashC = "c".repeat(64);
 
 function evidence(category: FailureCategory, overrides: Partial<FailureEvidence> = {}): FailureEvidence {
   return {
     version: 1,
+    runId: "run-recovery-test",
+    nodeId: "build",
     category,
     nodeKind: "build",
     graphVersion: "lifecycle-v1",
+    graphDigest: hashC,
+    planVersion: 3,
+    planHash: hashB,
+    attempt: 1,
+    failureLineageId: "lineage-build",
     artifactHashes: [hashA],
     ...overrides,
   };
@@ -49,10 +61,11 @@ function directive(
     failureFingerprint: fingerprintFailure(failure),
     rootCauseCategory,
     confidence: "high",
+    diagnosisRef: `plan-versions/${failure.planVersion}/debug.json`,
     diagnosisHash: hashB,
-    evidenceRefs: ["nodes/1/build/result.json"],
+    evidenceRefs: [`nodes/${failure.planVersion}/${failure.nodeId}/result.json`],
     repairScope: local ? ["src/feature.ts"] : [],
-    validationRequirements: local ? ["tests-pass"] : [],
+    validationRequirements: local ? ["tests-pass"] : structural ? ["graph-contract"] : [],
     topologyAssessment: structural ? "structural" : "preserve",
     ...overrides,
   };
@@ -61,10 +74,17 @@ function directive(
 function stateFor(
   failure: FailureEvidence,
   remaining: RecoveryBudgets = { retry: 1, repair: 1, replan: 1 },
-  sourcePlanVersion = 3,
 ): RecoveryState {
-  const ledger = registerRecovery(createRecoveryLedger(1), failure, { remaining, sourcePlanVersion });
-  return resumeRecoveryState(ledger, fingerprintFailure(failure));
+  const authority = {
+    version: 1 as const,
+    runId: failure.runId,
+    graphDigest: failure.graphDigest,
+    activePlanVersion: failure.planVersion,
+    activePlanHash: failure.planHash,
+    limits: { maxEntries: 1, maxPlanVersions: Math.max(failure.planVersion, 4), budgets: remaining },
+  };
+  const ledger = registerRecovery(createRecoveryLedger(authority), authority, failure);
+  return resumeRecoveryState(ledger, authority, fingerprintFailure(failure));
 }
 
 function compareTuple(left: readonly number[], right: readonly number[]): number {
@@ -101,6 +121,33 @@ describe("failure evidence", () => {
       .toThrow("category");
     expect(() => validateFailureEvidence({ ...evidence("timeout"), artifactHashes: Array(33).fill(hashA) }))
       .toThrow("at most 32");
+  });
+
+  it("never consumes required or optional schema fields from Object.prototype", () => {
+    const prototype = Object.prototype as unknown as Record<string, unknown>;
+    const originalVersion = Object.getOwnPropertyDescriptor(Object.prototype, "version");
+    const originalContractViolation = Object.getOwnPropertyDescriptor(Object.prototype, "contractViolation");
+    try {
+      Object.defineProperty(Object.prototype, "version", { configurable: true, value: 1 });
+      Object.defineProperty(Object.prototype, "contractViolation", {
+        configurable: true,
+        value: "validator-rejected",
+      });
+      const missingVersion: Partial<FailureEvidence> = { ...evidence("timeout") };
+      delete missingVersion.version;
+      expect(() => validateFailureEvidence(missingVersion)).toThrow(/version/);
+
+      const normalized = validateFailureEvidence(evidence("timeout"));
+      expect(Object.hasOwn(normalized, "contractViolation")).toBe(false);
+    } finally {
+      if (originalVersion) Object.defineProperty(Object.prototype, "version", originalVersion);
+      else delete prototype.version;
+      if (originalContractViolation) {
+        Object.defineProperty(Object.prototype, "contractViolation", originalContractViolation);
+      } else {
+        delete prototype.contractViolation;
+      }
+    }
   });
 });
 
@@ -173,6 +220,19 @@ describe("classifyFailure", () => {
     }
   });
 
+  it("rejects diagnosis and evidence references from a stale plan version", () => {
+    const failure = evidence("implementation-defect");
+    const state = stateFor(failure);
+    expect(() => classifyFailure(failure, state, {
+      ...directive(failure),
+      diagnosisRef: "plan-versions/2/debug.json",
+    })).toThrow("diagnosisRef");
+    expect(() => classifyFailure(failure, state, {
+      ...directive(failure),
+      evidenceRefs: ["nodes/2/build/result.json"],
+    })).toThrow("evidenceRef");
+  });
+
   it("allows a diagnosis to classify unknown evidence without resetting its fingerprint", () => {
     const failure = evidence("unknown");
     const diagnosis = directive(failure, "implementation-defect", {
@@ -196,14 +256,15 @@ describe("classifyFailure", () => {
 
     const first = classifyFailure(failure, stateFor(failure));
     const consumed = applyRecoveryDecision(stateFor(failure), first);
-    expect(classifyFailure(failure, consumed)).toMatchObject({ action: "fail", reason: "recovery-level-consumed" });
+    expect(classifyFailure(failure, validateRecoveryState({ ...consumed, status: "active" })))
+      .toMatchObject({ action: "fail", reason: "recovery-level-consumed" });
   });
 
   it("fails closed at the plan-version ceiling instead of overflowing a successor", () => {
-    const failure = evidence("invalid-topology");
+    const failure = evidence("invalid-topology", { planVersion: 1_000_000 });
     expect(classifyFailure(
       failure,
-      stateFor(failure, { retry: 1, repair: 1, replan: 1 }, 1_000_000),
+      stateFor(failure, { retry: 1, repair: 1, replan: 1 }),
       directive(failure),
     )).toMatchObject({ action: "fail", reason: "replan-exhausted", targetPlanVersion: 1_000_000 });
   });
@@ -216,7 +277,11 @@ describe("classifyFailure", () => {
       classifyFailure(failure, state, directive(failure, "timeout")),
     );
 
-    expect(classifyFailure(failure, retried, directive(failure, "invalid-topology"))).toMatchObject({
+    expect(classifyFailure(
+      failure,
+      validateRecoveryState({ ...retried, status: "active" }),
+      directive(failure, "invalid-topology"),
+    )).toMatchObject({
       action: "fail",
       reason: "recovery-level-skipped",
     });
@@ -237,7 +302,7 @@ describe("applyRecoveryDecision", () => {
 
       expect(decision.topology).toBe("preserve");
       expect(next.sourcePlanVersion).toBe(3);
-      expect(next.activePlanVersion).toBe(3);
+      expect(next.approvedPlanVersion).toBe(3);
       expect(state.consumed).toEqual([]);
       expect(next.consumed).toEqual([decision.action]);
     }
@@ -255,12 +320,13 @@ describe("applyRecoveryDecision", () => {
       sourcePlanVersion: 3,
       targetPlanVersion: 4,
     });
-    expect(next).toMatchObject({ sourcePlanVersion: 3, activePlanVersion: 4, consumed: ["replan"] });
-    expect(classifyFailure(failure, next, directive(failure))).toMatchObject({
-      action: "fail",
-      reason: "recovery-level-consumed",
-      targetPlanVersion: 4,
+    expect(next).toMatchObject({
+      sourcePlanVersion: 3,
+      approvedPlanVersion: 3,
+      status: "waiting-successor-artifact",
+      consumed: ["replan"],
     });
+    expect(() => classifyFailure(failure, next, directive(failure))).toThrow("waiting-successor-artifact");
   });
 
   it("rejects fingerprint resets, stale snapshots, budget increases, repeats, and level regression", () => {
@@ -281,24 +347,25 @@ describe("applyRecoveryDecision", () => {
     expect(() => validateRecoveryDecision({
       ...repair,
       remainingAfter: { ...repair.remainingAfter, repair: repair.remainingBefore.repair + 1 },
-    })).toThrow("decrement exactly once");
+    })).toThrow(/0 or 1|decrement exactly once/);
 
     const afterRepair = applyRecoveryDecision(state, repair);
-    expect(() => applyRecoveryDecision(afterRepair, repair)).toThrow("stale remaining budget");
+    expect(applyRecoveryDecision(afterRepair, repair)).toEqual(afterRepair);
 
     const regressiveDecision = classifyFailure(
       failure,
       stateFor(failure),
       directive(failure, "transient-tool"),
     );
-    expect(() => applyRecoveryDecision(afterRepair, {
+    expect(() => applyRecoveryDecision(validateRecoveryState({ ...afterRepair, status: "active" }), {
       ...regressiveDecision,
       failureFingerprint: afterRepair.fingerprint,
       observedCategory: afterRepair.observedCategory,
       remainingBefore: afterRepair.remaining,
       remainingAfter: { ...afterRepair.remaining, retry: afterRepair.remaining.retry - 1 },
-      sourcePlanVersion: afterRepair.activePlanVersion,
-      targetPlanVersion: afterRepair.activePlanVersion,
+      sourcePlanVersion: afterRepair.approvedPlanVersion,
+      sourcePlanHash: afterRepair.approvedPlanHash,
+      targetPlanVersion: afterRepair.approvedPlanVersion,
     })).toThrow("regress");
   });
 
@@ -317,9 +384,19 @@ describe("applyRecoveryDecision", () => {
       .toThrow("cannot recategorize known failure");
     expect(() => validateRecoveryDecision({ ...paused, reason: "policy-change-required" }))
       .toThrow("does not match");
+
+    const structuralFailure = evidence("invalid-topology");
+    const structural = classifyFailure(
+      structuralFailure,
+      stateFor(structuralFailure),
+      directive(structuralFailure),
+    );
+    const undiagnosed = { ...structural } as Partial<typeof structural>;
+    delete undiagnosed.directiveHash;
+    expect(() => validateRecoveryDecision(undiagnosed)).toThrow("diagnosis directive hash");
   });
 
-  it("makes pause and fail outcomes absorbing", () => {
+  it("makes failures absorbing and waiting states require explicit release evidence", () => {
     const budgetFailure = evidence("budget");
     const active = stateFor(budgetFailure);
     const failed = applyRecoveryDecision(active, classifyFailure(budgetFailure, active));
@@ -334,7 +411,8 @@ describe("applyRecoveryDecision", () => {
       authorizationState,
       classifyFailure(authorizationFailure, authorizationState),
     );
-    expect(applyRecoveryDecision(paused, unrelatedDecision)).toEqual(paused);
+    expect(paused.status).toBe("waiting-authorization");
+    expect(() => applyRecoveryDecision(paused, unrelatedDecision)).toThrow("explicit resume");
   });
 
   it("strictly validates state snapshots", () => {
@@ -350,45 +428,16 @@ describe("applyRecoveryDecision", () => {
 });
 
 describe("bounded recovery properties", () => {
-  it("walks retry to repair to replan exactly once while decreasing rank at every step", () => {
-    const failure = evidence("unknown");
-    let state = stateFor(failure, { retry: 2, repair: 2, replan: 2 });
-    const diagnoses = [
-      directive(failure, "timeout"),
-      directive(failure, "implementation-defect", {
-        repairScope: ["src/core/worker.ts"],
-        validationRequirements: ["worker-contract"],
-      }),
-      directive(failure, "invalid-topology"),
-    ] as const;
-
-    for (const [index, expectedLevel] of (["retry", "repair", "replan"] as const).entries()) {
-      const before = state;
-      const decision = classifyFailure(failure, before, diagnoses[index]);
-      state = applyRecoveryDecision(before, decision);
-      expect(decision.action).toBe(expectedLevel);
-      expect(compareTuple(recoveryRankingTuple(state), recoveryRankingTuple(before))).toBeLessThan(0);
-    }
-
-    expect(state.consumed).toEqual(["retry", "repair", "replan"]);
-    expect(state.remaining).toEqual({ retry: 1, repair: 1, replan: 1 });
-    expect(state.activePlanVersion).toBe(state.sourcePlanVersion + 1);
-    const terminalDecision = classifyFailure(failure, state, diagnoses[2]);
-    const terminal = applyRecoveryDecision(state, terminalDecision);
-    expect(terminalDecision).toMatchObject({ action: "fail", reason: "recovery-level-consumed" });
-    expect(compareTuple(recoveryRankingTuple(terminal), recoveryRankingTuple(state))).toBeLessThan(0);
-  });
-
-  it("never regresses levels, reuses a level, increases budgets, or leaves rank unchanged", () => {
+  it("never increases a frozen 0/1 budget and every permitted recovery decreases rank", () => {
     const categoryForLevel: Record<RecoveryLevel, FailureCategory> = {
       retry: "timeout",
       repair: "implementation-defect",
       replan: "invalid-topology",
     };
 
-    for (let retryBudget = 0; retryBudget <= 3; retryBudget += 1) {
-      for (let repairBudget = 0; repairBudget <= 3; repairBudget += 1) {
-        for (let replanBudget = 0; replanBudget <= 3; replanBudget += 1) {
+    for (let retryBudget = 0; retryBudget <= 1; retryBudget += 1) {
+      for (let repairBudget = 0; repairBudget <= 1; repairBudget += 1) {
+        for (let replanBudget = 0; replanBudget <= 1; replanBudget += 1) {
           const budgets = { retry: retryBudget, repair: repairBudget, replan: replanBudget };
           for (const level of ["retry", "repair", "replan"] as const) {
             const failure = evidence(categoryForLevel[level]);
@@ -407,12 +456,6 @@ describe("bounded recovery properties", () => {
 
             if (decision.action === level) {
               expect(next.consumed).toEqual([level]);
-              const repeated = classifyFailure(
-                failure,
-                next,
-                level === "retry" ? undefined : directive(failure),
-              );
-              expect(repeated.action).toBe("fail");
             }
           }
         }
@@ -422,7 +465,7 @@ describe("bounded recovery properties", () => {
 
   it("never automatically recovers any safety failure", () => {
     for (const category of ["budget", "authorization", "policy", "side-effect"] as const) {
-      for (let budget = 0; budget <= 3; budget += 1) {
+      for (let budget = 0; budget <= 1; budget += 1) {
         const failure = evidence(category);
         const decision = classifyFailure(failure, stateFor(failure, {
           retry: budget,
@@ -435,137 +478,443 @@ describe("bounded recovery properties", () => {
   });
 });
 
-describe("recovery ledger", () => {
-  it("round-trips immutable consumed history and terminal outcomes across resume", () => {
-    const failure = evidence("timeout");
-    const initialized = registerRecovery(createRecoveryLedger(4), failure, {
-      remaining: { retry: 2, repair: 1, replan: 1 },
-      sourcePlanVersion: 7,
-    });
-    const initial = resumeRecoveryState(initialized, fingerprintFailure(failure));
-    const retry = classifyFailure(failure, initial);
-    const updated = applyRecoveryDecisionToLedger(initialized, retry);
+describe("durable recovery hardening", () => {
+  const authority = {
+    version: 1 as const,
+    runId: "run-recovery-1",
+    graphDigest: "c".repeat(64),
+    activePlanVersion: 2,
+    activePlanHash: "1".repeat(64),
+    limits: {
+      maxEntries: 8,
+      maxPlanVersions: 4,
+      budgets: { retry: 1, repair: 1, replan: 1 },
+    },
+  };
 
-    const restored = validateRecoveryLedger(JSON.parse(JSON.stringify(updated)));
-    expect(resumeRecoveryState(restored, fingerprintFailure(failure))).toMatchObject({
+  const durableFailure = {
+    version: 1 as const,
+    runId: authority.runId,
+    nodeId: "build-a",
+    nodeKind: "build",
+    graphVersion: "lifecycle-v1",
+    graphDigest: authority.graphDigest,
+    planVersion: 2,
+    planHash: authority.activePlanHash,
+    attempt: 1,
+    failureLineageId: "lineage-build-a",
+    category: "invalid-topology" as const,
+    contractViolation: "validator-rejected" as const,
+    contractId: "build-output",
+    artifactHashes: [hashA],
+  };
+
+  const structuralDirective = {
+    version: 1 as const,
+    failureFingerprint: fingerprintFailure(durableFailure),
+    rootCauseCategory: "invalid-topology" as const,
+    confidence: "high" as const,
+    diagnosisRef: "plan-versions/2/debug.json",
+    diagnosisHash: hashB,
+    evidenceRefs: ["nodes/2/build-a/result.json"],
+    repairScope: [],
+    validationRequirements: ["graph-contract"],
+    topologyAssessment: "structural" as const,
+  };
+
+  it("binds canonical authoritative failure identity into the fingerprint", () => {
+    const base = fingerprintFailure(durableFailure);
+    expect(fingerprintFailure({ ...durableFailure, nodeId: "build-b" })).not.toBe(base);
+    expect(fingerprintFailure({ ...durableFailure, attempt: 2 })).not.toBe(base);
+    expect(fingerprintFailure({ ...durableFailure, planVersion: 3 })).not.toBe(base);
+    expect(fingerprintFailure({ ...durableFailure, failureLineageId: "lineage-build-b" })).not.toBe(base);
+    expect(fingerprintFailure({ ...durableFailure, graphDigest: "d".repeat(64) })).not.toBe(base);
+    expect(fingerprintFailure({ ...durableFailure, planHash: "9".repeat(64) })).not.toBe(base);
+    expect(recoveryBudgetKey({ ...durableFailure, attempt: 2, artifactHashes: [hashB] }))
+      .toBe(recoveryBudgetKey(durableFailure));
+    expect(recoveryBudgetKey({ ...durableFailure, nodeId: "build-b" }))
+      .not.toBe(recoveryBudgetKey(durableFailure));
+  });
+
+  it("keeps parallel node lineages independent", () => {
+    const first = { ...durableFailure, category: "timeout" as const };
+    const second = {
+      ...first,
+      nodeId: "build-b",
+      failureLineageId: "lineage-build-b",
+    };
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, first);
+    ledger = applyRecoveryDecisionToLedger(ledger, authority, fingerprintFailure(first));
+    ledger = registerRecovery(ledger, authority, second);
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(second))).toMatchObject({
+      consumed: [],
+      remaining: { retry: 1, repair: 1, replan: 1 },
+    });
+  });
+
+  it("advances new occurrences under one stable lineage budget without replenishment", () => {
+    const transient = { ...durableFailure, category: "timeout" as const };
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, transient);
+    ledger = applyRecoveryDecisionToLedger(ledger, authority, fingerprintFailure(transient));
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(transient))).toMatchObject({
+      status: "released",
       consumed: ["retry"],
-      remaining: { retry: 1, repair: 1, replan: 1 },
-      status: "active",
+      remaining: { retry: 0, repair: 1, replan: 1 },
     });
 
-    const exhausted = classifyFailure(failure, resumeRecoveryState(restored, fingerprintFailure(failure)));
-    const terminal = applyRecoveryDecisionToLedger(restored, exhausted);
-    const replayed = applyRecoveryDecisionToLedger(terminal, exhausted);
-    expect(replayed).toEqual(terminal);
-    expect(resumeRecoveryState(validateRecoveryLedger(JSON.parse(JSON.stringify(replayed))), fingerprintFailure(failure)))
-      .toMatchObject({ status: "failed", consumed: ["retry"] });
+    const local = {
+      ...durableFailure,
+      category: "implementation-defect" as const,
+      attempt: 2,
+      artifactHashes: [hashB],
+    };
+    ledger = registerRecovery(ledger, authority, local);
+    const localInitial = resumeRecoveryState(ledger, authority, fingerprintFailure(local));
+    expect(localInitial).toMatchObject({ consumed: ["retry"], remaining: { retry: 0, repair: 1, replan: 1 } });
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(local),
+      directive(local, "implementation-defect", {
+        diagnosisRef: "plan-versions/2/debug-local.json",
+        repairScope: ["src/core/recovery.ts"],
+        validationRequirements: ["recovery-contract"],
+      }),
+    );
+
+    const structural = {
+      ...durableFailure,
+      attempt: 3,
+      artifactHashes: ["8".repeat(64)],
+    };
+    ledger = registerRecovery(ledger, authority, structural);
+    const structuralInitial = resumeRecoveryState(ledger, authority, fingerprintFailure(structural));
+    expect(structuralInitial).toMatchObject({
+      consumed: ["retry", "repair"],
+      remaining: { retry: 0, repair: 0, replan: 1 },
+    });
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(structural),
+      { ...structuralDirective, failureFingerprint: fingerprintFailure(structural) },
+    );
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(structural))).toMatchObject({
+      consumed: ["retry", "repair", "replan"],
+      remaining: { retry: 0, repair: 0, replan: 0 },
+    });
+
+    expect(() => registerRecovery(ledger, authority, {
+      ...structural,
+      attempt: 4,
+      artifactHashes: ["7".repeat(64)],
+    })).toThrow(/prior lineage occurrence|released/);
   });
 
-  it("rejects duplicate initialization and an attempted budget/history reset", () => {
-    const failure = evidence("transient-tool");
-    const initialized = registerRecovery(createRecoveryLedger(), failure, {
-      remaining: { retry: 1, repair: 1, replan: 1 },
-      sourcePlanVersion: 1,
-    });
-    expect(() => registerRecovery(initialized, failure, {
-      remaining: { retry: 10, repair: 10, replan: 10 },
-      sourcePlanVersion: 1,
-    })).toThrow("already initialized");
+  it("persists immutable evidence and rederives every diagnosis-bound decision", () => {
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, durableFailure);
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(durableFailure),
+    );
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(durableFailure)).status)
+      .toBe("waiting-diagnosis");
 
-    const initial = resumeRecoveryState(initialized, fingerprintFailure(failure));
-    const updated = applyRecoveryDecisionToLedger(initialized, classifyFailure(failure, initial));
-    const tampered = JSON.parse(JSON.stringify(updated)) as {
-      entries: Array<{
-        initial: RecoveryState;
-        transitions: Array<{ decision: RecoveryDecision; state: RecoveryState }>;
-      }>;
-    };
-    tampered.entries[0]!.transitions[0]!.state = {
-      ...tampered.entries[0]!.transitions[0]!.state,
-      remaining: { retry: 2, repair: 1, replan: 1 },
-    };
-    expect(() => validateRecoveryLedger(tampered)).toThrow("replayed decision");
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(durableFailure),
+      structuralDirective,
+    );
+    const record = ledger.records.at(-1);
+    expect(record?.kind).toBe("decision");
+    if (!record || record.kind !== "decision") throw new Error("missing decision record");
+    expect(record.directive).toEqual(structuralDirective);
+    expect(record.decision.directiveHash).toBe(recoveryDirectiveDigest(structuralDirective));
+
+    const tampered = JSON.parse(JSON.stringify(ledger)) as typeof ledger;
+    const transition = tampered.records.at(-1);
+    if (!transition || transition.kind !== "decision") throw new Error("missing decision record");
+    delete (transition as { directive?: unknown }).directive;
+    expect(() => validateRecoveryLedger(tampered, authority)).toThrow(/directive|rederived|hash chain/);
   });
 
-  it("rejects a semantically impossible persisted route for a known category", () => {
-    const failure = evidence("timeout");
-    const initialized = registerRecovery(createRecoveryLedger(), failure, {
-      remaining: { retry: 1, repair: 1, replan: 1 },
-      sourcePlanVersion: 1,
+  it("uses explicit release evidence to resume non-diagnosis waits", () => {
+    const authorizationFailure = { ...durableFailure, category: "authorization" as const };
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, authorizationFailure);
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(authorizationFailure),
+    );
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(authorizationFailure)).status)
+      .toBe("waiting-authorization");
+
+    ledger = applyRecoveryReleaseToLedger(ledger, authority, {
+      version: 1,
+      failureFingerprint: fingerprintFailure(authorizationFailure),
+      reason: "authorization-granted",
+      evidenceRef: "plan-versions/2/recovery-authorization.json",
+      evidenceHash: "e".repeat(64),
     });
-    const initial = resumeRecoveryState(initialized, fingerprintFailure(failure));
-    const retry = classifyFailure(failure, initial);
-    for (const route of ["repair", "replan"] as const) {
-      const structural = route === "replan";
-      const forgedDecision = {
-        ...retry,
-        effectiveCategory: structural ? "invalid-topology" : "implementation-defect",
-        action: route,
-        reason: structural ? "structural-defect" : "local-defect",
-        topology: structural ? "successor" : "preserve",
-        targetPlanVersion: structural ? 2 : 1,
-        remainingAfter: { ...retry.remainingBefore, [route]: retry.remainingBefore[route] - 1 },
-      } as const;
-      const forgedState = {
-        ...initial,
-        consumed: [route],
-        remaining: forgedDecision.remainingAfter,
-        activePlanVersion: forgedDecision.targetPlanVersion,
-      };
-      const tampered = JSON.parse(JSON.stringify(initialized)) as {
-        entries: Array<{ transitions: Array<{ decision: unknown; state: unknown }> }>;
-      };
-      tampered.entries[0]!.transitions.push({ decision: forgedDecision, state: forgedState });
-      expect(() => validateRecoveryLedger(tampered)).toThrow("cannot recategorize known failure");
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(authorizationFailure)).status)
+      .toBe("released");
+  });
+
+  it("keeps N approved through successor intent, artifact, and approval, then activates N+1", () => {
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, durableFailure);
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(durableFailure),
+      structuralDirective,
+    );
+    let state = resumeRecoveryState(ledger, authority, fingerprintFailure(durableFailure));
+    expect(state).toMatchObject({
+      status: "waiting-successor-artifact",
+      sourcePlanVersion: 2,
+      approvedPlanVersion: 2,
+      successor: { status: "intent-recorded", targetPlanVersion: 3 },
+    });
+
+    const artifact = {
+      version: 1 as const,
+      phase: "artifact-durable" as const,
+      failureFingerprint: fingerprintFailure(durableFailure),
+      sourcePlanVersion: 2,
+      targetPlanVersion: 3,
+      graphHash: "d".repeat(64),
+      planHash: "e".repeat(64),
+      graphRef: "plan-versions/3/graph.json",
+      planRef: "plan-versions/3/plan.md",
+    };
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, artifact);
+    state = resumeRecoveryState(ledger, authority, fingerprintFailure(durableFailure));
+    expect(state).toMatchObject({ status: "waiting-successor-approval", approvedPlanVersion: 2 });
+
+    const approval = {
+      ...artifact,
+      phase: "approved" as const,
+      approvalRef: "plan-versions/3/approval.json",
+      approvalHash: "f".repeat(64),
+    };
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, approval);
+    state = resumeRecoveryState(ledger, authority, fingerprintFailure(durableFailure));
+    expect(state).toMatchObject({ status: "ready-successor-activation", approvedPlanVersion: 2 });
+
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, {
+      ...approval,
+      phase: "activated",
+    });
+    state = resumeRecoveryState(ledger, authority, fingerprintFailure(durableFailure));
+    expect(state).toMatchObject({
+      status: "released",
+      approvedPlanVersion: 3,
+      approvedPlanHash: artifact.planHash,
+      successor: { status: "activated" },
+    });
+
+    expect(() => registerRecovery(ledger, authority, {
+      ...durableFailure,
+      attempt: 2,
+      artifactHashes: ["6".repeat(64)],
+    })).toThrow(/current approved plan/);
+
+    const repeated = {
+      ...durableFailure,
+      planVersion: 3,
+      planHash: artifact.planHash,
+      attempt: 2,
+      artifactHashes: ["7".repeat(64)],
+    };
+    ledger = registerRecovery(ledger, authority, repeated);
+    const repeatedState = resumeRecoveryState(ledger, authority, fingerprintFailure(repeated));
+    expect(repeatedState).toMatchObject({ consumed: ["replan"], remaining: { replan: 0 } });
+    ledger = applyRecoveryDecisionToLedger(ledger, authority, fingerprintFailure(repeated), {
+      ...structuralDirective,
+      failureFingerprint: fingerprintFailure(repeated),
+      diagnosisRef: "plan-versions/3/debug.json",
+      evidenceRefs: ["nodes/3/build-a/result.json"],
+    });
+    expect(resumeRecoveryState(ledger, authority, fingerprintFailure(repeated))).toMatchObject({
+      status: "failed",
+      consumed: ["replan"],
+      remaining: { replan: 0 },
+    });
+  });
+
+  it("lets only current-plan recovery records advance after authoritative activation", () => {
+    const competingFailure = {
+      ...durableFailure,
+      nodeId: "build-b",
+      failureLineageId: "lineage-build-b",
+      artifactHashes: [hashB],
+    };
+    const authorizationFailure = {
+      ...durableFailure,
+      nodeId: "ship-a",
+      failureLineageId: "lineage-ship-a",
+      category: "authorization" as const,
+      artifactHashes: ["9".repeat(64)],
+    };
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, durableFailure);
+    ledger = registerRecovery(ledger, authority, competingFailure);
+    ledger = registerRecovery(ledger, authority, authorizationFailure);
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(authorizationFailure),
+    );
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(durableFailure),
+      structuralDirective,
+    );
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(competingFailure),
+      {
+        ...structuralDirective,
+        failureFingerprint: fingerprintFailure(competingFailure),
+        evidenceRefs: ["nodes/2/build-b/result.json"],
+      },
+    );
+
+    const firstArtifact = {
+      version: 1 as const,
+      phase: "artifact-durable" as const,
+      failureFingerprint: fingerprintFailure(durableFailure),
+      sourcePlanVersion: 2,
+      targetPlanVersion: 3,
+      graphHash: "d".repeat(64),
+      planHash: "e".repeat(64),
+      graphRef: "plan-versions/3/graph.json",
+      planRef: "plan-versions/3/plan.md",
+    };
+    const secondArtifact = {
+      ...firstArtifact,
+      failureFingerprint: fingerprintFailure(competingFailure),
+      graphHash: "7".repeat(64),
+      planHash: "8".repeat(64),
+    };
+    const approve = <T extends typeof firstArtifact>(artifact: T) => ({
+      ...artifact,
+      phase: "approved" as const,
+      approvalHash: "f".repeat(64),
+      approvalRef: "plan-versions/3/approval.json",
+    });
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, firstArtifact);
+    expect(() => applyRecoverySuccessorEventToLedger(ledger, authority, secondArtifact))
+      .toThrow(/plan-versions\/3|namespace|reserved/);
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, approve(firstArtifact));
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, {
+      ...approve(firstArtifact),
+      phase: "activated",
+    });
+
+    expect(() => applyRecoveryReleaseToLedger(ledger, authority, {
+      version: 1,
+      failureFingerprint: fingerprintFailure(authorizationFailure),
+      reason: "authorization-granted",
+      evidenceRef: "plan-versions/2/recovery-authorization.json",
+      evidenceHash: "6".repeat(64),
+    })).toThrow(/current approved plan|stale source plan/);
+  });
+
+  it("binds the ledger to frozen authority, genesis, and its append-only hash chain", () => {
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, durableFailure);
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(durableFailure),
+      structuralDirective,
+    );
+    expect(validateRecoveryLedger(JSON.parse(JSON.stringify(ledger)), authority)).toEqual(ledger);
+    expect(() => validateRecoveryLedger(ledger, {
+      ...authority,
+      limits: { ...authority.limits, maxPlanVersions: 5 },
+    })).toThrow(/authority|genesis|limits/);
+    expect(() => validateRecoveryLedger(ledger, {
+      ...authority,
+      activePlanHash: "9".repeat(64),
+    })).toThrow(/authority|genesis|plan/i);
+    expect(() => registerRecovery(createRecoveryLedger(authority), authority, {
+      ...durableFailure,
+      planHash: "9".repeat(64),
+    })).toThrow(/planHash|approved ledger plan/);
+
+    const tampered = JSON.parse(JSON.stringify(ledger)) as typeof ledger;
+    tampered.records.reverse();
+    expect(() => validateRecoveryLedger(tampered, authority)).toThrow(/sequence|hash chain/);
+  });
+
+  it("rejects accessors, inherited records, sparse or augmented arrays, and budgets above one", () => {
+    let reads = 0;
+    const accessor = { ...durableFailure } as Record<string, unknown>;
+    Object.defineProperty(accessor, "nodeId", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return "build-a";
+      },
+    });
+    expect(() => validateFailureEvidence(accessor)).toThrow(/data propert|plain/);
+    expect(reads).toBe(0);
+    expect(() => validateFailureEvidence(Object.assign(Object.create(durableFailure), {})))
+      .toThrow(/plain/);
+    expect(() => validateFailureEvidence({ ...durableFailure, artifactHashes: Array(1) }))
+      .toThrow(/dense|array/);
+    const augmented = [hashA] as string[] & { map?: unknown };
+    Object.defineProperty(augmented, "map", { value: () => [] });
+    expect(() => validateFailureEvidence({ ...durableFailure, artifactHashes: augmented }))
+      .toThrow(/exact|array/);
+    expect(() => createRecoveryLedger({
+      ...authority,
+      limits: { ...authority.limits, budgets: { retry: 2, repair: 1, replan: 1 } },
+    })).toThrow(/0 or 1/);
+  });
+
+  it("uses portable repository semantics for repair scope", () => {
+    const localFailure = { ...durableFailure, category: "implementation-defect" as const };
+    const base = {
+      ...structuralDirective,
+      failureFingerprint: fingerprintFailure(localFailure),
+      rootCauseCategory: "implementation-defect" as const,
+      topologyAssessment: "preserve" as const,
+      repairScope: ["src/core/recovery.ts"],
+    };
+    expect(validateRecoveryDirective(base).repairScope).toEqual(["src/core/recovery.ts"]);
+    for (const path of ["C:/outside.ts", ".ai-orchestrator/state.json", "src/CON.txt", "src/file."]) {
+      expect(() => validateRecoveryDirective({ ...base, repairScope: [path] })).toThrow(/repairScope/);
     }
   });
 
-  it("rejects persisted history that skips the next ladder level", () => {
-    const failure = evidence("unknown");
-    const initialized = registerRecovery(createRecoveryLedger(), failure, {
-      remaining: { retry: 1, repair: 1, replan: 1 },
-      sourcePlanVersion: 1,
+  it("validates successor state artifact references against its exact target version", () => {
+    let ledger = registerRecovery(createRecoveryLedger(authority), authority, durableFailure);
+    ledger = applyRecoveryDecisionToLedger(
+      ledger,
+      authority,
+      fingerprintFailure(durableFailure),
+      structuralDirective,
+    );
+    ledger = applyRecoverySuccessorEventToLedger(ledger, authority, {
+      version: 1,
+      phase: "artifact-durable",
+      failureFingerprint: fingerprintFailure(durableFailure),
+      sourcePlanVersion: 2,
+      targetPlanVersion: 3,
+      graphHash: "d".repeat(64),
+      planHash: "e".repeat(64),
+      graphRef: "plan-versions/3/graph.json",
+      planRef: "plan-versions/3/plan.md",
     });
-    const initial = resumeRecoveryState(initialized, fingerprintFailure(failure));
-    const retriedLedger = applyRecoveryDecisionToLedger(
-      initialized,
-      classifyFailure(failure, initial, directive(failure, "timeout")),
-    );
-    const retried = resumeRecoveryState(retriedLedger, fingerprintFailure(failure));
-    const directReplan = classifyFailure(failure, stateFor(failure, retried.remaining, 1), directive(failure, "invalid-topology"));
-    const forgedDecision = {
-      ...directReplan,
-      remainingBefore: retried.remaining,
-      remainingAfter: { ...retried.remaining, replan: retried.remaining.replan - 1 },
-      sourcePlanVersion: retried.activePlanVersion,
-      targetPlanVersion: retried.activePlanVersion + 1,
-    };
-    const forgedState = {
-      ...retried,
-      consumed: ["retry", "replan"],
-      remaining: forgedDecision.remainingAfter,
-      activePlanVersion: forgedDecision.targetPlanVersion,
-    };
-    const tampered = JSON.parse(JSON.stringify(retriedLedger)) as {
-      entries: Array<{ transitions: Array<{ decision: unknown; state: unknown }> }>;
-    };
-    tampered.entries[0]!.transitions.push({ decision: forgedDecision, state: forgedState });
-
-    expect(() => validateRecoveryLedger(tampered)).toThrow("skip");
-  });
-
-  it("tracks multiple fingerprints independently within a hard entry bound", () => {
-    const first = evidence("timeout", { artifactHashes: [hashA] });
-    const second = evidence("timeout", { artifactHashes: [hashB] });
-    const third = evidence("timeout", { graphVersion: "lifecycle-v2" });
-    const options = { remaining: { retry: 1, repair: 1, replan: 1 }, sourcePlanVersion: 1 };
-    const ledger = registerRecovery(registerRecovery(createRecoveryLedger(2), first, options), second, options);
-
-    expect(ledger.entries.map((entry) => entry.fingerprint)).toEqual(
-      [fingerprintFailure(first), fingerprintFailure(second)].sort(),
-    );
-    expect(resumeRecoveryState(ledger, fingerprintFailure(first)).fingerprint).toBe(fingerprintFailure(first));
-    expect(resumeRecoveryState(ledger, fingerprintFailure(second)).fingerprint).toBe(fingerprintFailure(second));
-    expect(() => registerRecovery(ledger, third, options)).toThrow("entry limit");
+    const state = resumeRecoveryState(ledger, authority, fingerprintFailure(durableFailure));
+    expect(() => validateRecoveryState({
+      ...state,
+      successor: { ...state.successor, graphRef: "plan-versions/3/other.json" },
+    })).toThrow(/exact target plan version/);
   });
 });
