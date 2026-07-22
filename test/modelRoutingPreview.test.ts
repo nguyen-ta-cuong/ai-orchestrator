@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import modelRoutingPreviewExtension from "../extensions/modelRoutingPreview.js";
-import { createRun, readState, writeState } from "../src/lifecycle/artifacts.js";
+import { acquireRunLease, createRun, readState, releaseRunLease, writeState } from "../src/lifecycle/artifacts.js";
 
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 const tempDirs: string[] = [];
@@ -103,7 +103,9 @@ describe("/lifecycle-models", () => {
     state.modelSelections.push({
       stage: "build", provider: "custom", model: "maker", family: "maker", thinking: "high", reason: "test", selectedAt: new Date().toISOString(),
     });
-    writeState(run.paths, state);
+    const owner = acquireRunLease(run.paths, "preview-test-writer");
+    writeState(run.paths, state, { owner });
+    releaseRunLease(run.paths, owner);
 
     const commands = new Map<string, CommandHandler>();
     const pi = { registerCommand: vi.fn((name: string, command: { handler: CommandHandler }) => commands.set(name, command.handler)) };

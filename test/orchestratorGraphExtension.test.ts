@@ -16,4 +16,20 @@ describe("fast graph adapter", () => {
     expect(next.phase).toBe("judging");
     expect(trace).toHaveBeenCalledWith(expect.objectContaining({ nodeId: "coding", nextNodeId: "judging", engine }));
   });
+
+  it.each(["graph-shadow", "graph"] as const)("characterizes provider failure in %s", async (engine) => {
+    const state = createIdleState({ phase: "planning", task: "task" });
+    const trace = vi.fn();
+    const next = await applyWorkflowTransition({
+      definition: fastWorkflowGraph(), engine, state, event: { type: "provider_failed" },
+      reduce: (value, event) => nextPhase(value, event, config), ownsState: () => true, onTrace: trace,
+    });
+    expect(next.phase).toBe("failed");
+    expect(trace).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: "planning",
+      edge: "provider-failed",
+      nextNodeId: "failed",
+      engine,
+    }));
+  });
 });

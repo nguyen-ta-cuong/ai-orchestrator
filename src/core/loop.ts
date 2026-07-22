@@ -48,6 +48,7 @@ export type LoopEvent =
   | { type: "plan_rejected_by_user" }
   | { type: "code_produced" }
   | { type: "verdict"; verdict: Verdict; reasons?: string; requiredFixes?: string }
+  | { type: "provider_failed" }
   | { type: "cancelled" };
 
 export const DEFAULT_LOOP_CONFIG: LoopConfig = {
@@ -98,6 +99,7 @@ export function nextPhase(
   }
 
   if (event.type === "cancelled") {
+    if (state.phase === "done" || state.phase === "failed") return cloneState(state);
     return createIdleState({
       originalModel: state.originalModel ? { ...state.originalModel } : undefined,
     });
@@ -174,6 +176,14 @@ export function nextPhase(
       }
 
       next.phase = "coding";
+      return next;
+    }
+
+    case "provider_failed": {
+      if (next.phase !== "planning" && next.phase !== "replanning" && next.phase !== "judging") {
+        return next;
+      }
+      next.phase = "failed";
       return next;
     }
 

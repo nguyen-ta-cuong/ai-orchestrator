@@ -45,7 +45,7 @@ const SIDE_EFFECTS = new Set<SideEffectClass>(["none", "read", "write", "externa
 export function compileGraph(definition: GraphDefinition): CompiledGraph {
   validateDefinitionHeader(definition);
 
-  const nodes = definition.nodes.map(cloneAndValidateNode).sort((left, right) => left.id.localeCompare(right.id));
+  const nodes = definition.nodes.map(cloneAndValidateNode).sort((left, right) => compareCodeUnits(left.id, right.id));
   const mutableNodesById = new Map<string, Readonly<GraphNodeDefinition>>();
   for (const node of nodes) {
     if (mutableNodesById.has(node.id)) throw new Error(`Duplicate graph node id: ${node.id}`);
@@ -140,6 +140,12 @@ function cloneAndValidateNode(node: GraphNodeDefinition): Readonly<GraphNodeDefi
   }
   const inputContracts = validateContracts(node.inputContracts, node.id, "input");
   const outputContracts = validateContracts(node.outputContracts, node.id, "output");
+  if (node.terminal && outputContracts.length > 0) {
+    throw new Error(`Terminal node ${node.id} is a run-state marker and cannot declare output contracts`);
+  }
+  if (node.terminal && node.sideEffect !== "none") {
+    throw new Error(`Terminal node ${node.id} is a run-state marker and cannot perform side effects`);
+  }
   if ((node.sideEffect === "external" || node.sideEffect === "irreversible") && outputContracts.length === 0) {
     throw new Error(`High-impact node ${node.id} must declare an output contract`);
   }
@@ -163,6 +169,9 @@ function validateContracts(contracts: string[], nodeId: string, direction: strin
   const copy = contracts.map((contract) => {
     if (typeof contract !== "string" || contract.trim() === "") {
       throw new Error(`Node ${nodeId} has an empty ${direction} contract`);
+    }
+    if (contract.length > 128 || /[\u0000-\u001f\u007f]/.test(contract)) {
+      throw new Error(`Node ${nodeId} has an invalid ${direction} contract`);
     }
     return contract;
   });
@@ -285,11 +294,15 @@ function visitFrom(
 }
 
 function compareEdges(left: Readonly<GraphEdgeDefinition>, right: Readonly<GraphEdgeDefinition>): number {
-  return left.from.localeCompare(right.from)
-    || left.event.localeCompare(right.event)
-    || (left.guard ?? "").localeCompare(right.guard ?? "")
-    || left.to.localeCompare(right.to)
-    || (left.boundedBy ?? "").localeCompare(right.boundedBy ?? "");
+  return compareCodeUnits(left.from, right.from)
+    || compareCodeUnits(left.event, right.event)
+    || compareCodeUnits(left.guard ?? "", right.guard ?? "")
+    || compareCodeUnits(left.to, right.to)
+    || compareCodeUnits(left.boundedBy ?? "", right.boundedBy ?? "");
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function assertIdentifier(value: string, label: string): void {

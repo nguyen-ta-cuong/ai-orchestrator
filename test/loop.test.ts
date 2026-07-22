@@ -254,4 +254,19 @@ describe("nextPhase", () => {
       originalModel: { provider: "openai", id: "gpt-5", thinking: "medium" },
     });
   });
+
+  it("fails closed on a provider failure only from an active provider phase", () => {
+    const planning = planningState();
+    const judging = completeCoding(approvePlan());
+
+    expect(nextPhase(planning, { type: "provider_failed" }, config)).toMatchObject({ phase: "failed", task: planning.task });
+    expect(nextPhase(judging, { type: "provider_failed" }, config)).toMatchObject({
+      phase: "failed",
+      coderIterations: 1,
+      plan: judging.plan,
+    });
+
+    const coding = approvePlan();
+    expect(nextPhase(coding, { type: "provider_failed" }, config)).toEqual(coding);
+  });
 });

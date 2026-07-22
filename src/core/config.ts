@@ -14,6 +14,7 @@ import {
   type RoutingBudgets,
   type RoutingCircuitBreakers,
 } from "./routingBudget.js";
+import { DEFAULT_EXECUTION_LIMITS, type ExecutionLimits } from "./scheduler.js";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -54,6 +55,12 @@ export type ShipCommitMode = "ask" | "never" | "auto";
 export type ShipOpenPrMode = "ask" | "never";
 export type ExecutionEngine = "legacy" | "graph-shadow" | "graph";
 
+export interface ExecutionConfig {
+  engine: ExecutionEngine;
+  allowProjectGraph: boolean;
+  limits: ExecutionLimits;
+}
+
 export interface LifecycleRoutingConfig {
   enabled: boolean;
   stages: Record<LifecycleRoutedStage, ModelCandidate[]>;
@@ -74,11 +81,14 @@ export interface RoutingEvidenceConfig {
   minRecommendationSamples: number;
 }
 
+export interface McpRunStorageConfig {
+  userStoreDir: string;
+  projectMirror: boolean;
+  terminalRetentionDays: number;
+}
+
 export interface OrchestratorConfig {
-  execution: {
-    engine: ExecutionEngine;
-    allowProjectGraph: boolean;
-  };
+  execution: ExecutionConfig;
   roles: Record<RoleName, RoleConfig>;
   loop: {
     maxCoderIterations: number;
@@ -106,11 +116,18 @@ export interface OrchestratorConfig {
   mcp: {
     providers: Record<string, ProviderConfig>;
     models: McpModelConfig[];
+    runs: McpRunStorageConfig;
   };
 }
 
+type ExecutionConfigPatch = Partial<Omit<ExecutionConfig, "limits">> & {
+  limits?: Partial<Omit<ExecutionLimits, "backEdgeBudgets">> & {
+    backEdgeBudgets?: Record<string, number>;
+  };
+};
+
 type ConfigPatch = Partial<{
-  execution: Partial<OrchestratorConfig["execution"]>;
+  execution: ExecutionConfigPatch;
   roles: Partial<Record<keyof OrchestratorConfig["roles"], Partial<RoleConfig>>>;
   loop: Partial<OrchestratorConfig["loop"]>;
   approval: Partial<OrchestratorConfig["approval"]>;
@@ -129,7 +146,11 @@ type ConfigPatch = Partial<{
     stages?: Partial<Record<RoutingStage, Partial<StageRoutingPolicy>>>;
   };
   ship: Partial<OrchestratorConfig["ship"]>;
-  mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>>; models: McpModelConfig[] }>;
+  mcp: Partial<{
+    providers: Record<string, Partial<ProviderConfig>>;
+    models: McpModelConfig[];
+    runs: Partial<McpRunStorageConfig>;
+  }>;
 }>;
 
 export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
@@ -140,6 +161,33 @@ const CAPABILITY_NAMES = [
   "requirements", "architecture", "coding", "debugging", "verification", "review", "release",
   "structuredOutput", "longContext", "speed", "economy",
 ] as const;
+const POSITIVE_EXECUTION_LIMIT_KEYS = [
+  "maxGraphSteps",
+  "maxNodeAttempts",
+  "maxPlanVersions",
+  "maxGraphNodes",
+  "maxGraphEdges",
+  "maxReadyWidth",
+  "maxConcurrency",
+  "maxModelConcurrency",
+  "maxProviderConcurrency",
+  "maxWallTimeMs",
+  "maxInputTokens",
+  "maxOutputTokens",
+  "maxSideEffectAttempts",
+  "maxHumanWaitMs",
+  "maxNoProgressRepeats",
+] as const satisfies readonly (keyof ExecutionLimits)[];
+const NON_NEGATIVE_EXECUTION_LIMIT_KEYS = [
+  "maxEstimatedCostUsd",
+  "maxObservedCostUsd",
+] as const satisfies readonly (keyof ExecutionLimits)[];
+const EXECUTION_LIMIT_KEYS = new Set<string>([
+  ...POSITIVE_EXECUTION_LIMIT_KEYS,
+  ...NON_NEGATIVE_EXECUTION_LIMIT_KEYS,
+  "humanWait",
+  "backEdgeBudgets",
+]);
 const FABLE: ModelCandidate = { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" };
 const GPT_56_SOL: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "xhigh" };
 const GPT_56_TERRA: ModelCandidate = { provider: "openai-codex", model: "gpt-5.6-terra", thinking: "xhigh" };
@@ -153,6 +201,10 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   execution: {
     engine: "graph-shadow",
     allowProjectGraph: false,
+    limits: {
+      ...DEFAULT_EXECUTION_LIMITS,
+      backEdgeBudgets: { ...DEFAULT_EXECUTION_LIMITS.backEdgeBudgets },
+    },
   },
   roles: {
     planner: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
@@ -210,6 +262,11 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   mcp: {
     models: [],
+    runs: {
+      userStoreDir: "mcp-runs",
+      projectMirror: false,
+      terminalRetentionDays: 30,
+    },
     providers: {
       anthropic: {
         baseUrl: "https://api.anthropic.com/v1",
@@ -268,11 +325,14 @@ export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions
   const projectConfig = readJsonIfPresent(projectPath);
   const userMerged = deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders));
   validateConfig(cloneConfig(userMerged));
-  const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
+  const projectPatch = options.ignoreProjectMcpProviders && !options.ignoreMcpProviders
+    ? sanitizeProjectMcpPatch(projectConfig)
+    : sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders);
   validateConfig(deepMerge(cloneConfig(userMerged), cloneConfig(projectPatch)));
   constrainProjectExecutionSafetyPatch(projectPatch, userMerged);
   if (options.ignoreProjectMcpProviders) {
     constrainProjectMcpRoles(projectPatch);
+    constrainProjectMcpRunPatch(projectPatch, userMerged.mcp.runs);
     if (projectPatch.routing) constrainProjectMcpRoutingPatch(projectPatch.routing);
   }
   const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing, userConfig.routing));
@@ -306,6 +366,14 @@ export function loopConfigFrom(config: OrchestratorConfig): {
     maxCoderIterations: config.loop.maxCoderIterations,
     plannerEscalationAfterRejections: config.loop.plannerEscalationAfterRejections,
     requirePlanApproval: config.approval.requirePlanApproval,
+  };
+}
+
+export function executionLimitsFrom(config: OrchestratorConfig): ExecutionLimits {
+  validateExecutionLimits(config.execution.limits);
+  return {
+    ...config.execution.limits,
+    backEdgeBudgets: { ...config.execution.limits.backEdgeBudgets },
   };
 }
 
@@ -367,6 +435,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
   const ship = requirePlainObject(config.ship, "ship");
   const mcp = requirePlainObject(config.mcp, "mcp");
   const providers = requirePlainObject(mcp.providers, "mcp.providers");
+  const mcpRuns = requirePlainObject(mcp.runs, "mcp.runs");
   if (!Array.isArray(mcp.models)) throw new Error("mcp.models must be an array");
 
   for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "debugger", "shipper"] as const) {
@@ -375,6 +444,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
 
   requireStringEnum(execution.engine, "execution.engine", ["legacy", "graph-shadow", "graph"] as const);
   requireBoolean(execution.allowProjectGraph, "execution.allowProjectGraph");
+  validateExecutionLimits(execution.limits);
 
   requireBoolean(lifecycleRouting.enabled, "routing.lifecycle.enabled");
   for (const stage of ["define", "plan", "verify", "review", "debug", "ship"] as const) {
@@ -395,6 +465,10 @@ function validateConfig(value: unknown): OrchestratorConfig {
   requireStringEnum(ship.commit, "ship.commit", ["ask", "never", "auto"] as const);
   requireStringEnum(ship.openPr, "ship.openPr", ["ask", "never"] as const);
 
+  requireUserStoreRelativePath(mcpRuns.userStoreDir, "mcp.runs.userStoreDir");
+  requireBoolean(mcpRuns.projectMirror, "mcp.runs.projectMirror");
+  requirePositiveInteger(mcpRuns.terminalRetentionDays, "mcp.runs.terminalRetentionDays");
+
   for (const [index, value] of mcp.models.entries()) validateMcpModel(value, `mcp.models[${index}]`);
   const identities = (mcp.models as McpModelConfig[]).map((model) => `${model.provider}/${model.model}`);
   if (new Set(identities).size !== identities.length) throw new Error("mcp.models must not contain duplicate provider/model identities");
@@ -414,6 +488,28 @@ function validateConfig(value: unknown): OrchestratorConfig {
   }
 
   return config as unknown as OrchestratorConfig;
+}
+
+function validateExecutionLimits(value: unknown): void {
+  const limits = requirePlainObject(value, "execution.limits");
+  for (const key of Object.keys(limits)) {
+    if (!EXECUTION_LIMIT_KEYS.has(key)) throw new Error(`execution.limits.${key} is not recognized`);
+  }
+  for (const key of POSITIVE_EXECUTION_LIMIT_KEYS) {
+    requirePositiveInteger(limits[key], `execution.limits.${key}`);
+  }
+  for (const key of NON_NEGATIVE_EXECUTION_LIMIT_KEYS) {
+    requireNonNegativeNumber(limits[key], `execution.limits.${key}`);
+  }
+  requireStringEnum(limits.humanWait, "execution.limits.humanWait", ["allow", "deny"] as const);
+  const backEdgeBudgets = requirePlainObject(limits.backEdgeBudgets, "execution.limits.backEdgeBudgets");
+  if (!Object.hasOwn(backEdgeBudgets, "run-transition-budget")) {
+    throw new Error("execution.limits.backEdgeBudgets.run-transition-budget must be configured");
+  }
+  for (const [name, budget] of Object.entries(backEdgeBudgets)) {
+    requireMetadataToken(name, "execution.limits.backEdgeBudgets key");
+    requirePositiveInteger(budget, `execution.limits.backEdgeBudgets.${name}`);
+  }
 }
 
 function validateCapabilityRouting(routing: Record<string, unknown>): void {
@@ -659,8 +755,8 @@ function requireUserStoreRelativePath(value: unknown, path: string): void {
   if (isAbsolute(text) || text.startsWith("/") || text.startsWith("\\") || /^[A-Za-z]:/.test(text)) {
     throw new Error(`${path} must be a relative path inside the user ai-orchestrator directory`);
   }
-  for (const part of text.split(/[\\/]+/)) {
-    if (part === ".." || /[\u0000-\u001f\u007f]/.test(part)) {
+  for (const part of text.split(/[\\/]/)) {
+    if (part.length === 0 || part === "." || part === ".." || /[\u0000-\u001f\u007f]/.test(part)) {
       throw new Error(`${path} must be a relative path inside the user ai-orchestrator directory`);
     }
   }
@@ -672,12 +768,33 @@ function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): 
   return rest;
 }
 
+function sanitizeProjectMcpPatch(patch: ConfigPatch): ConfigPatch {
+  const next = cloneConfig(patch);
+  if (next.mcp === undefined) return next;
+  if (!isPlainObject(next.mcp)) {
+    delete next.mcp;
+    return next;
+  }
+
+  const rawRuns = isPlainObject(next.mcp.runs) ? next.mcp.runs : undefined;
+  const runs: Partial<McpRunStorageConfig> = {};
+  if (rawRuns && Object.hasOwn(rawRuns, "projectMirror")) {
+    runs.projectMirror = cloneConfig(rawRuns.projectMirror) as boolean;
+  }
+  if (rawRuns && Object.hasOwn(rawRuns, "terminalRetentionDays")) {
+    runs.terminalRetentionDays = cloneConfig(rawRuns.terminalRetentionDays) as number;
+  }
+  next.mcp = Object.keys(runs).length > 0 ? { runs } : {};
+  return next;
+}
+
 function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: OrchestratorConfig): void {
   if (patch.execution) {
     if (patch.execution.engine === "graph" && !trusted.execution.allowProjectGraph) {
       patch.execution.engine = "graph-shadow";
     }
     patch.execution.allowProjectGraph = trusted.execution.allowProjectGraph;
+    constrainProjectExecutionLimits(patch.execution, trusted.execution.limits);
   }
   if (patch.approval) {
     patch.approval.requirePlanApproval = protectedBoolean(
@@ -707,6 +824,25 @@ function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: Orche
   }
 }
 
+function constrainProjectExecutionLimits(patch: ExecutionConfigPatch, trusted: ExecutionLimits): void {
+  if (patch.limits === undefined || !isPlainObject(patch.limits)) return;
+  const limits = patch.limits as Record<string, unknown>;
+  for (const key of [...POSITIVE_EXECUTION_LIMIT_KEYS, ...NON_NEGATIVE_EXECUTION_LIMIT_KEYS]) {
+    limits[key] = protectedMinimum(trusted[key], limits[key]);
+  }
+  limits.humanWait = stricterMode(trusted.humanWait, limits.humanWait, ["deny", "allow"] as const);
+
+  if (limits.backEdgeBudgets === undefined || !isPlainObject(limits.backEdgeBudgets)) return;
+  const requested = limits.backEdgeBudgets;
+  const constrained: Record<string, number> = {};
+  for (const [name, trustedBudget] of Object.entries(trusted.backEdgeBudgets)) {
+    if (Object.hasOwn(requested, name)) {
+      constrained[name] = protectedMinimum(trustedBudget, requested[name]) as number;
+    }
+  }
+  limits.backEdgeBudgets = constrained;
+}
+
 function constrainProjectMcpRoles(patch: ConfigPatch): void {
   // Repository config is not trusted to select models that receive user
   // credentials. MCP planner/judge exact routes therefore come only from
@@ -715,6 +851,17 @@ function constrainProjectMcpRoles(patch: ConfigPatch): void {
   if (!patch.roles) return;
   delete patch.roles.planner;
   delete patch.roles.judge;
+}
+
+function constrainProjectMcpRunPatch(patch: ConfigPatch, trusted: McpRunStorageConfig): void {
+  const runs = patch.mcp?.runs;
+  if (!runs) return;
+  runs.userStoreDir = trusted.userStoreDir;
+  runs.projectMirror = protectedPermission(trusted.projectMirror, runs.projectMirror) as boolean;
+  runs.terminalRetentionDays = protectedMinimum(
+    trusted.terminalRetentionDays,
+    runs.terminalRetentionDays,
+  ) as number;
 }
 
 function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routing"]>): void {

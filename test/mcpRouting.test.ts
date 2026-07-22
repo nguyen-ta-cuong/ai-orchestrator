@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG, type OrchestratorConfig } from "../src/core/config.js";
 import { defaultTaskFeatures, mergeTaskFeatures, metadataFor, resolveMcpRoute } from "../mcp/routing.js";
+import { freezeRoutingDecision } from "../mcp/llm.js";
 
 function routedConfig(): OrchestratorConfig {
   const config = structuredClone(DEFAULT_CONFIG);
@@ -24,6 +25,28 @@ function routedConfig(): OrchestratorConfig {
 }
 
 describe("MCP capability routing", () => {
+  it("uses locale-independent code-unit ordering for non-ASCII routing authority keys", () => {
+    const config = routedConfig();
+    const profile = config.routing.profiles["p1/maker"]!;
+    config.routing.profiles = {
+      "z/model": structuredClone(profile),
+      "ä/model": structuredClone(profile),
+    };
+    config.mcp.providers = {
+      z: { baseUrl: "https://z.example/v1", api: "openai-responses", apiKey: "secret-z" },
+      ä: { baseUrl: "https://unicode.example/v1", api: "openai-responses", apiKey: "secret-unicode" },
+    };
+    const decision = freezeRoutingDecision(config, [{
+      provider: "z",
+      model: "model",
+      family: "family-z",
+      thinking: "high",
+    }], config.routing.version, "unicode-order");
+
+    expect(decision.policyDigest).toBe("21ac3b5c98d8eb1dfb8e550ffe5d398c35b8f9e00581258a016467d40dd6b9fa");
+    expect(decision.configDigest).toBe("a593c693d07a4f343b34d042c3d184f452bd1f070e9f1d9d1428772697ef3db8");
+  });
+
   it("normalizes the trusted catalog through shared rankModels and filters unsupported provider APIs", () => {
     const route = resolveMcpRoute({ config: routedConfig(), stage: "plan", role: "planner", task: defaultTaskFeatures("plan a feature") });
     expect(route.candidates.map((candidate) => `${candidate.provider}/${candidate.model}`)).toEqual(["p1/maker", "p2/checker"]);

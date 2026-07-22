@@ -78,7 +78,10 @@ describe("fastWorkflowGraph", () => {
       { type: "verdict", verdict: "reject" },
       "build-cap-exhausted",
     );
-    for (const phase of ["planning", "awaiting_approval", "coding", "judging", "replanning", "done", "failed"] as const) {
+    for (const phase of ["planning", "replanning", "judging"] as const) {
+      record(fastState(phase), { type: "provider_failed" }, "provider-failed");
+    }
+    for (const phase of ["planning", "awaiting_approval", "coding", "judging", "replanning"] as const) {
       record(fastState(phase), { type: "cancelled" }, "run-cancelled");
     }
 
@@ -93,14 +96,15 @@ describe("fastWorkflowGraph", () => {
       { type: "plan_rejected_by_user" },
       { type: "code_produced" },
       { type: "verdict", verdict: "approve" },
+      { type: "provider_failed" },
     ];
     const allowed: Record<Phase, Set<LoopEvent["type"]>> = {
       idle: new Set(["start"]),
-      planning: new Set(["plan_produced"]),
+      planning: new Set(["plan_produced", "provider_failed"]),
       awaiting_approval: new Set(["plan_approved", "plan_rejected_by_user"]),
       coding: new Set(["code_produced"]),
-      judging: new Set(["verdict"]),
-      replanning: new Set(["plan_produced"]),
+      judging: new Set(["verdict", "provider_failed"]),
+      replanning: new Set(["plan_produced", "provider_failed"]),
       done: new Set(["start"]),
       failed: new Set(["start"]),
     };
@@ -174,7 +178,7 @@ describe("lifecycleWorkflowGraph", () => {
     record(lifecycleState("awaiting_ship_approval"), { type: "ship_confirmed" }, "human-approved");
     record(lifecycleState("awaiting_ship_approval"), { type: "ship_declined" }, "human-declined");
     record(lifecycleState("finalizing"), { type: "finalize_complete" }, undefined);
-    for (const phase of lifecycleActiveAndTerminalPhases) {
+    for (const phase of lifecycleActiveAndTerminalPhases.filter((phase) => phase !== "done" && phase !== "failed")) {
       record(lifecycleState(phase), { type: "cancelled" }, "run-cancelled");
     }
 
