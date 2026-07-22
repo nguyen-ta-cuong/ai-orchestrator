@@ -23,10 +23,13 @@ import {
   assertGraphEventValid,
   assertScheduleValid,
   createGraphExecutionState,
+  evaluateExecutionGuard,
   graphDefinitionDigest,
   graphEventDigest,
+  migrateLegacyNodePlanVersions,
   schedulerMetadataFingerprint,
   type ArtifactReference,
+  type GraphCheckpointRef,
   type GraphEvent,
   type GraphExecutionState,
   type SchedulerMetadata,
@@ -38,11 +41,23 @@ export interface GraphCheckpointPaths {
   graph: string;
   events: string;
   nodes: string;
+  mutations: string;
   executionLease: string;
 }
 
-export interface CheckpointMutationOptions {
+export interface GraphCheckpointLease {
   owner: string;
+  nonce: string;
+  pid: number;
+  createdAt: string;
+  dev: number | bigint;
+  ino: number | bigint;
+}
+
+export interface CheckpointMutationOptions {
+  owner: Readonly<GraphCheckpointLease>;
+  /** Deterministic race-injection hook; production callers leave this unset. */
+  beforeAppend?(): void;
 }
 
 export type CheckpointFailurePoint =
@@ -91,14 +106,7 @@ export const MAX_NODE_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const SHA256 = /^[a-f0-9]{64}$/;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 
-interface LeaseRecord {
-  owner: string;
-  nonce: string;
-  pid: number;
-  createdAt: string;
-  dev: number | bigint;
-  ino: number | bigint;
-}
+type LeaseRecord = GraphCheckpointLease;
 
 export function createGraphCheckpointPaths(root: string): GraphCheckpointPaths {
   const requestedRoot = resolve(root);
@@ -112,6 +120,7 @@ export function createGraphCheckpointPaths(root: string): GraphCheckpointPaths {
     graph: join(absoluteRoot, "graph.json"),
     events: join(absoluteRoot, "events.jsonl"),
     nodes: join(absoluteRoot, "nodes"),
+    mutations: join(absoluteRoot, "mutations"),
     executionLease: join(absoluteRoot, "execution.lock"),
   };
 }
@@ -123,6 +132,7 @@ export function assertGraphCheckpointPathsSafe(paths: GraphCheckpointPaths): voi
     graph: join(root, "graph.json"),
     events: join(root, "events.jsonl"),
     nodes: join(root, "nodes"),
+    mutations: join(root, "mutations"),
     executionLease: join(root, "execution.lock"),
   };
   for (const [field, target] of Object.entries(expected) as [keyof typeof expected, string][]) {
@@ -138,7 +148,7 @@ export function acquireGraphCheckpointLease(
   paths: GraphCheckpointPaths,
   owner: string,
   options: LeaseOptions,
-): void {
+): GraphCheckpointLease {
   assertOwnerToken(owner);
   assertIsoTimestamp(options.now, "lease timestamp");
   assertPositiveInteger(options.pid, "lease pid");
@@ -152,12 +162,19 @@ export function acquireGraphCheckpointLease(
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       writeExclusiveAndSync(paths.executionLease, record);
-      return;
+      const acquired = readLease(paths.executionLease);
+      if (!acquired || acquired.owner !== owner || acquired.nonce !== nonce) {
+        throw new Error("Graph checkpoint lease generation changed during acquisition");
+      }
+      return acquired;
     } catch (error) {
       if (!isNodeErrorWithCode(error, "EEXIST")) throw error;
       const existing = readLease(paths.executionLease);
       if (!existing) throw new Error("Graph checkpoint execution lease is corrupt; explicit recovery is required");
-      if (existing.owner === owner) return;
+      if (existing.owner === owner) {
+        if (existing.nonce === nonce && existing.pid === options.pid) return existing;
+        throw new Error(`Graph checkpoint is already executing under a different lease generation for owner ${owner}`);
+      }
       if (isAlive(existing.pid)) throw new Error(`Graph checkpoint is already executing under lease owner ${existing.owner}`);
       options.beforeStaleLeaseRemove?.();
       if (!removeLeaseIfUnchanged(paths.executionLease, existing, "reclaim")) continue;
@@ -166,23 +183,24 @@ export function acquireGraphCheckpointLease(
   throw new Error("Graph checkpoint execution lease could not be acquired");
 }
 
-export function ownsGraphCheckpointLease(paths: GraphCheckpointPaths, owner: string): boolean {
-  assertOwnerToken(owner);
+export function ownsGraphCheckpointLease(paths: GraphCheckpointPaths, lease: Readonly<GraphCheckpointLease>): boolean {
+  assertLeaseHandle(lease);
   assertGraphCheckpointPathsSafe(paths);
-  return readLease(paths.executionLease)?.owner === owner;
+  const current = readLease(paths.executionLease);
+  return Boolean(current && sameLeaseIdentity(current, lease));
 }
 
 export function releaseGraphCheckpointLease(
   paths: GraphCheckpointPaths,
-  owner: string,
+  lease: Readonly<GraphCheckpointLease>,
   options: LeaseReleaseOptions = {},
 ): boolean {
-  assertOwnerToken(owner);
+  assertLeaseHandle(lease);
   assertGraphCheckpointPathsSafe(paths);
-  const lease = readLease(paths.executionLease);
-  if (!lease || lease.owner !== owner) return false;
+  const current = readLease(paths.executionLease);
+  if (!current || !sameLeaseIdentity(current, lease)) return false;
   options.beforeLeaseRemove?.();
-  return removeLeaseIfUnchanged(paths.executionLease, lease, "release");
+  return removeLeaseIfUnchanged(paths.executionLease, current, "release");
 }
 
 export function writeImmutableGraphCheckpoint(
@@ -233,15 +251,16 @@ export function readImmutableGraphCheckpoint(paths: GraphCheckpointPaths): Immut
     throw new Error(`Immutable graph checkpoint definition is invalid: ${errorMessage(error)}`);
   }
   const schedulerMetadata = record.schedulerMetadata as SchedulerMetadata;
-  const genesisState = record.genesisState as GraphExecutionState;
+  const rawGenesisState = record.genesisState as GraphExecutionState;
   const graphDigest = graphDefinitionDigest(graph);
   const metadataFingerprint = schedulerMetadataFingerprint(schedulerMetadata);
   if (record.graphDigest !== graphDigest || record.metadataFingerprint !== metadataFingerprint) {
     throw new Error("Immutable graph checkpoint digest validation failed");
   }
+  if (record.genesisHash !== graphSnapshotDigest(rawGenesisState)) throw new Error("Immutable graph checkpoint genesis hash is invalid");
+  const genesisState = migrateLegacyNodePlanVersions(rawGenesisState);
   assertGenesisState(graph, schedulerMetadata, genesisState, record.runId);
-  if (record.genesisHash !== graphSnapshotDigest(genesisState)) throw new Error("Immutable graph checkpoint genesis hash is invalid");
-  const canonical = `${canonicalJson(immutableGraphRecord(graph, schedulerMetadata, genesisState))}\n`;
+  const canonical = `${canonicalJson(record)}\n`;
   if (canonical !== bytes) throw new Error("Immutable graph checkpoint bytes are not canonical");
   return {
     schemaVersion: 1,
@@ -259,7 +278,7 @@ export function readImmutableGraphCheckpoint(paths: GraphCheckpointPaths): Immut
 export function writeNodeArtifact(
   paths: GraphCheckpointPaths,
   input: {
-    owner: string;
+    owner: Readonly<GraphCheckpointLease>;
     planVersion: number;
     nodeId: string;
     contract: string;
@@ -307,6 +326,42 @@ export function readNodeArtifact(paths: GraphCheckpointPaths, reference: Readonl
   return bytes;
 }
 
+export function writeGraphMutationArtifact(
+  paths: GraphCheckpointPaths,
+  input: { owner: Readonly<GraphCheckpointLease>; mutationId: string; bytes: Uint8Array },
+): GraphCheckpointRef {
+  assertCheckpointOwner(paths, input.owner);
+  if (!SHA256.test(input.mutationId)) throw new Error("Mutation id must be a flat SHA-256 token");
+  if (input.bytes.byteLength > MAX_NODE_ARTIFACT_BYTES) throw new Error("Graph mutation artifact exceeds its size limit");
+  const bytes = Buffer.from(input.bytes);
+  const digest = sha256(bytes);
+  const relativePath = `mutations/${input.mutationId}.json`;
+  const target = checkpointRelativePath(paths, relativePath);
+  ensureDirectoryDurable(dirname(target));
+  assertGraphCheckpointPathsSafe(paths);
+  assertNoSymlinkComponents(target);
+  if (existsSync(target)) {
+    const existing = readFileBounded(target, MAX_NODE_ARTIFACT_BYTES, "graph mutation artifact");
+    if (!existing.equals(bytes)) throw new Error("Refusing to mutate an existing immutable graph mutation artifact");
+  } else {
+    publishImmutableAndSync(target, bytes, MAX_NODE_ARTIFACT_BYTES, "graph mutation artifact");
+  }
+  return { path: relativePath, sha256: digest, sizeBytes: bytes.byteLength };
+}
+
+export function readGraphMutationArtifact(
+  paths: GraphCheckpointPaths,
+  reference: Readonly<GraphCheckpointRef>,
+): Buffer {
+  assertGraphCheckpointPathsSafe(paths);
+  assertGraphCheckpointRef(reference);
+  const target = checkpointRelativePath(paths, reference.path);
+  const bytes = readFileBounded(target, MAX_NODE_ARTIFACT_BYTES, "graph mutation artifact");
+  if (bytes.byteLength !== reference.sizeBytes) throw new Error("Graph mutation artifact size does not match its reference");
+  if (sha256(bytes) !== reference.sha256) throw new Error("Graph mutation artifact SHA-256 does not match its reference");
+  return bytes;
+}
+
 export function appendGraphEvent(
   paths: GraphCheckpointPaths,
   event: Readonly<GraphEvent>,
@@ -316,7 +371,11 @@ export function appendGraphEvent(
   assertGraphEventValid(event);
   const checkpoint = readImmutableGraphCheckpoint(paths);
   assertEventMatchesCheckpoint(checkpoint, event);
-  const existing = readGraphEvents(paths);
+  if (event.checkpointRef) readGraphMutationArtifact(paths, event.checkpointRef);
+  if (event.activationRef) readNodeArtifact(paths, event.activationRef);
+  verifyEventArtifacts(paths, event);
+  const log = readGraphEventLog(paths);
+  const existing = log.events;
   if (event.sequence <= existing.length) {
     const prior = existing[event.sequence - 1];
     if (prior && prior.eventId === event.eventId && graphEventDigest(prior) === graphEventDigest(event)) return;
@@ -336,14 +395,27 @@ export function appendGraphEvent(
   const line = `${canonicalJson(event)}\n`;
   const lineBytes = Buffer.byteLength(line);
   if (lineBytes > MAX_GRAPH_EVENT_BYTES) throw new Error("Graph event record exceeds its record limit");
-  appendAndSync(paths.events, line, MAX_GRAPH_EVENT_LOG_BYTES);
+  options.beforeAppend?.();
+  appendAndSync(paths, line, MAX_GRAPH_EVENT_LOG_BYTES, options.owner, log);
 }
 
 export function readGraphEvents(paths: GraphCheckpointPaths): GraphEvent[] {
+  return readGraphEventLog(paths).events;
+}
+
+interface GraphEventLogRead {
+  events: GraphEvent[];
+  bytes: Buffer;
+  dev?: number | bigint;
+  ino?: number | bigint;
+}
+
+function readGraphEventLog(paths: GraphCheckpointPaths): GraphEventLogRead {
   assertGraphCheckpointPathsSafe(paths);
-  if (!existsSync(paths.events)) return [];
-  const bytes = readFileBounded(paths.events, MAX_GRAPH_EVENT_LOG_BYTES, "graph event log");
-  if (bytes.byteLength === 0) return [];
+  if (!existsSync(paths.events)) return { events: [], bytes: Buffer.alloc(0) };
+  const read = readFileBoundedWithIdentity(paths.events, MAX_GRAPH_EVENT_LOG_BYTES, "graph event log");
+  const bytes = read.bytes;
+  if (bytes.byteLength === 0) return { events: [], bytes, dev: read.dev, ino: read.ino };
   const checkpoint = readImmutableGraphCheckpoint(paths);
   const text = bytes.toString("utf8");
   if (!text.endsWith("\n")) throw new Error("Graph event log has a partial final record; explicit recovery is required");
@@ -365,6 +437,9 @@ export function readGraphEvents(paths: GraphCheckpointPaths): GraphEvent[] {
     if (eventIds.has(parsed.eventId)) throw new Error(`Graph event log contains duplicate event id ${parsed.eventId}`);
     eventIds.add(parsed.eventId);
     assertEventMatchesCheckpoint(checkpoint, parsed);
+    if (parsed.checkpointRef) readGraphMutationArtifact(paths, parsed.checkpointRef);
+    if (parsed.activationRef) readNodeArtifact(paths, parsed.activationRef);
+    verifyEventArtifacts(paths, parsed);
     if (events.length > 0) {
       assertSameRunIdentity(events[0]!, parsed);
       if (Date.parse(parsed.timestamp) < Date.parse(events.at(-1)!.timestamp)) {
@@ -376,7 +451,14 @@ export function readGraphEvents(paths: GraphCheckpointPaths): GraphEvent[] {
     events.push(parsed);
   }
   replayFromGenesis(checkpoint, events);
-  return events;
+  return { events, bytes, dev: read.dev, ino: read.ino };
+}
+
+function verifyEventArtifacts(paths: GraphCheckpointPaths, event: Readonly<GraphEvent>): void {
+  for (const reference of event.artifactRefs) readNodeArtifact(paths, reference);
+  if (event.sideEffect?.phase === "result" && event.sideEffect.outcome === "succeeded" && event.sideEffect.resultRef) {
+    readNodeArtifact(paths, event.sideEffect.resultRef);
+  }
 }
 
 export function writeGraphSnapshot(
@@ -393,9 +475,9 @@ export function writeGraphSnapshot(
   const bytes = `${canonicalJson(state)}\n`;
   if (Buffer.byteLength(bytes) > MAX_GRAPH_SNAPSHOT_BYTES) throw new Error("Graph snapshot exceeds its size limit");
   if (existsSync(paths.state)) {
+    const currentDiskBytes = readFileBounded(paths.state, MAX_GRAPH_SNAPSHOT_BYTES, "graph snapshot").toString("utf8");
     const current = readGraphSnapshot(paths, graph);
-    const currentBytes = `${canonicalJson(current)}\n`;
-    if (currentBytes === bytes) return;
+    if (currentDiskBytes === bytes) return;
     if (options.expectedRevision === undefined) throw new Error("Graph snapshot overwrite requires an expected revision");
     if (options.expectedSnapshotHash === undefined || !SHA256.test(options.expectedSnapshotHash)) {
       throw new Error("Graph snapshot overwrite requires an expected snapshot hash");
@@ -443,7 +525,7 @@ export function replayGraphEvents(
   graph: CompiledGraph,
   snapshot: Readonly<GraphExecutionState>,
   events: readonly Readonly<GraphEvent>[],
-  genesis?: Readonly<GraphExecutionState>,
+  genesis: Readonly<GraphExecutionState>,
 ): GraphExecutionState {
   assertScheduleValid(graph, snapshot);
   assertEventArray(events);
@@ -454,13 +536,11 @@ export function replayGraphEvents(
       throw new Error("Graph snapshot event tail does not match the event log");
     }
   }
-  if (genesis) {
-    assertScheduleValid(graph, genesis);
-    if (genesis.lastAppliedEventSequence !== 0) throw new Error("Graph replay genesis must be at event sequence zero");
-    let expected = cloneJson(genesis);
-    for (const event of events.slice(0, snapshot.lastAppliedEventSequence)) expected = applySchedulerEvent(graph, expected, event);
-    if (canonicalJson(expected) !== canonicalJson(snapshot)) throw new Error("Graph snapshot does not match full replay from immutable genesis");
-  }
+  assertScheduleValid(graph, genesis);
+  if (genesis.lastAppliedEventSequence !== 0) throw new Error("Graph replay genesis must be at event sequence zero");
+  let expected = cloneJson(genesis);
+  for (const event of events.slice(0, snapshot.lastAppliedEventSequence)) expected = applySchedulerEvent(graph, expected, event);
+  if (canonicalJson(expected) !== canonicalJson(snapshot)) throw new Error("Graph snapshot does not match full replay from immutable genesis");
   let state = cloneJson(snapshot);
   for (const event of events.slice(snapshot.lastAppliedEventSequence)) state = applySchedulerEvent(graph, state, event);
   return state;
@@ -475,7 +555,7 @@ export function checkpointGraphEvent(input: {
   paths: GraphCheckpointPaths;
   state: Readonly<GraphExecutionState>;
   event: Readonly<GraphEvent>;
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
   tempId: string;
   failAt?(point: CheckpointFailurePoint): void;
 }): GraphExecutionState {
@@ -495,6 +575,64 @@ export function checkpointGraphEvent(input: {
     failAt: input.failAt,
   });
   return next;
+}
+
+/**
+ * Durably reserves the next scheduler artifact namespace before any re-plan
+ * provider spend. This does not approve or replace a business-level plan.
+ */
+export function checkpointPlanVersionReservation(input: {
+  graph: CompiledGraph;
+  paths: GraphCheckpointPaths;
+  state: Readonly<GraphExecutionState>;
+  nodeId: string;
+  activationRef: Readonly<ArtifactReference>;
+  checkpointRef?: Readonly<GraphCheckpointRef>;
+  eventId: string;
+  timestamp: string;
+  unattended: boolean;
+  owner: Readonly<GraphCheckpointLease>;
+  tempId: string;
+  failAt?(point: CheckpointFailurePoint): void;
+}): GraphExecutionState {
+  const node = input.state.nodeStates[input.nodeId];
+  if (!node) throw new Error(`Plan-version reservation references unknown node ${input.nodeId}`);
+  const guard = evaluateExecutionGuard(input.graph, input.state, input.state.effectiveLimits, {
+    action: "plan_version",
+    now: input.timestamp,
+    unattended: input.unattended,
+  });
+  if (!guard.allowed) throw new Error(`Plan-version reservation guard ${guard.code}: ${guard.reason}`);
+  const event: GraphEvent = {
+    schemaVersion: 1,
+    kind: "plan-version-reserved",
+    sequence: input.state.lastAppliedEventSequence + 1,
+    eventId: input.eventId,
+    runId: input.state.runId,
+    graphId: input.state.graphId,
+    graphVersion: input.state.graphVersion,
+    graphDigest: input.state.graphDigest,
+    planVersion: input.state.planVersion,
+    priorPlanVersion: input.state.planVersion,
+    nextPlanVersion: input.state.planVersion + 1,
+    nodeId: input.nodeId,
+    priorStatus: node.status,
+    nextStatus: node.status,
+    attempt: node.attempts,
+    timestamp: input.timestamp,
+    artifactRefs: [],
+    activationRef: cloneJson(input.activationRef),
+    ...(input.checkpointRef ? { checkpointRef: cloneJson(input.checkpointRef) } : {}),
+  };
+  return checkpointGraphEvent({
+    graph: input.graph,
+    paths: input.paths,
+    state: input.state,
+    event,
+    owner: input.owner,
+    tempId: input.tempId,
+    ...(input.failAt ? { failAt: input.failAt } : {}),
+  });
 }
 
 function immutableGraphRecord(
@@ -521,7 +659,7 @@ function immutableGraphRecord(
 
 function normalizeMetadata(metadata: SchedulerMetadata): SchedulerMetadata {
   schedulerMetadataFingerprint(metadata);
-  const priorities = Object.fromEntries(Object.entries(metadata.priorities ?? {}).sort(([left], [right]) => left.localeCompare(right)));
+  const priorities = Object.fromEntries(Object.entries(metadata.priorities ?? {}).sort(([left], [right]) => compareCodeUnits(left, right)));
   return Object.keys(priorities).length > 0 ? { priorities } : {};
 }
 
@@ -561,8 +699,7 @@ function assertSuppliedGraph(checkpoint: ImmutableGraphCheckpoint, graph: Compil
 
 function assertEventMatchesCheckpoint(checkpoint: ImmutableGraphCheckpoint, event: Readonly<GraphEvent>): void {
   if (event.runId !== checkpoint.runId || event.graphId !== checkpoint.graph.definition.id ||
-      event.graphVersion !== checkpoint.graph.definition.version || event.graphDigest !== checkpoint.graphDigest ||
-      event.planVersion !== checkpoint.genesisState.planVersion) {
+      event.graphVersion !== checkpoint.graph.definition.version || event.graphDigest !== checkpoint.graphDigest) {
     throw new Error("Graph event does not match its immutable graph checkpoint identity");
   }
 }
@@ -595,11 +732,13 @@ function readSnapshotUnchecked(paths: GraphCheckpointPaths): GraphExecutionState
   if (!existsSync(paths.state)) throw new Error("Graph snapshot is missing");
   const bytes = readFileBounded(paths.state, MAX_GRAPH_SNAPSHOT_BYTES, "graph snapshot").toString("utf8");
   if (!bytes.endsWith("\n")) throw new Error("Graph snapshot is partial or corrupt");
+  let parsed: GraphExecutionState;
   try {
-    return JSON.parse(bytes) as GraphExecutionState;
+    parsed = JSON.parse(bytes) as GraphExecutionState;
   } catch {
     throw new Error("Graph snapshot is corrupt JSON");
   }
+  return migrateLegacyNodePlanVersions(parsed);
 }
 
 function assertEventArray(events: readonly Readonly<GraphEvent>[]): void {
@@ -619,11 +758,24 @@ function assertSameRunIdentity(first: Readonly<GraphEvent>, next: Readonly<Graph
   }
 }
 
-function assertCheckpointOwner(paths: GraphCheckpointPaths, owner: string): void {
-  assertOwnerToken(owner);
+function assertCheckpointOwner(paths: GraphCheckpointPaths, lease: Readonly<GraphCheckpointLease>): void {
+  assertLeaseHandle(lease);
   assertGraphCheckpointPathsSafe(paths);
-  const lease = readLease(paths.executionLease);
-  if (!lease || lease.owner !== owner) throw new Error(`Graph checkpoint mutation requires current lease owner ${owner}`);
+  const current = readLease(paths.executionLease);
+  if (!current || !sameLeaseIdentity(current, lease)) {
+    throw new Error(`Graph checkpoint mutation requires current lease generation ${lease.owner}/${lease.nonce}`);
+  }
+}
+
+function assertLeaseHandle(lease: Readonly<GraphCheckpointLease>): void {
+  assertOwnerToken(lease.owner);
+  assertOwnerToken(lease.nonce);
+  assertPositiveInteger(lease.pid, "lease pid");
+  assertIsoTimestamp(lease.createdAt, "lease timestamp");
+  if ((typeof lease.dev !== "number" && typeof lease.dev !== "bigint") ||
+      (typeof lease.ino !== "number" && typeof lease.ino !== "bigint")) {
+    throw new Error("Graph checkpoint lease handle identity is invalid");
+  }
 }
 
 function readLease(path: string): LeaseRecord | undefined {
@@ -702,6 +854,20 @@ function assertArtifactReference(reference: Readonly<ArtifactReference>): void {
   if (!SHA256.test(reference.sha256)) throw new Error("Artifact reference SHA-256 is invalid");
   assertNonNegativeInteger(reference.sizeBytes, "artifact reference size");
   if (reference.sizeBytes > MAX_NODE_ARTIFACT_BYTES) throw new Error("Artifact reference size exceeds its limit");
+}
+
+function assertGraphCheckpointRef(reference: Readonly<GraphCheckpointRef>): void {
+  if (!reference || typeof reference !== "object" || Array.isArray(reference) ||
+      Object.keys(reference).sort().join(",") !== "path,sha256,sizeBytes") {
+    throw new Error("Graph checkpoint reference shape is invalid");
+  }
+  if (typeof reference.path !== "string" || !/^mutations\/[a-f0-9]{64}\.json$/.test(reference.path) ||
+      !isSafeRelativePath(reference.path)) {
+    throw new Error("Graph checkpoint reference path is invalid");
+  }
+  if (!SHA256.test(reference.sha256)) throw new Error("Graph checkpoint reference SHA-256 is invalid");
+  assertNonNegativeInteger(reference.sizeBytes, "graph mutation artifact size");
+  if (reference.sizeBytes > MAX_NODE_ARTIFACT_BYTES) throw new Error("Graph mutation artifact size exceeds its limit");
 }
 
 function assertContract(value: string): void {
@@ -785,10 +951,16 @@ function publishImmutableAndSync(path: string, data: string | Uint8Array, limit:
   }
 }
 
-function appendAndSync(path: string, data: string, limit: number): void {
+function appendAndSync(
+  paths: GraphCheckpointPaths,
+  data: string,
+  limit: number,
+  lease: Readonly<GraphCheckpointLease>,
+  expected: Readonly<GraphEventLogRead>,
+): void {
   const fd = openSync(
-    path,
-    constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+    paths.events,
+    constants.O_APPEND | constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
     0o600,
   );
   try {
@@ -796,12 +968,37 @@ function appendAndSync(path: string, data: string, limit: number): void {
     if (!before.isFile()) throw new Error("Graph event log must be a regular file");
     const bytes = Buffer.from(data);
     if (before.size + bytes.byteLength > limit) throw new Error("Graph event log exceeds its file limit");
+    if (before.size !== expected.bytes.byteLength ||
+        (expected.dev !== undefined && (before.dev !== expected.dev || before.ino !== expected.ino))) {
+      throw new Error("Graph event log changed from its expected append head");
+    }
+    const currentBytes = readOpenFileBytes(fd, before.size);
+    if (sha256(currentBytes) !== sha256(expected.bytes)) {
+      throw new Error("Graph event log changed from its expected append head");
+    }
+    const named = lstatSync(paths.events);
+    if (!named.isFile() || named.dev !== before.dev || named.ino !== before.ino) {
+      throw new Error("Graph event log identity changed before append");
+    }
+    assertCheckpointOwner(paths, lease);
     writeAll(fd, bytes);
     fsyncSync(fd);
+    assertCheckpointOwner(paths, lease);
   } finally {
     closeSync(fd);
   }
-  fsyncDirectory(dirname(path));
+  fsyncDirectory(dirname(paths.events));
+}
+
+function readOpenFileBytes(fd: number, size: number): Buffer {
+  const bytes = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const count = readSync(fd, bytes, offset, size - offset, offset);
+    if (count === 0) throw new Error("Graph event log changed while validating its expected append head");
+    offset += count;
+  }
+  return bytes;
 }
 
 function writeAll(fd: number, bytes: Buffer): void {
@@ -857,10 +1054,14 @@ function canonicalValue(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value)
       .filter(([, item]) => item !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => compareCodeUnits(left, right))
       .map(([key, item]) => [key, canonicalValue(item)]));
   }
   return value;
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function cloneJson<T>(value: T): T {
@@ -904,7 +1105,15 @@ function isSafeRelativePath(value: string): boolean {
 }
 
 function assertExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new Error(`${label} must be a plain data object`);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key === "symbol")) throw new Error(`${label} cannot contain symbol fields`);
+  if (Object.values(descriptors).some((descriptor) => !("value" in descriptor) || descriptor.enumerable !== true)) {
+    throw new Error(`${label} must contain only enumerable data fields`);
+  }
+  const actual = ownKeys.filter((key): key is string => typeof key === "string").sort();
   const expected = [...keys].sort();
   if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
     throw new Error(`${label} contains unexpected or missing fields`);

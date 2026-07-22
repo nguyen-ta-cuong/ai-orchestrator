@@ -45,7 +45,7 @@ const SIDE_EFFECTS = new Set<SideEffectClass>(["none", "read", "write", "externa
 export function compileGraph(definition: GraphDefinition): CompiledGraph {
   validateDefinitionHeader(definition);
 
-  const nodes = definition.nodes.map(cloneAndValidateNode).sort((left, right) => left.id.localeCompare(right.id));
+  const nodes = definition.nodes.map(cloneAndValidateNode).sort((left, right) => compareCodeUnits(left.id, right.id));
   const mutableNodesById = new Map<string, Readonly<GraphNodeDefinition>>();
   for (const node of nodes) {
     if (mutableNodesById.has(node.id)) throw new Error(`Duplicate graph node id: ${node.id}`);
@@ -294,11 +294,15 @@ function visitFrom(
 }
 
 function compareEdges(left: Readonly<GraphEdgeDefinition>, right: Readonly<GraphEdgeDefinition>): number {
-  return left.from.localeCompare(right.from)
-    || left.event.localeCompare(right.event)
-    || (left.guard ?? "").localeCompare(right.guard ?? "")
-    || left.to.localeCompare(right.to)
-    || (left.boundedBy ?? "").localeCompare(right.boundedBy ?? "");
+  return compareCodeUnits(left.from, right.from)
+    || compareCodeUnits(left.event, right.event)
+    || compareCodeUnits(left.guard ?? "", right.guard ?? "")
+    || compareCodeUnits(left.to, right.to)
+    || compareCodeUnits(left.boundedBy ?? "", right.boundedBy ?? "");
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function assertIdentifier(value: string, label: string): void {
