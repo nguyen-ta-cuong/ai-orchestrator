@@ -52,6 +52,7 @@ export type LifecycleRoutedStage = "define" | "plan" | "verify" | "review" | "de
 export type ModelCandidate = RoleConfig;
 export type ShipCommitMode = "ask" | "never" | "auto";
 export type ShipOpenPrMode = "ask" | "never";
+export type ExecutionEngine = "legacy" | "graph-shadow" | "graph";
 
 export interface LifecycleRoutingConfig {
   enabled: boolean;
@@ -74,6 +75,10 @@ export interface RoutingEvidenceConfig {
 }
 
 export interface OrchestratorConfig {
+  execution: {
+    engine: ExecutionEngine;
+    allowProjectGraph: boolean;
+  };
   roles: Record<RoleName, RoleConfig>;
   loop: {
     maxCoderIterations: number;
@@ -105,6 +110,7 @@ export interface OrchestratorConfig {
 }
 
 type ConfigPatch = Partial<{
+  execution: Partial<OrchestratorConfig["execution"]>;
   roles: Partial<Record<keyof OrchestratorConfig["roles"], Partial<RoleConfig>>>;
   loop: Partial<OrchestratorConfig["loop"]>;
   approval: Partial<OrchestratorConfig["approval"]>;
@@ -144,6 +150,10 @@ function candidates(...values: ModelCandidate[]): ModelCandidate[] {
 }
 
 export const DEFAULT_CONFIG: OrchestratorConfig = {
+  execution: {
+    engine: "graph-shadow",
+    allowProjectGraph: false,
+  },
   roles: {
     planner: { provider: "anthropic", model: "claude-fable-5", thinking: "xhigh" },
     coder: { provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
@@ -345,6 +355,7 @@ function interpolateEnvVar(value: string): string | undefined {
 function validateConfig(value: unknown): OrchestratorConfig {
   const config = requirePlainObject(value, "config");
   const roles = requirePlainObject(config.roles, "roles");
+  const execution = requirePlainObject(config.execution, "execution");
   const loop = requirePlainObject(config.loop, "loop");
   const approval = requirePlainObject(config.approval, "approval");
   const judge = requirePlainObject(config.judge, "judge");
@@ -361,6 +372,9 @@ function validateConfig(value: unknown): OrchestratorConfig {
   for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "debugger", "shipper"] as const) {
     validateRoleConfig(roles[roleName], `roles.${roleName}`);
   }
+
+  requireStringEnum(execution.engine, "execution.engine", ["legacy", "graph-shadow", "graph"] as const);
+  requireBoolean(execution.allowProjectGraph, "execution.allowProjectGraph");
 
   requireBoolean(lifecycleRouting.enabled, "routing.lifecycle.enabled");
   for (const stage of ["define", "plan", "verify", "review", "debug", "ship"] as const) {
@@ -659,6 +673,12 @@ function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): 
 }
 
 function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: OrchestratorConfig): void {
+  if (patch.execution) {
+    if (patch.execution.engine === "graph" && !trusted.execution.allowProjectGraph) {
+      patch.execution.engine = "graph-shadow";
+    }
+    patch.execution.allowProjectGraph = trusted.execution.allowProjectGraph;
+  }
   if (patch.approval) {
     patch.approval.requirePlanApproval = protectedBoolean(
       trusted.approval.requirePlanApproval,

@@ -58,6 +58,8 @@ import {
   readRoutingEvidenceEvents,
   resolveUserEvidenceRoot,
 } from "../src/lifecycle/routingEvidenceStore.js";
+import { applyWorkflowTransition } from "../src/adapters/piWorkflow/graphExecution.js";
+import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -1935,7 +1937,20 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const runId = runtime.state.runId;
     const before = runtime.state.phase;
     if (!ownsRun(runId, before)) throw new Error(`Lifecycle ownership changed before ${before} transition`);
-    const next = nextStage(runtime.state, event, loopConfigFrom(runtime.config));
+    const currentRuntime = runtime;
+    const next = await applyWorkflowTransition({
+      definition: lifecycleWorkflowGraph(),
+      engine: currentRuntime.config.execution.engine,
+      state: currentRuntime.state,
+      event,
+      reduce: (state, selectedEvent) => nextStage(state, selectedEvent, loopConfigFrom(currentRuntime.config)),
+      ownsState: (candidate) => ownsRun(candidate.runId, candidate.phase),
+      onTrace: (trace) => appendJournal(
+        currentRuntime.paths,
+        `graph ${trace.engine}: ${trace.nodeId} --${trace.edge}--> ${trace.nextNodeId} (step ${trace.step})`,
+      ),
+      onShadowMismatch: (message) => notify(ctx, message, "warning"),
+    });
     if (next.phase === before && JSON.stringify(next) === JSON.stringify(runtime.state)) return;
     runtime.state = next;
     writeState(runtime.paths, next);
