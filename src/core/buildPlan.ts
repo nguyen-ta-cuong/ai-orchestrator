@@ -33,6 +33,10 @@ export interface BuildNode {
   id: string;
   handler: BuildHandlerKind;
   priority: number;
+  objective: string;
+  instructions: string[];
+  acceptanceCriteria: string[];
+  verificationCommands: string[];
   inputContracts: string[];
   outputContracts: BuildOutputContract[];
   toolPolicy: BuildToolPolicy;
@@ -130,7 +134,8 @@ const BUILD_PLAN_KEYS = [
   "schemaVersion", "id", "planVersion", "summary", "entry", "exit", "nodes", "dependencies", "joins",
 ] as const;
 const BUILD_NODE_KEYS = [
-  "id", "handler", "priority", "inputContracts", "outputContracts", "toolPolicy", "sideEffect", "workspace",
+  "id", "handler", "priority", "objective", "instructions", "acceptanceCriteria", "verificationCommands",
+  "inputContracts", "outputContracts", "toolPolicy", "sideEffect", "workspace",
   "targetWorktreeNodeId", "idempotency", "resourceLocks", "writeSet", "retryLimit", "timeoutMs",
 ] as const;
 const BUILD_PLAN_LIMIT_KEYS = Object.keys(DEFAULT_BUILD_PLAN_LIMITS) as (keyof BuildPlanLimits)[];
@@ -147,6 +152,10 @@ const IDENTIFIER = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
 const LOGICAL_RESOURCE = /^[a-z][a-z0-9]*(?:[-_.:/][a-z0-9]+)*$/;
 const RESERVED_NODE_ID = "build-complete";
 const MAX_IDENTIFIER_BYTES = 128;
+const MAX_NODE_OBJECTIVE_BYTES = 8 * 1024;
+const MAX_NODE_TEXT_BYTES = 8 * 1024;
+const MAX_NODE_TEXT_ITEMS = 32;
+const MAX_VERIFICATION_COMMAND_BYTES = 4 * 1024;
 
 export function compileBuildPlan(
   value: unknown,
@@ -184,6 +193,135 @@ export function compileBuildPlan(
   });
 }
 
+/**
+ * Compatibility bridge for an already-approved prose-only plan. Topology is
+ * never parsed from Markdown: the entire legacy BUILD is one shared writer,
+ * and the caller must provide the explicit repository scope captured at
+ * migration time.
+ */
+export function compileLegacySequentialBuildPlan(
+  planTextValue: string,
+  planVersion: number,
+  writableRepositoryRootsValue: readonly string[],
+): CompiledBuildPlan {
+  if (typeof planTextValue !== "string" || planTextValue.trim().length === 0) {
+    throw new Error("Legacy prose plan must be non-empty");
+  }
+  const planText = planTextValue.trim();
+  if (Buffer.byteLength(planText, "utf8") > DEFAULT_BUILD_PLAN_LIMITS.maxSerializedBytes) {
+    throw new Error("Legacy prose plan exceeds the BUILD-plan migration limit");
+  }
+  if (!Number.isSafeInteger(planVersion) || planVersion <= 0) {
+    throw new Error("Legacy prose plan version must be a positive integer");
+  }
+  if (!Array.isArray(writableRepositoryRootsValue) || writableRepositoryRootsValue.length === 0) {
+    throw new Error("Legacy prose plan requires a non-empty explicit write scope");
+  }
+  const writeSet = [...new Set(writableRepositoryRootsValue.map((path, index) =>
+    requireBuildRepositoryPath(path, `legacy write scope ${index}`)))].sort(comparePaths);
+  for (let index = 1; index < writeSet.length; index += 1) {
+    if (pathsOverlap(writeSet[index - 1]!, writeSet[index]!)) {
+      throw new Error("Legacy prose plan write scope contains overlapping paths");
+    }
+  }
+  const proseHash = createHash("sha256").update(planText).digest("hex");
+  const firstLine = planText.split(/\r?\n/, 1)[0]!.replace(/\s+/g, " ").slice(0, 240);
+  return compileBuildPlan({
+    schemaVersion: 1,
+    id: "legacy-build",
+    planVersion,
+    summary: `Legacy prose plan ${proseHash.slice(0, 16)}: ${firstLine}`,
+    entry: "legacy-build",
+    exit: "legacy-build",
+    nodes: [{
+      id: "legacy-build",
+      handler: "implement",
+      priority: 0,
+      objective: "Execute the complete approved legacy implementation plan.",
+      instructions: [planText],
+      acceptanceCriteria: ["The approved legacy plan is implemented without changing orchestrator-owned artifacts."],
+      verificationCommands: [],
+      inputContracts: [],
+      outputContracts: [{ id: "legacy-build-output", kind: "file-set", validation: "sha256" }],
+      toolPolicy: "declared-writes",
+      sideEffect: "write",
+      workspace: "shared",
+      idempotency: "keyed",
+      resourceLocks: writeSet.map((value) => ({ kind: "path", value, mode: "exclusive" })),
+      writeSet,
+      retryLimit: 0,
+      timeoutMs: DEFAULT_BUILD_PLAN_LIMITS.maxTimeoutMs,
+    }],
+    dependencies: [],
+    joins: [],
+  } satisfies BuildPlan);
+}
+
+/**
+ * Compare re-plans by their executable content while excluding the immutable
+ * reservation number. A new planVersion alone is not evidence of progress.
+ */
+export function buildPlanContentFingerprint(compiled: Readonly<CompiledBuildPlan>): string {
+  const { planVersion: _planVersion, ...content } = compiled.plan;
+  return createHash("sha256")
+    .update(`build-plan-content-v1\0${stableJson(content)}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/** Render human-facing Markdown only from the validated canonical graph. */
+export function renderBuildPlanMarkdown(compiled: Readonly<CompiledBuildPlan>): string {
+  const lines = [
+    `# ${renderMarkdownText(compiled.plan.summary)}`,
+    "",
+    `Plan id: \`${compiled.plan.id}\`  `,
+    `Plan version: ${compiled.plan.planVersion}  `,
+    `Plan hash: \`${compiled.hash}\``,
+    "",
+    "## BUILD nodes",
+    "",
+  ];
+  for (const node of compiled.plan.nodes) {
+    lines.push(
+      `### ${node.id}`,
+      "",
+      `- Handler: \`${node.handler}\``,
+      `- Objective: ${renderMarkdownText(node.objective)}`,
+      `- Workspace: \`${node.workspace}\``,
+      `- Tool policy: \`${node.toolPolicy}\``,
+      `- Side effect: \`${node.sideEffect}\``,
+      `- Inputs: ${node.inputContracts.length > 0 ? node.inputContracts.map((item) => `\`${item}\``).join(", ") : "none"}`,
+      `- Outputs: ${node.outputContracts.map((item) => `\`${item.id}\` (${item.validation})`).join(", ")}`,
+      `- Write set: ${node.writeSet.length > 0 ? node.writeSet.map((item) => `\`${item}\``).join(", ") : "none"}`,
+      "- Instructions:",
+      ...node.instructions.map((item) => `  - ${renderMarkdownText(item)}`),
+      "- Acceptance criteria:",
+      ...node.acceptanceCriteria.map((item) => `  - ${renderMarkdownText(item)}`),
+      `- Verification commands: ${node.verificationCommands.length > 0
+        ? node.verificationCommands.map((item) => `\`${renderMarkdownText(item)}\``).join(", ")
+        : "none"}`,
+      "",
+    );
+  }
+  lines.push("## Dependency order", "");
+  if (compiled.plan.dependencies.length === 0) lines.push("Single sequential BUILD node.");
+  else for (const edge of compiled.plan.dependencies) {
+    lines.push(`- \`${edge.from}\` → \`${edge.to}\` via ${edge.contracts.map((item) => `\`${item}\``).join(", ")}`);
+  }
+  lines.push("");
+  return `${lines.join("\n")}\n`;
+}
+
+function renderMarkdownText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\r\n?|\n/g, "<br>");
+}
+
 function normalizeBuildPlan(value: unknown, limits: Readonly<BuildPlanLimits>): BuildPlan {
   const source = requireRecord(value, "BUILD plan");
   assertOnlyKeys(source, BUILD_PLAN_KEYS, "BUILD plan");
@@ -215,6 +353,28 @@ function normalizeNode(value: unknown, index: number, limits: Readonly<BuildPlan
   if (id === RESERVED_NODE_ID) throw new Error(`BUILD node id ${id} is reserved`);
   const handler = requireEnum(source.handler, HANDLERS, `handler for ${id}`);
   const priority = requireBoundedInteger(source.priority, limits.maxPriority, `priority for ${id}`);
+  const objective = requireBoundedText(source.objective, `objective for ${id}`, MAX_NODE_OBJECTIVE_BYTES);
+  const instructions = normalizeOrderedText(
+    source.instructions,
+    `instructions for ${id}`,
+    MAX_NODE_TEXT_ITEMS,
+    MAX_NODE_TEXT_BYTES,
+    true,
+  );
+  const acceptanceCriteria = normalizeOrderedText(
+    source.acceptanceCriteria,
+    `acceptance criteria for ${id}`,
+    MAX_NODE_TEXT_ITEMS,
+    MAX_NODE_TEXT_BYTES,
+    true,
+  );
+  const verificationCommands = normalizeOrderedText(
+    source.verificationCommands,
+    `verification commands for ${id}`,
+    MAX_NODE_TEXT_ITEMS,
+    MAX_VERIFICATION_COMMAND_BYTES,
+    false,
+  );
   const inputContracts = normalizeContractIds(source.inputContracts, `input contracts for ${id}`, limits.maxContractsPerNode);
   const outputValues = requireArray(source.outputContracts, `output contracts for ${id}`);
   if (inputContracts.length + outputValues.length > limits.maxContractsPerNode) {
@@ -249,6 +409,10 @@ function normalizeNode(value: unknown, index: number, limits: Readonly<BuildPlan
     id,
     handler,
     priority,
+    objective,
+    instructions,
+    acceptanceCriteria,
+    verificationCommands,
     inputContracts,
     outputContracts,
     toolPolicy,
@@ -459,6 +623,24 @@ function assertNodePolicy(node: Readonly<BuildNode>): void {
   if ((node.sideEffect === "write" || node.sideEffect === "external") && node.retryLimit > 0 && node.idempotency !== "keyed") {
     throw new Error(`BUILD node ${node.id} retry requires keyed idempotency for ${node.sideEffect} work`);
   }
+  if (node.handler !== "validate" && node.verificationCommands.length > 0) {
+    throw new Error(`BUILD node ${node.id} may execute verification commands only through a validate handler`);
+  }
+
+  for (const contract of node.outputContracts) {
+    if (contract.id.startsWith("orchestrator-")) {
+      throw new Error(`BUILD output contract ${node.id}/${contract.id} uses a reserved runtime prefix`);
+    }
+    if (contract.kind === "file-set" && node.handler !== "implement") {
+      throw new Error(`BUILD file-set output ${node.id}/${contract.id} requires an implement handler`);
+    }
+    if (contract.validation === "structured" && contract.kind === "file-set") {
+      throw new Error(`BUILD structured output ${node.id}/${contract.id} cannot use a file-set contract`);
+    }
+    if (contract.validation === "reviewed-command" && contract.kind !== "evidence") {
+      throw new Error(`BUILD ${contract.validation} output ${node.id}/${contract.id} must use an evidence contract`);
+    }
+  }
 
   switch (node.handler) {
     case "inspect":
@@ -618,6 +800,23 @@ function normalizePaths(value: unknown, label: string, maximum: number): string[
     if (pathsOverlap(paths[index - 1]!, paths[index]!)) throw new Error(`${label} contains overlapping repository paths`);
   }
   return paths;
+}
+
+function normalizeOrderedText(
+  value: unknown,
+  label: string,
+  maximumItems: number,
+  maximumItemBytes: number,
+  requireNonEmpty: boolean,
+): string[] {
+  const source = requireArray(value, label);
+  if (source.length > maximumItems || (requireNonEmpty && source.length === 0)) {
+    throw new Error(`${label} must contain ${requireNonEmpty ? "between 1 and" : "at most"} ${maximumItems} items`);
+  }
+  const normalized = source.map((item, index) =>
+    requireBoundedText(item, `${label} item ${index}`, maximumItemBytes));
+  if (new Set(normalized).size !== normalized.length) throw new Error(`${label} contains duplicate items`);
+  return normalized;
 }
 
 function pathContains(parent: string, child: string): boolean {

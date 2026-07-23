@@ -4,11 +4,16 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertOwnedWorktree,
+  createOwnedBuildWorkspaceIdentity,
+  createPlannedBuildWorkspaceIdentity,
   createBuildWorktreeOwnershipProof,
   inspectOwnedBuildWorkspace,
   inspectOwnedWorktreeChanges,
+  cleanupOwnedWorktree,
   materializeWorktree,
+  prepareWorktreeCleanupIntent,
   prepareWorktreeIntent,
+  reconcileWorktreeCleanup,
   reconcileWorktreeIntent,
   type GitCommandResult,
   type GitRunner,
@@ -35,12 +40,14 @@ class FakeGit implements GitRunner {
   status = "";
   branchExists = false;
   addCode = 0;
+  removeCode = 0;
   addCreatesListing = true;
   worktrees: ListedWorktree[] = [];
   unstaged: string[] = [];
   staged: string[] = [];
   untracked: string[] = [];
   ignored: string[] = [];
+  candidateRootIgnored = true;
 
   constructor(
     readonly repositoryRoot: string,
@@ -55,6 +62,9 @@ class FakeGit implements GitRunner {
     if (key === "rev-parse\u0000--path-format=absolute\u0000--git-common-dir") return ok(`${this.commonDir}\n`);
     if (key === "rev-parse\u0000HEAD") return ok(`${baseSha}\n`);
     if (key === "-c\u0000core.fsmonitor=false\u0000status\u0000--porcelain=v1\u0000--untracked-files=all") return ok(this.status);
+    if (copy[0] === "check-ignore" && copy[1] === "--quiet" && copy[2] === "--no-index" && copy[3] === "--") {
+      return this.candidateRootIgnored ? ok("") : { code: 1, stdout: "", stderr: "" };
+    }
     if (key === "worktree\u0000list\u0000--porcelain") return ok(renderWorktrees(this.worktrees));
     if (copy[0] === "show-ref" && copy[1] === "--verify" && copy[2] === "--quiet") {
       return this.branchExists || this.worktrees.some(({ branch }) => `refs/heads/${branch}` === copy[3])
@@ -72,6 +82,13 @@ class FakeGit implements GitRunner {
         this.worktrees.push({ path, head, branch });
       }
       return ok("prepared\n");
+    }
+    if (copy[0] === "worktree" && copy[1] === "remove") {
+      if (this.removeCode !== 0) return { code: this.removeCode, stdout: "", stderr: "simulated worktree remove failure" };
+      const path = copy[2]!;
+      this.worktrees = this.worktrees.filter((entry) => entry.path !== path);
+      rmSync(path, { recursive: true, force: true });
+      return ok("removed\n");
     }
     if (key === "-c\u0000core.fsmonitor=false\u0000diff\u0000--no-ext-diff\u0000--no-textconv\u0000--name-only\u0000-z") {
       return ok(nul(this.unstaged));
@@ -174,10 +191,51 @@ describe("owned BUILD worktree execution", () => {
       planHash,
     });
     expect(intent.intentId).toMatch(/^[a-f0-9]{64}$/);
+    expect(createPlannedBuildWorkspaceIdentity(intent)).toEqual({
+      kind: "planned-worktree",
+      intentId: intent.intentId,
+      runId: intent.runId,
+      planVersion: intent.planVersion,
+      planHash: intent.planHash,
+      ownerNodeId: intent.nodeId,
+      baseSha: intent.baseSha,
+      worktreePath: intent.worktreePath,
+    });
     expect(Object.isFrozen(intent)).toBe(true);
     expect(mutatingCalls(git)).toEqual([]);
     expect(git.calls.map(({ args }) => args)).toContainEqual(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     expectNoForbiddenGit(git);
+  });
+
+  it("refuses a candidate root that is not ignored before any mutation", () => {
+    const selected = fixture();
+    selected.git.candidateRootIgnored = false;
+    expect(() => prepareWorktreeIntent({
+      repositoryRoot: selected.repositoryRoot,
+      candidateRoot: selected.candidateRoot,
+      runId: "run-001",
+      nodeId: "implement-a",
+      planVersion: 1,
+      planHash,
+    }, selected.git)).toThrow(/ignored/i);
+    expect(mutatingCalls(selected.git)).toEqual([]);
+  });
+
+  it("mints owned workspace authority only from a reconciled record and exact immutable receipt hash", () => {
+    const selected = materialized();
+    const receiptHash = "c".repeat(64);
+    expect(createOwnedBuildWorkspaceIdentity(selected.record, receiptHash, selected.git)).toEqual({
+      kind: "owned-worktree",
+      intentId: selected.record.intentId,
+      runId: selected.record.runId,
+      planVersion: selected.record.planVersion,
+      planHash: selected.record.planHash,
+      ownerNodeId: selected.record.nodeId,
+      baseSha: selected.record.baseSha,
+      worktreePath: selected.record.worktreePath,
+      ownershipReceiptHash: receiptHash,
+    });
+    expect(() => createOwnedBuildWorkspaceIdentity(selected.record, "not-a-hash", selected.git)).toThrow(/receipt hash/i);
   });
 
   it.each([
@@ -403,5 +461,58 @@ describe("owned BUILD worktree execution", () => {
     selected.git.unstaged = ["../outside"];
     expect(() => inspectOwnedWorktreeChanges(selected.record, ["src/a.ts"], selected.git)).toThrow(/canonical.*path|unsafe.*path/);
     expectNoForbiddenGit(selected.git);
+  });
+
+  it("requires a separate cleanup confirmation, refuses dirty candidates, removes non-force, and preserves the branch", () => {
+    const selected = materialized();
+    const now = "2026-07-22T00:00:00.000Z";
+    const cleanup = prepareWorktreeCleanupIntent(selected.record, selected.git, now);
+    expect(cleanup).toMatchObject({
+      intentId: selected.record.intentId,
+      branch: selected.record.branch,
+      candidateHead: baseSha,
+      preparedAt: now,
+    });
+
+    expect(() => cleanupOwnedWorktree(cleanup, selected.record, selected.git, { confirmed: false, now }))
+      .toThrow(/explicit confirmation/i);
+    expect(selected.git.worktrees).toHaveLength(1);
+
+    selected.git.untracked = ["src/left-behind.ts"];
+    expect(() => prepareWorktreeCleanupIntent(selected.record, selected.git, now)).toThrow(/dirty|refuses/i);
+    selected.git.untracked = [];
+    const receipt = cleanupOwnedWorktree(cleanup, selected.record, selected.git, { confirmed: true, now });
+    expect(receipt).toMatchObject({ status: "released", branchPreserved: true, cleanupId: cleanup.cleanupId });
+    const removeCall = selected.git.calls.find(({ args }) => args[0] === "worktree" && args[1] === "remove")!;
+    expect(removeCall.args).toEqual(["worktree", "remove", selected.record.worktreePath]);
+    expect(removeCall.args).not.toContain("--force");
+    expect(selected.git.branchExists).toBe(true);
+    expect(selected.git.calls.some(({ args }) => args[0] === "branch" && args.some((value) => value === "-D" || value === "-d"))).toBe(false);
+  });
+
+  it("reconciles a crash after cleanup and refuses moved, deleted-branch, or unknown outcomes", () => {
+    const selected = materialized();
+    const now = "2026-07-22T00:00:00.000Z";
+    const cleanup = prepareWorktreeCleanupIntent(selected.record, selected.git, now);
+    selected.git.worktrees = [];
+    rmSync(selected.record.worktreePath, { recursive: true, force: true });
+    expect(reconcileWorktreeCleanup(cleanup, selected.record, selected.git, now)).toMatchObject({
+      status: "released",
+      branchPreserved: true,
+    });
+
+    selected.git.branchExists = false;
+    expect(() => reconcileWorktreeCleanup(cleanup, selected.record, selected.git, now)).toThrow(/branch.*deleted|proven/i);
+
+    const moved = materialized();
+    const movedCleanup = prepareWorktreeCleanupIntent(moved.record, moved.git, now);
+    moved.git.worktrees[0]!.path = join(moved.record.candidateRoot, "moved-candidate");
+    expect(() => reconcileWorktreeCleanup(movedCleanup, moved.record, moved.git, now)).toThrow(/moved|different path/i);
+
+    const unknown = materialized();
+    const unknownCleanup = prepareWorktreeCleanupIntent(unknown.record, unknown.git, now);
+    unknown.git.removeCode = 9;
+    expect(() => cleanupOwnedWorktree(unknownCleanup, unknown.record, unknown.git, { confirmed: true, now }))
+      .toThrow(/outcome is unknown/i);
   });
 });

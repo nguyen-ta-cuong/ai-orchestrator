@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, parse, relative, resolve } from "node:path";
+import type { BuildWorkspaceIdentity } from "../core/buildExecution.js";
 import type { BuildWorkspaceInspection, BuildWorktreeOwnershipProof } from "../core/buildScheduler.js";
 import { requireBuildRepositoryPath } from "../core/repositoryPath.js";
 
@@ -53,6 +55,37 @@ export interface WorktreeChangeInspection {
   stagedPaths: readonly string[];
 }
 
+export interface WorktreeCleanupIntent {
+  schemaVersion: 1;
+  cleanupId: string;
+  intentId: string;
+  runId: string;
+  nodeId: string;
+  planVersion: number;
+  planHash: string;
+  repositoryRoot: string;
+  worktreePath: string;
+  branch: string;
+  candidateHead: string;
+  preparedAt: string;
+}
+
+export interface WorktreeCleanupReceipt {
+  schemaVersion: 1;
+  cleanupId: string;
+  intentId: string;
+  runId: string;
+  nodeId: string;
+  planVersion: number;
+  planHash: string;
+  worktreePath: string;
+  branch: string;
+  candidateHead: string;
+  status: "released";
+  branchPreserved: true;
+  reconciledAt: string;
+}
+
 interface ListedWorktree {
   path: string;
   head?: string;
@@ -61,18 +94,92 @@ interface ListedWorktree {
 
 const TOKEN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const INTENT_KEYS = [
   "schemaVersion", "intentId", "repositoryRoot", "commonDir", "candidateRoot", "worktreePath", "baseSha", "branch",
   "runId", "nodeId", "planVersion",
   "planHash",
 ] as const;
 const RECORD_KEYS = [...INTENT_KEYS, "reconciled", "cleanupStatus"] as const;
+const CLEANUP_INTENT_KEYS = [
+  "schemaVersion", "cleanupId", "intentId", "runId", "nodeId", "planVersion", "planHash", "repositoryRoot",
+  "worktreePath", "branch", "candidateHead", "preparedAt",
+] as const;
 const SAFE_STATUS_ARGS = ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=all"] as const;
 const SAFE_UNSTAGED_ARGS = ["-c", "core.fsmonitor=false", "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z"] as const;
 const SAFE_STAGED_ARGS = ["-c", "core.fsmonitor=false", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "-z"] as const;
 const SAFE_UNTRACKED_ARGS = ["-c", "core.fsmonitor=false", "ls-files", "--others", "--exclude-standard", "-z"] as const;
 const SAFE_IGNORED_ARGS = ["-c", "core.fsmonitor=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"] as const;
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
+
+/** Execute generated Git argv directly without a shell or string interpolation. */
+export function createLocalGitRunner(options: Readonly<{ timeoutMs?: number }> = {}): GitRunner {
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 30 * 60 * 1_000) {
+    throw new Error("Local Git runner timeout must be an integer from 1ms through 30 minutes");
+  }
+  return Object.freeze({
+    run(args: readonly string[], options: { cwd: string }): GitCommandResult {
+      if (!Array.isArray(args) || args.length === 0 || args.length > 128 ||
+          args.some((argument) => typeof argument !== "string" || argument.length === 0 || /[\u0000\r\n]/.test(argument)) ||
+          args.reduce((bytes, argument) => bytes + Buffer.byteLength(argument, "utf8"), 0) > 64 * 1024) {
+        throw new Error("Local Git runner requires a non-empty bounded argv vector");
+      }
+      const cwd = canonicalExistingDirectory(options.cwd, "local Git working directory");
+      const result = spawnSync("git", [...args], {
+        cwd,
+        encoding: "utf8",
+        shell: false,
+        windowsHide: true,
+        maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        timeout: timeoutMs,
+      });
+      if (result.error) throw new Error(`Local Git invocation failed: ${result.error.message}`);
+      if (result.status === null) throw new Error(`Local Git invocation ended without an exit code${result.signal ? ` (${result.signal})` : ""}`);
+      const output = { code: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+      assertBoundedGitResult(output, "local Git invocation");
+      return output;
+    },
+  });
+}
+
+/** Reconstruct the full immutable intent from a durable planned authority. */
+export function reconstructWorktreeIntent(
+  options: Readonly<{ repositoryRoot: string; candidateRoot: string }>,
+  authorityValue: Exclude<Readonly<BuildWorkspaceIdentity>, { kind: "shared" }>,
+  git: GitRunner,
+): WorktreeExecutionIntent {
+  const authority = authorityValue;
+  const repositoryRoot = canonicalExistingDirectory(options.repositoryRoot, "repository root");
+  const candidateRoot = canonicalExistingDirectory(options.candidateRoot, "candidate worktree root");
+  assertStrictlyContained(repositoryRoot, candidateRoot, "candidate worktree root must remain inside the repository");
+  assertCandidateRootIgnored(git, repositoryRoot, candidateRoot);
+  const reportedRoot = readGitPath(git, repositoryRoot, ["rev-parse", "--show-toplevel"], "repository root");
+  if (reportedRoot !== repositoryRoot) throw new Error("Git repository root does not match the durable worktree authority");
+  const commonDir = readGitPath(
+    git,
+    repositoryRoot,
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    "Git common directory",
+  );
+  const intent = createIntent({
+    repositoryRoot,
+    commonDir,
+    candidateRoot,
+    worktreePath: authority.worktreePath,
+    baseSha: authority.baseSha,
+    branch: `codex/build/${authority.runId}/v${authority.planVersion}/${authority.ownerNodeId}`,
+    runId: authority.runId,
+    nodeId: authority.ownerNodeId,
+    planVersion: authority.planVersion,
+    planHash: authority.planHash,
+  });
+  if (authority.kind !== "planned-worktree" || authority.intentId !== intent.intentId ||
+      authority.worktreePath !== intent.worktreePath) {
+    throw new Error("Durable planned worktree authority does not match its reconstructed intent");
+  }
+  return intent;
+}
 
 export function prepareWorktreeIntent(
   options: Readonly<PrepareWorktreeOptions>,
@@ -95,6 +202,7 @@ export function prepareWorktreeIntent(
   const baseSha = readGitSha(git, repositoryRoot, ["rev-parse", "HEAD"], "base HEAD");
   const candidateRoot = canonicalExistingDirectory(options.candidateRoot, "candidate worktree root");
   assertStrictlyContained(repositoryRoot, candidateRoot, "candidate worktree root must remain inside the repository");
+  assertCandidateRootIgnored(git, repositoryRoot, candidateRoot);
   const branch = `codex/build/${runId}/v${planVersion}/${nodeId}`;
   const worktreePath = resolve(candidateRoot, `${runId}-v${planVersion}-${nodeId}`);
   assertStrictlyContained(candidateRoot, worktreePath, "candidate worktree path must remain inside its configured root");
@@ -128,6 +236,7 @@ export function materializeWorktree(
   if (options.trustRepositoryCheckout !== true) {
     throw new Error("BUILD worktree creation requires explicit trust in repository checkout hooks and filters");
   }
+  assertCandidateRootIgnored(git, intent.repositoryRoot, intent.candidateRoot);
   const recovered = reconcileWorktreeIntent(intent, git);
   if (recovered) return recovered;
 
@@ -157,6 +266,7 @@ export function reconcileWorktreeIntent(
   git: GitRunner,
 ): WorktreeOwnershipRecord | undefined {
   const intent = validateIntent(intentValue);
+  assertCandidateRootIgnored(git, intent.repositoryRoot, intent.candidateRoot);
   assertRepositoryIdentity(intent, git);
   const listed = readWorktrees(git, intent.repositoryRoot);
   const atPath = listed.filter((entry) => entry.path === intent.worktreePath);
@@ -177,6 +287,47 @@ export function reconcileWorktreeIntent(
     throw new Error("Stale BUILD worktree ownership: candidate branch exists without its recorded worktree");
   }
   return undefined;
+}
+
+/** Convert an immutable worktree intent into the only planned authority accepted by BUILD dispatch. */
+export function createPlannedBuildWorkspaceIdentity(
+  intentValue: Readonly<WorktreeExecutionIntent>,
+): Readonly<BuildWorkspaceIdentity> {
+  const intent = validateIntent(intentValue);
+  return Object.freeze({
+    kind: "planned-worktree",
+    intentId: intent.intentId,
+    runId: intent.runId,
+    planVersion: intent.planVersion,
+    planHash: intent.planHash,
+    ownerNodeId: intent.nodeId,
+    baseSha: intent.baseSha,
+    worktreePath: intent.worktreePath,
+  });
+}
+
+/** Reconcile Git before minting owned authority bound to the immutable effect receipt. */
+export function createOwnedBuildWorkspaceIdentity(
+  recordValue: Readonly<WorktreeOwnershipRecord>,
+  ownershipReceiptHash: string,
+  git: GitRunner,
+): Readonly<BuildWorkspaceIdentity> {
+  const record = validateOwnershipRecord(recordValue);
+  if (typeof ownershipReceiptHash !== "string" || !SHA256.test(ownershipReceiptHash)) {
+    throw new Error("BUILD worktree ownership receipt hash is invalid");
+  }
+  assertOwnedWorktree(record, git);
+  return Object.freeze({
+    kind: "owned-worktree",
+    intentId: record.intentId,
+    runId: record.runId,
+    planVersion: record.planVersion,
+    planHash: record.planHash,
+    ownerNodeId: record.nodeId,
+    baseSha: record.baseSha,
+    worktreePath: record.worktreePath,
+    ownershipReceiptHash,
+  });
 }
 
 export function assertOwnedWorktree(recordValue: Readonly<WorktreeOwnershipRecord>, git: GitRunner): void {
@@ -227,6 +378,39 @@ export function inspectOwnedWorktreeChanges(
   return Object.freeze({ changedPaths: Object.freeze(changedPaths), stagedPaths: Object.freeze([]) });
 }
 
+/** Inspect a shared BUILD workspace against the same bounded path policy. */
+export function inspectSharedBuildWorkspace(
+  repositoryRootValue: string,
+  declaredWriteSet: readonly string[],
+  git: GitRunner,
+): WorktreeChangeInspection {
+  const repositoryRoot = canonicalExistingDirectory(repositoryRootValue, "shared BUILD repository root");
+  const declared = normalizeDeclaredPaths(declaredWriteSet);
+  const unstaged = readGitPaths(git, repositoryRoot, SAFE_UNSTAGED_ARGS, "unstaged shared BUILD changes");
+  const staged = readGitPaths(git, repositoryRoot, SAFE_STAGED_ARGS, "staged shared BUILD changes");
+  const untracked = readGitPaths(git, repositoryRoot, SAFE_UNTRACKED_ARGS, "untracked shared BUILD changes");
+  const ignored = readGitPaths(
+    git,
+    repositoryRoot,
+    SAFE_IGNORED_ARGS,
+    "ignored shared BUILD changes",
+    { omitProtected: true },
+  );
+  if (staged.length > 0) throw new Error(`staged shared BUILD changes are not allowed: ${staged.join(", ")}`);
+  // A shared repository commonly contains pre-existing ignored caches (for
+  // example node_modules). They are not attributable to this node. Nested Pi
+  // mutation tools enforce the write set at call time, so only ignored paths
+  // inside that set are relevant to this postcondition.
+  const declaredIgnored = ignored.filter((path) => declared.some((allowed) => pathContains(allowed, path)));
+  const changedPaths = uniquePaths([...unstaged, ...untracked, ...declaredIgnored]);
+  for (const changed of changedPaths) {
+    if (!declared.some((allowed) => pathContains(allowed, changed))) {
+      throw new Error(`shared BUILD workspace contains undeclared write ${changed}`);
+    }
+  }
+  return Object.freeze({ changedPaths: Object.freeze(changedPaths), stagedPaths: Object.freeze([]) });
+}
+
 /** Inspect candidate changes and reconcile Git again before returning trusted completion evidence. */
 export function inspectOwnedBuildWorkspace(
   recordValue: Readonly<WorktreeOwnershipRecord>,
@@ -240,6 +424,110 @@ export function inspectOwnedBuildWorkspace(
     ownership,
     changedPaths: changes.changedPaths,
     stagedPaths: changes.stagedPaths,
+  });
+}
+
+/** Prepare cleanup evidence without changing Git or the filesystem. */
+export function prepareWorktreeCleanupIntent(
+  recordValue: Readonly<WorktreeOwnershipRecord>,
+  git: GitRunner,
+  now: string,
+): WorktreeCleanupIntent {
+  const record = validateOwnershipRecord(recordValue);
+  assertIsoTimestamp(now, "BUILD worktree cleanup timestamp");
+  assertOwnedWorktree(record, git);
+  assertCleanOwnedWorktree(record, git);
+  const candidateHead = readGitSha(git, record.worktreePath, ["rev-parse", "HEAD"], "candidate HEAD");
+  const fields = {
+    schemaVersion: 1 as const,
+    intentId: record.intentId,
+    runId: record.runId,
+    nodeId: record.nodeId,
+    planVersion: record.planVersion,
+    planHash: record.planHash,
+    repositoryRoot: record.repositoryRoot,
+    worktreePath: record.worktreePath,
+    branch: record.branch,
+    candidateHead,
+    preparedAt: now,
+  };
+  return Object.freeze({ ...fields, cleanupId: createHash("sha256").update(stableJson(fields)).digest("hex") });
+}
+
+/**
+ * Remove only the exact clean owned worktree, without force and without
+ * deleting its branch. The caller must durably checkpoint the cleanup intent
+ * before invoking this function.
+ */
+export function cleanupOwnedWorktree(
+  cleanupValue: Readonly<WorktreeCleanupIntent>,
+  recordValue: Readonly<WorktreeOwnershipRecord>,
+  git: GitRunner,
+  options: Readonly<{ confirmed: boolean; now: string }>,
+): WorktreeCleanupReceipt {
+  const cleanup = validateCleanupIntent(cleanupValue);
+  const record = validateOwnershipRecord(recordValue);
+  assertCleanupMatchesOwnership(cleanup, record);
+  assertIsoTimestamp(options.now, "BUILD worktree cleanup reconciliation timestamp");
+  const recovered = reconcileWorktreeCleanup(cleanup, record, git, options.now);
+  if (recovered) return recovered;
+  if (options.confirmed !== true) throw new Error("BUILD worktree cleanup requires separate explicit confirmation");
+  assertOwnedWorktree(record, git);
+  assertCleanOwnedWorktree(record, git);
+  const candidateHead = readGitSha(git, record.worktreePath, ["rev-parse", "HEAD"], "candidate HEAD");
+  if (candidateHead !== cleanup.candidateHead) throw new Error("BUILD worktree changed after cleanup intent preparation");
+  const result = git.run(["worktree", "remove", record.worktreePath], { cwd: record.repositoryRoot });
+  assertBoundedGitResult(result, "git worktree remove");
+  if (result.code !== 0) {
+    throw new Error(`git worktree remove failed with exit code ${result.code}; cleanup outcome is unknown and must be reconciled`);
+  }
+  const receipt = reconcileWorktreeCleanup(cleanup, record, git, options.now);
+  if (!receipt) throw new Error("git worktree remove returned success but the owned worktree remains registered");
+  return receipt;
+}
+
+/** Reconcile a crash after non-force worktree removal without repeating it. */
+export function reconcileWorktreeCleanup(
+  cleanupValue: Readonly<WorktreeCleanupIntent>,
+  recordValue: Readonly<WorktreeOwnershipRecord>,
+  git: GitRunner,
+  now: string,
+): WorktreeCleanupReceipt | undefined {
+  const cleanup = validateCleanupIntent(cleanupValue);
+  const record = validateOwnershipRecord(recordValue);
+  assertCleanupMatchesOwnership(cleanup, record);
+  assertIsoTimestamp(now, "BUILD worktree cleanup reconciliation timestamp");
+  assertRepositoryIdentity(record, git);
+  const listed = readWorktrees(git, record.repositoryRoot);
+  const atPath = listed.filter((entry) => entry.path === record.worktreePath);
+  const onBranch = listed.filter((entry) => entry.branch === record.branch);
+  if (atPath.length > 1 || onBranch.length > 1) throw new Error("BUILD worktree cleanup found duplicate Git registrations");
+  if (atPath.length === 1) {
+    const entry = atPath[0]!;
+    if (entry.branch !== record.branch) throw new Error("BUILD worktree cleanup path is owned by a different branch");
+    if (entry.head !== cleanup.candidateHead) throw new Error("BUILD worktree cleanup candidate HEAD changed after confirmation");
+    if (!existsSync(record.worktreePath)) throw new Error("BUILD worktree cleanup registration exists but its path is missing");
+    return undefined;
+  }
+  if (onBranch.length === 1) throw new Error("BUILD worktree cleanup candidate was moved to a different path");
+  if (existsSync(record.worktreePath)) throw new Error("BUILD worktree cleanup path remains without its Git registration");
+  if (!branchExists(git, record.repositoryRoot, record.branch)) {
+    throw new Error("BUILD worktree cleanup branch was deleted or cannot be proven to remain");
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    cleanupId: cleanup.cleanupId,
+    intentId: cleanup.intentId,
+    runId: cleanup.runId,
+    nodeId: cleanup.nodeId,
+    planVersion: cleanup.planVersion,
+    planHash: cleanup.planHash,
+    worktreePath: cleanup.worktreePath,
+    branch: cleanup.branch,
+    candidateHead: cleanup.candidateHead,
+    status: "released",
+    branchPreserved: true,
+    reconciledAt: now,
   });
 }
 
@@ -303,6 +591,52 @@ function validateOwnershipRecord(value: Readonly<WorktreeOwnershipRecord>): Work
   return createOwnershipRecord(intent, source.reconciled);
 }
 
+function validateCleanupIntent(value: Readonly<WorktreeCleanupIntent>): WorktreeCleanupIntent {
+  const source = requireRecord(value, "BUILD worktree cleanup intent");
+  assertOnlyKeys(source, CLEANUP_INTENT_KEYS, "BUILD worktree cleanup intent");
+  if (source.schemaVersion !== 1 || typeof source.cleanupId !== "string" || !/^[a-f0-9]{64}$/.test(source.cleanupId) ||
+      typeof source.intentId !== "string" || !/^[a-f0-9]{64}$/.test(source.intentId)) {
+    throw new Error("BUILD worktree cleanup intent identity is invalid");
+  }
+  const normalized = {
+    schemaVersion: 1 as const,
+    intentId: source.intentId,
+    runId: requireToken(source.runId, "BUILD worktree cleanup run id"),
+    nodeId: requireToken(source.nodeId, "BUILD worktree cleanup node id"),
+    planVersion: requirePositiveInteger(source.planVersion, "BUILD worktree cleanup plan version"),
+    planHash: requirePlanHash(source.planHash),
+    repositoryRoot: canonicalExistingDirectory(source.repositoryRoot, "BUILD worktree cleanup repository"),
+    worktreePath: canonicalTargetPath(source.worktreePath, "BUILD worktree cleanup path"),
+    branch: requireBranch(source.branch),
+    candidateHead: requireSha(source.candidateHead, "BUILD worktree cleanup candidate HEAD"),
+    preparedAt: requireIsoTimestamp(source.preparedAt, "BUILD worktree cleanup preparation timestamp"),
+  };
+  const cleanupId = createHash("sha256").update(stableJson(normalized)).digest("hex");
+  if (cleanupId !== source.cleanupId) throw new Error("BUILD worktree cleanup intent hash does not match its contents");
+  return Object.freeze({ ...normalized, cleanupId });
+}
+
+function assertCleanupMatchesOwnership(
+  cleanup: Readonly<WorktreeCleanupIntent>,
+  record: Readonly<WorktreeOwnershipRecord>,
+): void {
+  if (cleanup.intentId !== record.intentId || cleanup.runId !== record.runId || cleanup.nodeId !== record.nodeId ||
+      cleanup.planVersion !== record.planVersion || cleanup.planHash !== record.planHash ||
+      cleanup.repositoryRoot !== record.repositoryRoot || cleanup.worktreePath !== record.worktreePath || cleanup.branch !== record.branch) {
+    throw new Error("BUILD worktree cleanup intent does not match exact active ownership");
+  }
+}
+
+function assertCleanOwnedWorktree(record: Readonly<WorktreeOwnershipRecord>, git: GitRunner): void {
+  const dirty = [
+    ...readGitPaths(git, record.worktreePath, SAFE_UNSTAGED_ARGS, "cleanup unstaged worktree changes"),
+    ...readGitPaths(git, record.worktreePath, SAFE_STAGED_ARGS, "cleanup staged worktree changes"),
+    ...readGitPaths(git, record.worktreePath, SAFE_UNTRACKED_ARGS, "cleanup untracked worktree changes"),
+    ...readGitPaths(git, record.worktreePath, SAFE_IGNORED_ARGS, "cleanup ignored worktree changes"),
+  ];
+  if (dirty.length > 0) throw new Error(`BUILD worktree cleanup refuses dirty or unknown paths: ${uniquePaths(dirty).join(", ")}`);
+}
+
 function toIntent(value: object): WorktreeExecutionIntent {
   const source = value as Record<string, unknown>;
   return Object.fromEntries(INTENT_KEYS.map((key) => [key, source[key]])) as unknown as WorktreeExecutionIntent;
@@ -323,6 +657,21 @@ function assertRepositoryIdentity(intent: Readonly<WorktreeExecutionIntent>, git
 function assertCleanBase(git: GitRunner, repositoryRoot: string): void {
   const result = runGit(git, repositoryRoot, SAFE_STATUS_ARGS, "git status");
   if (result.stdout.length > 0) throw new Error("BUILD worktree creation requires a clean working tree with no staged, unstaged, or untracked paths");
+}
+
+function assertCandidateRootIgnored(git: GitRunner, repositoryRoot: string, candidateRoot: string): void {
+  const relativeRoot = relative(repositoryRoot, candidateRoot);
+  if (relativeRoot.length === 0 || relativeRoot.startsWith("..") || isAbsolute(relativeRoot) ||
+      /[\u0000\r\n]/.test(relativeRoot)) {
+    throw new Error("BUILD candidate worktree root is not safely contained in the repository");
+  }
+  const result = git.run(["check-ignore", "--quiet", "--no-index", "--", relativeRoot], { cwd: repositoryRoot });
+  assertBoundedGitResult(result, "git check-ignore");
+  if (result.code === 0) return;
+  if (result.code === 1) {
+    throw new Error("BUILD candidate worktree root must already be ignored so creation cannot dirty the main worktree");
+  }
+  throw new Error(`git check-ignore failed with exit code ${result.code}`);
 }
 
 function readGitPath(git: GitRunner, cwd: string, args: readonly string[], label: string): string {
@@ -381,13 +730,21 @@ function readGitPaths(
   cwd: string,
   args: readonly string[],
   label: string,
+  options: Readonly<{ omitProtected?: boolean }> = {},
 ): string[] {
   const output = runGit(git, cwd, args, label).stdout;
   if (output.length === 0) return [];
   if (!output.endsWith("\u0000")) throw new Error(`${label} did not return NUL-delimited paths`);
   const values = output.slice(0, -1).split("\u0000");
   if (values.some((value) => value.length === 0)) throw new Error(`${label} returned an empty path`);
-  return uniquePaths(values.map((value) => requireBuildRepositoryPath(value, `${label} path`)));
+  return uniquePaths(values.flatMap((value) => {
+    try {
+      return [requireBuildRepositoryPath(value, `${label} path`)];
+    } catch (error) {
+      if (options.omitProtected && error instanceof Error && /protected path/.test(error.message)) return [];
+      throw error;
+    }
+  }));
 }
 
 function runGit(git: GitRunner, cwd: string, args: readonly string[], label: string): GitCommandResult {
@@ -511,6 +868,17 @@ function requirePlanHash(value: unknown): string {
 function requirePositiveInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new Error(`${label} must be a positive integer`);
   return value as number;
+}
+
+function requireIsoTimestamp(value: unknown, label: string): string {
+  assertIsoTimestamp(value, label);
+  return value;
+}
+
+function assertIsoTimestamp(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) {
+    throw new Error(`${label} must be an ISO timestamp`);
+  }
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

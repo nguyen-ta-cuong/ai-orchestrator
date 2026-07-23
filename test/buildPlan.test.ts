@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_BUILD_PLAN_LIMITS,
+  buildPlanContentFingerprint,
+  compileLegacySequentialBuildPlan,
   compileBuildPlan,
+  renderBuildPlanMarkdown,
   type BuildNode,
   type BuildPlan,
   type BuildPlanLimits,
@@ -28,6 +31,10 @@ function node(id: string, overrides: Partial<BuildNode> = {}): BuildNode {
     id,
     handler: "inspect",
     priority: 0,
+    objective: `Complete ${id}.`,
+    instructions: [`Perform the ${id} task.`],
+    acceptanceCriteria: [`${id} produces its declared output.`],
+    verificationCommands: [],
     inputContracts: [],
     outputContracts: [output(`${id}-output`)],
     toolPolicy: "read-only",
@@ -133,6 +140,43 @@ function limits(overrides: Partial<BuildPlanLimits>): BuildPlanLimits {
 }
 
 describe("compileBuildPlan", () => {
+  it("renders canonical human Markdown and maps an approved legacy prose plan to one sequential writer", () => {
+    const compiled = compileBuildPlan(plan());
+    const markdown = renderBuildPlanMarkdown(compiled);
+    expect(markdown).toContain(`# ${compiled.plan.summary}`);
+    expect(markdown).toContain(`Plan version: 1`);
+    expect(markdown).toContain(`Plan hash: \`${compiled.hash}\``);
+    expect(markdown).toContain("## Dependency order");
+
+    const first = compileLegacySequentialBuildPlan("Implement the approved change.\n\nRun npm test.", 2, ["src", "test"]);
+    const second = compileLegacySequentialBuildPlan("Implement the approved change.\n\nRun npm test.", 2, ["test", "src"]);
+    expect(second.hash).toBe(first.hash);
+    expect(first.plan).toMatchObject({
+      id: "legacy-build",
+      planVersion: 2,
+      entry: "legacy-build",
+      exit: "legacy-build",
+      nodes: [{ handler: "implement", workspace: "shared", writeSet: ["src", "test"] }],
+      dependencies: [],
+    });
+    expect(first.plan.summary).toMatch(/Legacy prose plan [a-f0-9]{16}/);
+    expect(() => compileLegacySequentialBuildPlan("  ", 1, ["src"])).toThrow(/non-empty/i);
+    expect(() => compileLegacySequentialBuildPlan("Do it", 1, [])).toThrow(/write scope/i);
+  });
+
+  it("renders plan-authored text as inert Markdown content", () => {
+    const input = plan();
+    input.summary = "Safe summary\n## forged heading";
+    input.nodes[0]!.objective = "Inspect `code`\n# injected";
+    input.nodes[0]!.instructions = ["Read files\n- forged sibling"];
+    const markdown = renderBuildPlanMarkdown(compileBuildPlan(input));
+    expect(markdown).not.toContain("\n## forged heading");
+    expect(markdown).not.toContain("\n# injected");
+    expect(markdown).not.toContain("\n- forged sibling");
+    expect(markdown).toContain("Safe summary<br>## forged heading");
+    expect(markdown).toContain("Inspect \\`code\\`<br># injected");
+  });
+
   it("strictly validates, canonicalizes, hashes, and freezes a BUILD plan without mutating input", () => {
     const input = plan();
     input.nodes.reverse();
@@ -183,6 +227,16 @@ describe("compileBuildPlan", () => {
     expect(second.canonicalJson).toBe(first.canonicalJson);
     expect(second.graph.definition).toEqual(first.graph.definition);
     expect(compileBuildPlan({ ...left, summary: `${left.summary} Changed.` }).hash).not.toBe(first.hash);
+  });
+
+  it("does not treat a reservation version bump as implementation-plan progress", () => {
+    const first = compileBuildPlan(plan());
+    const second = compileBuildPlan({ ...plan(), planVersion: 2 });
+
+    expect(second.hash).not.toBe(first.hash);
+    expect(buildPlanContentFingerprint(second)).toBe(buildPlanContentFingerprint(first));
+    expect(buildPlanContentFingerprint(compileBuildPlan({ ...plan(), summary: "A materially changed plan." })))
+      .not.toBe(buildPlanContentFingerprint(first));
   });
 
   it("derives an exact GraphDefinition v1 DAG and adapter-friendly priority metadata", () => {
@@ -430,5 +484,39 @@ describe("compileBuildPlan", () => {
 
   it("bounds identifiers before canonicalization and hashing", () => {
     expect(() => compileBuildPlan({ ...plan(), id: `a${"b".repeat(256)}` })).toThrow(/bounded canonical identifier/i);
+  });
+
+  it("makes per-node intent immutable and renders it for approval", () => {
+    const input = plan();
+    const target = input.nodes.find(({ id }) => id === "validate-a")!;
+    target.objective = "Add the bounded scheduler adapter.";
+    target.instructions = ["Add the failing recovery test first.", "Implement only the declared write set."];
+    target.acceptanceCriteria = ["Recovery resumes without replaying a settled side effect."];
+    target.verificationCommands = ["npm test -- --run test/buildExecution.test.ts"];
+
+    const compiled = compileBuildPlan(input);
+    expect(compiled.plan.nodes.find(({ id }) => id === target.id)).toMatchObject({
+      objective: target.objective,
+      instructions: target.instructions,
+      acceptanceCriteria: target.acceptanceCriteria,
+      verificationCommands: target.verificationCommands,
+    });
+    const markdown = renderBuildPlanMarkdown(compiled);
+    expect(markdown).toContain(target.objective);
+    expect(markdown).toContain(target.acceptanceCriteria[0]);
+    expect(markdown).toContain(target.verificationCommands[0]);
+
+    for (const field of ["objective", "instructions", "acceptanceCriteria", "verificationCommands"] as const) {
+      const missing = plan() as unknown as Record<string, unknown>;
+      delete ((missing.nodes as Array<Record<string, unknown>>)[0]!)[field];
+      expect(() => compileBuildPlan(missing), field).toThrow();
+    }
+  });
+
+  it("keeps executable verification commands behind validate-node policy", () => {
+    const value = plan();
+    value.nodes.find(({ id }) => id === "implement-a")!.verificationCommands = ["npm test"];
+
+    expect(() => compileBuildPlan(value)).toThrow(/only through a validate handler/i);
   });
 });

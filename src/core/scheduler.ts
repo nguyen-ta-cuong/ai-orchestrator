@@ -252,7 +252,7 @@ const ALLOWED_STATUS_TRANSITIONS: Readonly<Record<NodeStatus, ReadonlySet<NodeSt
   pending: new Set(["cancelled", "skipped"]),
   ready: new Set(["running", "waiting_human", "cancelled", "skipped"]),
   running: new Set(["blocked", "executed", "failed_retryable", "failed", "cancelled"]),
-  waiting_human: new Set(["blocked", "failed", "cancelled"]),
+  waiting_human: new Set(["blocked", "executed", "failed", "cancelled"]),
   blocked: new Set(["cancelled", "skipped"]),
   executed: new Set(),
   failed_retryable: new Set(["ready", "failed", "cancelled"]),
@@ -892,7 +892,7 @@ function assertPersistedSideEffect(
     throw new Error(`Settled side-effect outcome is inconsistent for ${node.nodeId}`);
   }
   if (sideEffect.status === "succeeded" && !sideEffect.resultRef) throw new Error(`Successful side effect for ${node.nodeId} requires a result reference`);
-  if (sideEffect.resultRef) assertArtifactReference(graph, state.planVersion, node.nodeId, sideEffect.resultRef);
+  if (sideEffect.resultRef) assertSideEffectArtifactReference(state.planVersion, node.nodeId, sideEffect.resultRef);
   if (node.idempotencyKey !== sideEffect.idempotencyKey) throw new Error(`Node ${node.nodeId} idempotency key does not match side-effect state`);
 }
 
@@ -1077,7 +1077,7 @@ function assertEventIdentity(state: Readonly<GraphExecutionState>, event: Readon
 
 function assertEventArtifacts(graph: CompiledGraph, event: Readonly<GraphEvent>): void {
   for (const reference of event.artifactRefs) assertArtifactReference(graph, event.planVersion, event.nodeId, reference);
-  if (event.sideEffect?.resultRef) assertArtifactReference(graph, event.planVersion, event.nodeId, event.sideEffect.resultRef);
+  if (event.sideEffect?.resultRef) assertSideEffectArtifactReference(event.planVersion, event.nodeId, event.sideEffect.resultRef);
 }
 
 function assertCompletionContracts(graph: CompiledGraph, event: Readonly<GraphEvent>): void {
@@ -1125,6 +1125,24 @@ function assertArtifactReference(
   const expectedDirectory = `nodes/${planVersion}/${nodeId}/`;
   if (!reference.path.startsWith(expectedDirectory)) {
     throw new Error(`Artifact reference must remain inside node artifact directory ${expectedDirectory}`);
+  }
+}
+
+/** Side-effect receipts are control-plane evidence, not business output
+ * contracts. They remain content-addressed and confined to the exact node
+ * artifact directory without impersonating one of the node's declarations. */
+function assertSideEffectArtifactReference(
+  planVersion: number,
+  nodeId: string,
+  reference: Readonly<ArtifactReference>,
+): void {
+  assertArtifactReferenceShape(reference);
+  if (reference.planVersion !== planVersion || reference.nodeId !== nodeId) {
+    throw new Error("Side-effect artifact reference does not match its node");
+  }
+  const expectedDirectory = `nodes/${planVersion}/${nodeId}/`;
+  if (!reference.path.startsWith(expectedDirectory)) {
+    throw new Error(`Side-effect artifact reference must remain inside ${expectedDirectory}`);
   }
 }
 
