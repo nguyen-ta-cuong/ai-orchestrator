@@ -1,5 +1,8 @@
 import { decideRejectedBuildOutcome, type LoopConfig } from "./loop.js";
 import type { LifecycleRoutedStage, ThinkingLevel } from "./config.js";
+import type { RecoveryLedger } from "./recovery.js";
+import type { GraphCheckpointRef, GraphExecutionState } from "./scheduler.js";
+import type { SchedulerRecoveryBinding } from "./schedulerRecovery.js";
 
 export type LifecyclePhase =
   | "idle"
@@ -57,8 +60,38 @@ export interface LifecycleModelSelection {
   };
 }
 
-export interface LifecycleState {
+export interface LifecycleRecoveryArtifactBinding {
   version: 1;
+  semanticRef: string;
+  sha256: string;
+  sizeBytes: number;
+  storageRef: Readonly<GraphCheckpointRef>;
+}
+
+export interface LifecycleRecoveryActionExecution {
+  version: 1;
+  failureFingerprint: string;
+  failurePhase: "verifying" | "reviewing";
+  action: "retry" | "repair";
+  status: "pending" | "completed";
+  requestRef?: string;
+  intentRef?: Readonly<GraphCheckpointRef>;
+  resultRef?: Readonly<GraphCheckpointRef>;
+}
+
+export interface LifecycleRecoveryEnvelope {
+  version: 1;
+  failurePhase: "verifying" | "reviewing";
+  binding: Readonly<SchedulerRecoveryBinding>;
+  occurrenceBindings: readonly Readonly<SchedulerRecoveryBinding>[];
+  ledger: Readonly<RecoveryLedger>;
+  artifacts: readonly Readonly<LifecycleRecoveryArtifactBinding>[];
+  actionHistory: readonly Readonly<LifecycleRecoveryActionExecution>[];
+  action?: Readonly<LifecycleRecoveryActionExecution>;
+}
+
+export interface LifecycleState {
+  version: 1 | 2;
   runId: string;
   phase: LifecyclePhase;
   task: string;
@@ -88,6 +121,21 @@ export interface LifecycleState {
   shipReport?: string;
   yolo: boolean;
   originalModel?: LifecycleOriginalModelState;
+  recovery?: Readonly<LifecycleRecoveryEnvelope>;
+  graphExecution?: GraphExecutionState;
+  envelopeRevision?: number;
+  previousEnvelopeHash?: string;
+  envelopeHash?: string;
+  revisionFeedback?: {
+    artifact: "spec" | "plan";
+    feedback: string;
+    recordedAt: string;
+  };
+  reminder?: {
+    phase: LifecyclePhase;
+    kind: "artifact" | "verdict" | "debug";
+    recordedAt: string;
+  };
 }
 
 export type LifecycleEvent =
@@ -99,7 +147,13 @@ export type LifecycleEvent =
   | { type: "plan_approved" }
   | { type: "plan_rejected_by_user" }
   | { type: "build_produced" }
-  | { type: "debug_produced"; debugPath?: string }
+  | {
+      type: "debug_produced";
+      debugPath?: string;
+      recoveryAction?: "retry" | "repair" | "replan" | "fail";
+      retryPhase?: "verifying" | "reviewing";
+    }
+  | { type: "recovery_failed" }
   | {
       type: "verdict";
       stage: LifecycleVerdictStage;
@@ -146,6 +200,10 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
   state.baselineStagedPaths = overrides.baselineStagedPaths ? [...overrides.baselineStagedPaths] : undefined;
   state.finalization = overrides.finalization ? { ...overrides.finalization } : undefined;
   state.originalModel = overrides.originalModel ? { ...overrides.originalModel } : undefined;
+  state.recovery = overrides.recovery ? structuredClone(overrides.recovery) : undefined;
+  state.graphExecution = overrides.graphExecution ? structuredClone(overrides.graphExecution) : undefined;
+  state.revisionFeedback = overrides.revisionFeedback ? { ...overrides.revisionFeedback } : undefined;
+  state.reminder = overrides.reminder ? { ...overrides.reminder } : undefined;
   return state;
 }
 
@@ -160,19 +218,24 @@ export function nextStage(
     if (state.phase !== "idle" && state.phase !== "done" && state.phase !== "failed") {
       return cloneLifecycleState(state);
     }
+    if (state.version === 2 && (state.phase === "done" || state.phase === "failed")) {
+      return cloneLifecycleState(state);
+    }
     return createIdleLifecycleState({
+      version: state.version,
       runId: state.runId,
       phase: "defining",
       task: event.task,
       yolo: event.yolo,
+      graphExecution: state.graphExecution,
     });
   }
 
   if (event.type === "cancelled") {
-    return createIdleLifecycleState({
-      runId: state.runId,
-      originalModel: state.originalModel ? { ...state.originalModel } : undefined,
-    });
+    if (state.phase === "done" || state.phase === "failed") return cloneLifecycleState(state);
+    const cancelled = cloneLifecycleState(state);
+    cancelled.phase = "idle";
+    return cancelled;
   }
 
   const next = cloneLifecycleState(state);
@@ -226,7 +289,40 @@ export function nextStage(
     case "debug_produced": {
       if (next.phase !== "debugging") return next;
       if (event.debugPath !== undefined) next.debugPath = event.debugPath;
+      if (event.recoveryAction !== undefined) {
+        if (event.recoveryAction === "retry") {
+          if (event.retryPhase !== "verifying" && event.retryPhase !== "reviewing") {
+            throw new Error("Lifecycle recovery retry requires its exact checker phase");
+          }
+          next.phase = event.retryPhase;
+          return next;
+        }
+        if (event.retryPhase !== undefined) {
+          throw new Error("Lifecycle recovery retryPhase is valid only for retry");
+        }
+        if (event.recoveryAction === "repair") {
+          next.phase = next.buildIterations >= config.maxCoderIterations ? "failed" : "building";
+          return next;
+        }
+        if (event.recoveryAction === "replan") {
+          if (next.buildIterations >= config.maxCoderIterations) {
+            next.phase = "failed";
+            return next;
+          }
+          next.phase = "planning";
+          next.consecutiveRejections = 0;
+          return next;
+        }
+        next.phase = "failed";
+        return next;
+      }
       return applyRejectedBuildOutcome(next, config);
+    }
+
+    case "recovery_failed": {
+      if (next.phase !== "building") return next;
+      next.phase = "failed";
+      return next;
     }
 
     case "verdict": {
@@ -367,6 +463,10 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
     finalization: state.finalization ? { ...state.finalization } : undefined,
     pendingCheckerVerdict: state.pendingCheckerVerdict ? { ...state.pendingCheckerVerdict } : undefined,
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
+    recovery: state.recovery ? structuredClone(state.recovery) : undefined,
+    graphExecution: state.graphExecution ? structuredClone(state.graphExecution) : undefined,
+    revisionFeedback: state.revisionFeedback ? { ...state.revisionFeedback } : undefined,
+    reminder: state.reminder ? { ...state.reminder } : undefined,
   };
 }
 

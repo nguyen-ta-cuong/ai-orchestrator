@@ -2,7 +2,7 @@
 
 This document is the durable architecture canvas for AI Orchestrator's migration from implicit control flow to explicit, inspectable graphs. It separates what is shipped today from the target program so operators do not mistake planned files or commands for available behavior.
 
-Today, the pure reducers `nextPhase()` in `src/core/loop.ts` and `nextStage()` in `src/core/lifecycle.ts` remain the only authorities for workflow transitions. The Pi extensions adapt those decisions to models, tools, approvals, and disk. The graph compiler, runner, scheduler, immutable BUILD graph, stateful MCP runs, and versioned recovery shown below are targets for plans 0011 through 0017; they do not exist yet.
+Today, the pure reducers `nextPhase()` in `src/core/loop.ts` and `nextStage()` in `src/core/lifecycle.ts` remain the only authorities for workflow transitions. The Pi extensions adapt those decisions to models, tools, approvals, and disk. The graph contracts, runner, durable scheduler, stateful MCP authority, immutable BUILD-graph execution, and scheduler-anchored DEBUG/BUILD/successor-plan recovery executors have landed. Plan 0017 owns shadow evidence, rollout gates, and retirement of the legacy control path.
 
 ## User flow canvas
 
@@ -99,9 +99,9 @@ Plans 0011 through 0013 are serial because they establish shared types, executio
 
 The fast reducer uses these internal states: `idle`, `planning`, `awaiting_approval`, `coding`, `judging`, `replanning`, `done`, and `failed`. Its Pi entry points are `/orchestrate` and `/orchestrate-stop`. `judge_verdict` is the terminating structured checker tool.
 
-The lifecycle reducer uses `idle`, `defining`, `awaiting_spec_approval`, `planning`, `awaiting_plan_approval`, `building`, `verifying`, `reviewing`, `debugging`, `shipping`, `awaiting_ship_approval`, `finalizing`, `done`, and `failed`. Its main entry points are `/lifecycle` and `/lifecycle-stop`; `/lifecycle resume` is the resumable invocation, and `/lifecycle migrate-routing` explicitly adopts current routing policy for an unfinished phase. Standalone stage commands are `/spec`, `/plan`, `/build`, `/test`, `/debug`, `/review`, and `/ship`. Routing evidence is managed with `/lifecycle-routing-report`, `/lifecycle-routing-apply`, and `/lifecycle-routing-rollback`. Structured terminating tools are `verify_verdict`, `review_verdict`, `debug_diagnosis`, and `ship_decision`.
+The lifecycle reducer uses `idle`, `defining`, `awaiting_spec_approval`, `planning`, `awaiting_plan_approval`, `building`, `verifying`, `reviewing`, `debugging`, `shipping`, `awaiting_ship_approval`, `finalizing`, `done`, and `failed`. Its main entry points are `/lifecycle` and `/lifecycle-stop`; `/lifecycle resume` is the resumable invocation, and `/lifecycle migrate-routing` explicitly adopts current routing policy for an unfinished phase. Standalone stage commands are `/spec`, `/plan`, `/build`, `/test`, `/debug`, `/review`, and `/ship`. Routing evidence is managed with `/lifecycle-routing-report`, `/lifecycle-routing-apply`, and `/lifecycle-routing-rollback`. Structured terminating tools are `submit_build_plan`, `verify_verdict`, `review_verdict`, `debug_diagnosis`, and `ship_decision`.
 
-The current MCP server is stateless across calls. It exposes `orchestrator_plan`, `orchestrator_judge`, and `orchestrator_models`; Cursor supplies repository context, evidence, and loop counters. “Stateful MCP tools” in the runtime canvas are explicitly a plan-0014 target.
+The MCP server preserves the compatibility/stateless tools `orchestrator_plan`, `orchestrator_judge`, and `orchestrator_models`. The preferred durable tools are `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, `orchestrator_run_recover`, and `orchestrator_run_cancel`. Their server-owned transition service uses Plan 0013's generation-bound lease, immutable graph checkpoint, append-only event chain, atomic snapshot CAS, and content-addressed output artifacts under a trusted user root partitioned by canonical repository digest. Recovery freezes one scheduler-issued lineage and cap set, anchors every occurrence to the exact WAL head, runs typed read-only DEBUG, and authenticates plan/graph/diagnosis/approval evidence across restart. Repair requires a scoped client BUILD submission; structural recovery creates immutable N+1 graph/plan bytes and pauses for approval before activation. Exact request receipts and historical revisions replay after restart; project mirrors are optional, status-only, and never authoritative.
 
 The current transition topology is:
 
@@ -137,14 +137,22 @@ By default, one durable run lives under `.ai-orchestrator/runs/<run-id>/`:
         ├── journal.md     append-only human-readable transition journal
         ├── routing.jsonl  bounded structured routing decisions
         ├── evidence.jsonl privacy-minimized run evidence
+        ├── graph.json     compiled outer lifecycle graph
+        ├── events.jsonl  structured write-ahead transition events
+        ├── nodes/         immutable node-result artifacts
+        ├── mutations/     immutable side-effect request/result artifacts
         └── execution.lock active executor lease
 ```
 
 `src/lifecycle/artifacts.ts` owns this layout, path containment, symlink rejection, atomic state replacement, the active-run pointer, and execution leases. The run directory is excluded from Git. Source work is never automatically stashed, reset, cleaned, checked out, or reverted.
 
+An execution lease is a generation-bound handle, not merely an owner label. Every WAL append compares the complete expected log head and revalidates that exact lease generation immediately before writing. Model, write, external, and irreversible effects must bind intent and result events to the same immutable mutation checkpoint; if dispatch may have happened but completion is uncertain, the durable outcome is `unknown` and automatic replay stops for reconciliation.
+
+Replay revalidates the bytes behind completion references, successful result receipts, activation evidence, and mutation checkpoints before accepting an event prefix. Plan 0013 fails closed on missing, corrupt, substituted, or truncated evidence and never truncates history automatically. Coordinated operator recovery to a last-known-valid prefix must update the WAL, scheduler snapshot, lifecycle envelope, and referenced evidence as one reviewed operation; that recovery protocol remains an explicit Plan 0016 dependency.
+
 ## Target artifact layout
 
-Plans 0013 through 0016 extend the current layout without silently rewriting historical evidence:
+Plans 0014 through 0016 extend the current layout without silently rewriting historical evidence:
 
 ```text
 .ai-orchestrator/runs/<run-id>/
@@ -158,6 +166,7 @@ Plans 0013 through 0016 extend the current layout without silently rewriting his
 ├── evidence.jsonl
 ├── journal.md
 ├── nodes/                      outputs addressed by plan version and node id
+├── mutations/                  side-effect requests and result receipts by content hash
 └── plan-versions/
     └── <N>/
         ├── graph.json          immutable BUILD DAG for version N

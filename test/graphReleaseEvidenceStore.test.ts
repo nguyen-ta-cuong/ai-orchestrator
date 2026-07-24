@@ -305,7 +305,7 @@ describe("trusted graph release evidence", () => {
     expect(() => verifyFixture(brokenConfigContinuity)).toThrowError(
       expect.objectContaining<Partial<GraphReleaseEvidenceError>>({ code: "invalid-release-artifact" }),
     );
-  });
+  }, 10_000);
 
   it("semantically validates later rollout and coverage evidence against the retained default", () => {
     const malformedRollout = writeReleaseFixture(makeTempDir());

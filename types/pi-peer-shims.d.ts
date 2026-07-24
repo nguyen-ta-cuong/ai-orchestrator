@@ -1,11 +1,20 @@
 declare module "@earendil-works/pi-ai" {
   export function StringEnum<T extends readonly string[]>(values: T): unknown;
+  export interface Model<T = unknown> {
+    provider: string;
+    id: string;
+    [key: string]: unknown;
+  }
 }
 
 declare module "typebox" {
   export const Type: {
     Object(properties: Record<string, unknown>, options?: Record<string, unknown>): unknown;
     String(options?: Record<string, unknown>): unknown;
+    Integer(options?: Record<string, unknown>): unknown;
+    Number(options?: Record<string, unknown>): unknown;
+    Boolean(options?: Record<string, unknown>): unknown;
+    Literal(value: unknown): unknown;
     Array(schema: unknown, options?: Record<string, unknown>): unknown;
     Optional(schema: unknown): unknown;
   };
@@ -20,9 +29,41 @@ declare module "@earendil-works/pi-coding-agent" {
   }
 
   export interface ModelRegistry {
+    readonly authStorage: unknown;
     find(provider: string, model: string): ModelInfo | undefined;
     getAvailable(): ModelInfo[];
   }
+
+  export interface AgentSessionLike {
+    prompt(text: string, options?: { expandPromptTemplates?: boolean; source?: "interactive" | "rpc" | "extension" }): Promise<void>;
+    waitForIdle(): Promise<void>;
+    abort(): Promise<void>;
+    dispose(): void;
+    subscribe(listener: (event: unknown) => void): () => void;
+    getSessionStats(): { tokens: { input: number; output: number }; cost: number };
+    readonly isIdle: boolean;
+    readonly state?: { messages?: readonly unknown[] };
+  }
+
+  export class DefaultResourceLoader {
+    constructor(options: Record<string, unknown>);
+    reload(): Promise<void>;
+  }
+
+  export const SessionManager: {
+    inMemory(cwd?: string): SessionManager;
+  };
+
+  export function getAgentDir(): string;
+  export function defineTool<T>(tool: T): T;
+  export interface ToolDefinition { name: string; [key: string]: unknown }
+  export function createReadToolDefinition(cwd: string, options?: Record<string, unknown>): ToolDefinition;
+  export function createGrepToolDefinition(cwd: string, options?: Record<string, unknown>): ToolDefinition;
+  export function createFindToolDefinition(cwd: string, options?: Record<string, unknown>): ToolDefinition;
+  export function createLsToolDefinition(cwd: string, options?: Record<string, unknown>): ToolDefinition;
+  export function createEditToolDefinition(cwd: string, options?: Record<string, unknown>): ToolDefinition;
+  export function createWriteToolDefinition(cwd: string, options?: Record<string, unknown>): ToolDefinition;
+  export function createAgentSession(options: Record<string, unknown>): Promise<{ session: AgentSessionLike }>;
 
   export interface SessionManager {
     getBranch(): Array<{ type: string; customType?: string; data?: unknown }>;
@@ -118,6 +159,6 @@ declare module "@earendil-works/pi-coding-agent" {
     appendEntry(customType: string, data: unknown): void;
     getActiveTools(): string[];
     setActiveTools(tools: readonly string[]): void;
-    exec(command: string, args: string[], options?: { timeout?: number; signal?: AbortSignal }): Promise<ExecResult>;
+    exec(command: string, args: string[], options?: { cwd?: string; timeout?: number; signal?: AbortSignal }): Promise<ExecResult>;
   }
 }

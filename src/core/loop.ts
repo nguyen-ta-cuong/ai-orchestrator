@@ -32,6 +32,7 @@ export interface OrchestratorState {
   consecutiveRejections: number;
   judgeReports: JudgeReport[];
   yolo: boolean;
+  pendingProviderRetry?: "plan" | "judge";
   originalModel?: OriginalModelState;
 }
 
@@ -48,6 +49,12 @@ export type LoopEvent =
   | { type: "plan_rejected_by_user" }
   | { type: "code_produced" }
   | { type: "verdict"; verdict: Verdict; reasons?: string; requiredFixes?: string }
+  | {
+      type: "recovery_directed";
+      action: "retry" | "repair" | "replan" | "fail";
+      providerKind?: "plan" | "judge";
+    }
+  | { type: "provider_failed" }
   | { type: "cancelled" };
 
 export const DEFAULT_LOOP_CONFIG: LoopConfig = {
@@ -98,6 +105,7 @@ export function nextPhase(
   }
 
   if (event.type === "cancelled") {
+    if (state.phase === "done" || state.phase === "failed") return cloneState(state);
     return createIdleState({
       originalModel: state.originalModel ? { ...state.originalModel } : undefined,
     });
@@ -113,6 +121,7 @@ export function nextPhase(
       if (event.plan !== undefined) {
         next.plan = event.plan;
       }
+      next.pendingProviderRetry = undefined;
       next.phase = config.requirePlanApproval && !next.yolo ? "awaiting_approval" : "coding";
       return next;
     }
@@ -137,7 +146,8 @@ export function nextPhase(
       if (next.phase !== "coding") {
         return next;
       }
-      next.coderIterations += 1;
+      if (next.pendingProviderRetry !== "judge") next.coderIterations += 1;
+      next.pendingProviderRetry = undefined;
       next.phase = "judging";
       return next;
     }
@@ -177,6 +187,46 @@ export function nextPhase(
       return next;
     }
 
+    case "recovery_directed": {
+      if (next.phase === "done" || next.phase === "idle") return next;
+      if (event.action !== "retry" && event.providerKind !== undefined) {
+        throw new Error("Only recovery retry may declare a provider kind");
+      }
+      if (event.action === "fail" ||
+          ((event.action === "repair" || event.action === "replan") &&
+            next.coderIterations >= config.maxCoderIterations)) {
+        next.phase = "failed";
+        next.pendingProviderRetry = undefined;
+        return next;
+      }
+      if (event.action === "retry") {
+        if (event.providerKind !== "plan" && event.providerKind !== "judge") {
+          throw new Error("Recovery retry requires its failed provider kind");
+        }
+        next.pendingProviderRetry = event.providerKind;
+        next.phase = event.providerKind === "plan"
+          ? (next.plan === undefined ? "planning" : "replanning")
+          : "coding";
+        return next;
+      }
+      next.pendingProviderRetry = undefined;
+      if (event.action === "repair") {
+        next.phase = "coding";
+        return next;
+      }
+      next.phase = "replanning";
+      next.consecutiveRejections = 0;
+      return next;
+    }
+
+    case "provider_failed": {
+      if (next.phase !== "planning" && next.phase !== "replanning" && next.phase !== "judging") {
+        return next;
+      }
+      next.phase = "failed";
+      return next;
+    }
+
     default:
       return assertNever(event);
   }
@@ -190,6 +240,7 @@ function cloneState(state: OrchestratorState): OrchestratorState {
   return {
     ...state,
     judgeReports: state.judgeReports.map((report) => ({ ...report })),
+    ...(state.pendingProviderRetry === undefined ? {} : { pendingProviderRetry: state.pendingProviderRetry }),
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
   };
 }

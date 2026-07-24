@@ -21,7 +21,7 @@ How to read the canvas:
 2. **Keep the user at the gates.** Plans require approval by default, and routing metadata never grants permission to edit, commit, or publish.
 3. **Use the fast loop for focused changes.** PLAN → approval → BUILD → independent JUDGE; rejection returns actionable fixes, and repeated rejection re-plans within bounded attempts.
 4. **Use the lifecycle for durable work.** DEFINE → PLAN → BUILD → VERIFY → REVIEW → SHIP persists state on disk and uses the same default three-build/two-rejection caps. VERIFY or REVIEW rejection enters read-only DEBUG; SHIP NO-GO skips DEBUG. Loop policy then selects BUILD, PLAN, or failed.
-5. **Match features to the host.** Pi and MCP apply capability routing; every workflow keeps the maker separate from the checker. Pi adds cumulative budgets and minimized evidence, while the lifecycle adds restart recovery and fresh Git confirmations. MCP is stateless across calls, and Cursor manual mode relies on installed guidance rather than enforced automation. SHIP never pushes.
+5. **Match features to the host.** Pi and MCP apply capability routing; every workflow keeps the maker separate from the checker. Pi adds cumulative budgets and minimized evidence, while the lifecycle adds restart recovery and fresh Git confirmations. Durable MCP runs persist server-owned state across calls; the compatibility plan/judge tools and Cursor manual mode remain stateless. SHIP never pushes.
 
 ## Documentation
 
@@ -204,15 +204,17 @@ npx @miracle3010/ai-orchestrator install-cursor --no-mcp
 
 Restart or reload Cursor after installation and enable the `ai-orchestrator` MCP server. The installed workflow uses:
 
-1. `orchestrator_models` for a read-only preview of the trusted **server-side** `plan` route.
-2. `orchestrator_plan`, followed by recording its actual routing metadata and explicit plan approval.
-3. A manually selected coding-capable Cursor model; record its exact host `provider/model` as `coderIdentity`.
-4. Client-collected `git diff`, `git diff --staged`, and relevant test output.
-5. `orchestrator_models` for `fast-judge` with `coderIdentity` to confirm an eligible server-side checker.
-6. `orchestrator_judge` with the returned plan, evidence, counters, and `coderIdentity`, followed by recording its selected checker and fallback history.
-7. The server-returned `nextAction`, `nextIteration`, and `nextConsecutiveRejections` without client-side counter invention.
+1. `orchestrator_models` for an optional read-only preview of the trusted **server-side** `plan` route.
+2. A manually selected coding-capable Cursor model, recorded as exact host `provider/model` in `coderIdentity`.
+3. `orchestrator_run_start`, followed by recording its opaque run ID/revision and explicitly approving the returned plan.
+4. `orchestrator_run_advance` with the exact returned revision for approval and later client-collected diff/test evidence.
+5. The server-returned node, permitted events, required action, checker metadata, counters, and remaining budgets without client-side invention.
+6. `orchestrator_run_recover` only after a provider failure or checker rejection has been durably closed by the server. The server derives the category and contract; clients cannot submit their own diagnosis.
+7. `orchestrator_run_get` after a conflict or restart, and `orchestrator_run_cancel` for explicit cancellation.
 
-The MCP server routes its own planner/judge API calls; those catalog identities may not exist in Cursor's picker. It cannot change Cursor's selected host model, which remains the coder unless the user switches it. Record the host coder identity and server-returned routing metadata in project-defined notes or artifacts so separation is auditable.
+Prefer the durable `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, `orchestrator_run_recover`, and `orchestrator_run_cancel` tools. Start with the declared host `coderIdentity`, approve the returned plan explicitly, and pass the exact returned revision with every fresh idempotent mutation. Recovery is scheduler-anchored and derived from durable server evidence: independent read-only DEBUG selects a typed local repair or immutable successor plan, retries are bounded, and every successor returns to explicit approval before activation. Follow only `permittedEvents`; a conflict is reconciled by reading the run. The server owns counters, checker routing, recovery budgets, plan-version lineage, and terminal caps. `orchestrator_plan` and `orchestrator_judge` remain compatibility tools for clients that still manage their own loop.
+
+The MCP server routes its own planner/judge API calls; those catalog identities may not exist in Cursor's picker. It cannot change Cursor's selected host model, which remains the coder unless the user switches it. Run authority is stored under the trusted user directory by canonical repository partition. An optional project mirror contains status and digests only and is never authoritative.
 
 ### Cursor without MCP
 
@@ -374,7 +376,7 @@ Unknown price follows the explicit `routing.unknownCost` policy (`exclude`, `pen
 
 Pi workflows additionally enforce stateful `routing.budgets` before activation. A privacy-minimal `budget.jsonl` ledger enforces run/day estimated and observed ceilings independently of optional analytical evidence. A lifecycle run holds a recoverable process lease, freezes the complete routing/role policy version on first model entry, and pauses rather than silently rerouting if that policy changes. After reviewing the change, use `/lifecycle migrate-routing` and confirm the dialog to adopt the current policy for the unfinished phase, then `/lifecycle resume`; completed decision evidence is preserved. Provider/model execution errors are recorded as typed fallback evidence; resume skips the failed identity and tries the next eligible candidate within configured caps. Lifecycle evidence is retained in the run directory until the user removes it: `routing.jsonl` contains routing decisions/fallbacks and `evidence.jsonl` contains minimized task category, selected identity, usage/cost values or `unknown`, and outcome fields. Evidence excludes prompts, source, diffs, artifact text, credentials, headers, and repository remotes. `/lifecycle-routing-report` displays only version-compatible recommendations that meet the configured sample threshold and never changes policy. `/lifecycle-routing-apply <number>` requires confirmation, writes a versioned preference to trusted user config, and creates a rollback record; `/lifecycle-routing-rollback <id>` confirms and restores that exact prior preference only if it has not changed since application.
 
-MCP is deliberately stateless across tool calls. It enforces per-request estimated-cost and fallback-attempt ceilings but cannot reconcile observed usage or enforce cumulative run/day budgets across independent requests. It does not write `routing.jsonl`/`evidence.jsonl`; its durable evidence boundary is the structured metadata returned to the client. Cursor should retain that metadata and manual identities in project-defined notes when audit history is required.
+Stateful MCP runs freeze scheduler/provider limits at creation and durably reserve every routed attempt before network use. Provider output bytes are content-addressed before a successful transition is exposed, and exact request receipts replay after restart. Compatibility plan/judge calls remain stateless and enforce only their per-request routing ceilings.
 
 ## Legacy migration and rollback
 

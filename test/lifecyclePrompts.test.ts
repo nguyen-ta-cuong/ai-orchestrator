@@ -44,6 +44,19 @@ describe("lifecycle prompts", () => {
     expect(JSON.stringify(payload)).not.toContain("add smaller tasks");
   });
 
+  it("requires the terminating structured BUILD-plan tool for a reserved plan version", () => {
+    const prompt = taskPlanPrompt("# Spec", "plan.md", undefined, 3, "npm test");
+    const payload = jsonLine(prompt, "{\"specText\":");
+
+    expect(payload.structuredBuildPlanVersion).toBe(3);
+    expect(prompt).toContain("submit_build_plan");
+    expect(prompt).toContain('trusted fixed command "npm test"');
+    expect(prompt).toContain("Never invent shell commands");
+    expect(prompt).toContain("planVersion exactly matches structuredBuildPlanVersion");
+    expect(prompt).toContain("Do not write plan files directly");
+    expect(prompt).toContain("final human integration node");
+  });
+
   it("build prompt includes rejection feedback and commit policy", () => {
     const noCommit = buildPrompt("1. Do it", "Fix failing tests", false);
     expect(noCommit).toContain("A checker rejected the previous attempt");

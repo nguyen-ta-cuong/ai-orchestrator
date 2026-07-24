@@ -161,36 +161,28 @@ Routing and evidence files contain bounded identities, policy/profile versions, 
 
 ## Cursor with MCP
 
-The MCP server routes only its planner and checker calls. Cursor's selected host model remains the coder.
+The MCP server routes only its planner and checker calls. Cursor's selected host model remains the coder. Prefer the durable run tools:
 
-1. Call `orchestrator_models` with `stage: "plan"` and the task. Review eligible server-side candidates and exclusions.
-2. Call `orchestrator_plan` with the task, repository context, and structured task features when known.
-3. Record returned routing metadata, show the plan, and wait for explicit user approval.
-4. Select a coding-capable Cursor model and record its exact host identity as canonical `provider/model` in `coderIdentity`.
-5. Implement, run relevant tests in Cursor, and collect `git diff`, `git diff --staged`, and test output.
-6. Call `orchestrator_models` with `stage: "fast-judge"` and `coderIdentity`; verify independent checking is satisfied.
-7. On the first pass, call `orchestrator_judge` with these required counter values:
+1. Optionally preview the trusted server-side plan route with `orchestrator_models`.
+2. Select a coding-capable Cursor model and record its exact host identity as canonical `provider/model` in `coderIdentity`.
+3. Call `orchestrator_run_start` with a fresh `requestId`, the task, optional repository context/features, and `coderIdentity`:
 
    ```json
    {
+     "requestId": "cursor-unique-start-id",
      "task": "the original task",
-     "plan": "the approved plan",
-     "diff": "the current unstaged and staged diff",
-     "testOutput": "the relevant test output",
-     "iteration": 1,
-     "consecutiveRejections": 0,
      "coderIdentity": "provider/model"
    }
    ```
 
-8. Record the actual checker, fallback history, verdict, reasons, and required fixes.
-9. Follow the returned `nextAction`, `nextIteration`, and `nextConsecutiveRejections` exactly:
-   - `done`: report the independently approved result.
-   - `retry_coding`: address every required fix, retest, refresh the diff, and use the returned counters on the next judge call.
-   - `replan`: call `orchestrator_plan` with the original `task`, the last approved plan as `previousPlan`, accumulated `judgeReports`, and the refreshed `diffSummary`; present and approve the revised plan before editing again.
-   - `stop_failed`: stop and report remaining work without reverting the tree.
+4. Record the opaque `runId` and `revision`, show the plan, and wait for explicit user approval. Advance `plan_approved` with a new request ID and the exact returned revision. Use `plan_revision_requested` for feedback and approve the replacement separately.
+5. Implement only while `currentNode` is `coding`; collect the unstaged/staged diff and relevant test output.
+6. Submit `code_result_submitted` with a fresh request ID and exact current revision. The server owns checker selection, iteration and rejection counters, automatic re-plan thresholds, and terminal caps.
+7. Follow `currentNode`, `permittedEvents`, `requiredAction`, `limits`, and `remaining` exactly. Address every required fix before submitting refreshed evidence. Stop on terminal or blocked status.
+8. Use `orchestrator_run_recover` only after the server has durably closed a provider failure or checker rejection. The server derives category, contract, attempt, and lineage from that evidence; the client cannot author a diagnosis. Independent read-only DEBUG produces the typed directive. The response then permits only the matching bounded action: resubmit a scoped repair, approve an immutable successor plan, inspect a safety pause, or stop.
+9. Reuse a request ID only for the identical mutation after a lost response. On revision conflict call `orchestrator_run_get`, reconcile current authority, and use a new ID for changed input. Use `orchestrator_run_cancel` for explicit cancellation.
 
-`previousPlan` is mandatory whenever `judgeReports` or `diffSummary` is supplied. MCP is stateless across tool calls. It enforces per-request estimate and fallback caps, returns minimized routing metadata, and does not write project artifacts or cumulative run/day evidence. Keep client-side run notes when durable audit history is required.
+Run authority, immutable provider-output evidence, the recovery ledger, content-addressed diagnosis evidence, completed action receipts, and plan-version approval provenance live in the trusted user store and survive MCP restart. Every occurrence is anchored to its exact scheduler WAL head while one frozen lineage carries consumed retry/repair/replan budgets across plan versions. An optional project mirror contains only sanitized status. The stateless `orchestrator_plan`/`orchestrator_judge` flow remains available during the compatibility window.
 
 ## Cursor without MCP
 

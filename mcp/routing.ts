@@ -1,4 +1,5 @@
 import type { OrchestratorConfig, RoleConfig } from "../src/core/config.js";
+import type { RoutedCompletionDecision } from "./llm.js";
 import { estimateRoutingStageCost } from "../src/core/routingBudget.js";
 import {
   rankModels,
@@ -18,6 +19,7 @@ export interface McpSeparationResult {
 }
 
 export interface McpRoutingMetadata {
+  selectedIndex: number;
   selectedIdentity: { provider: string; model: string; family?: string };
   thinking: RoleConfig["thinking"];
   policyVersion: string;
@@ -25,6 +27,7 @@ export interface McpRoutingMetadata {
   fallbackHistory: Array<{ identity: string; reason: string }>;
   separation: McpSeparationResult;
   legacyFallback: boolean;
+  decision?: RoutedCompletionDecision;
 }
 
 export interface McpCompletionCandidate extends RoleConfig {
@@ -338,11 +341,13 @@ export function metadataFor(
   route: McpRoute,
   selectedIndex: number,
   fallbackHistory: McpRoutingMetadata["fallbackHistory"],
+  decision?: RoutedCompletionDecision,
 ): McpRoutingMetadata {
   const candidate = route.candidates[selectedIndex];
   if (!candidate) throw new Error(`Selected MCP candidate index ${selectedIndex} is out of range`);
   const ranked = route.ranked[selectedIndex];
   return {
+    selectedIndex,
     selectedIdentity: {
       provider: candidate.provider,
       model: candidate.model,
@@ -354,5 +359,6 @@ export function metadataFor(
     fallbackHistory,
     separation: separationFor(route.separation.required, route.familySeparationRequired, route.builder, candidate),
     legacyFallback: route.legacyFallback,
+    ...(decision === undefined ? {} : { decision: structuredClone(decision) }),
   };
 }

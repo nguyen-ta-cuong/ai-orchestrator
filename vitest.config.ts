@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@earendil-works/pi-ai": piRuntimeStub,
+      "@earendil-works/pi-coding-agent": piRuntimeStub,
       typebox: piRuntimeStub,
     },
   },
