@@ -83,6 +83,12 @@ export const mcpRunCancelInputSchema = z.object({
   reason: boundedReportText.optional(),
 }).strict();
 
+export const mcpRunRecoverInputSchema = z.object({
+  requestId: mcpRequestIdSchema,
+  runId: mcpRunIdSchema,
+  expectedRevision: safeRevision,
+}).strict();
+
 export const mcpRunRoutingDecisionSchema = z.object({
   decisionId: z.string().regex(/^[A-Za-z0-9._:@/-]{1,128}$/),
   stage: z.enum(["plan", "fast-judge"]),
@@ -147,6 +153,24 @@ export const mcpRunResponseSchema = z.object({
   }).strict(),
   limits: budgetValuesSchema,
   remaining: budgetValuesSchema,
+  recovery: z.object({
+    failureFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    status: z.enum([
+      "active", "waiting-diagnosis", "waiting-configuration", "waiting-authorization", "waiting-policy",
+      "waiting-side-effect-review", "waiting-successor-artifact", "waiting-successor-approval",
+      "ready-successor-activation", "released", "failed",
+    ]),
+    action: z.enum(["retry", "repair", "replan", "pause", "fail"]).optional(),
+    reason: z.enum([
+      "transient-failure", "local-defect", "structural-defect", "diagnosis-required", "unknown-after-diagnosis",
+      "configuration-change-required", "human-authorization-required", "policy-change-required",
+      "side-effect-review-required", "global-budget-exhausted", "retry-exhausted", "repair-exhausted",
+      "replan-exhausted", "recovery-level-consumed", "recovery-level-skipped",
+    ]).optional(),
+    sourcePlanVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    targetPlanVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+    remaining: z.object({ retry: z.number().int().min(0).max(1), repair: z.number().int().min(0).max(1), replan: z.number().int().min(0).max(1) }).strict(),
+  }).strict().optional(),
   conflict: z.object({
     expectedRevision: safeRevision,
     currentRevision: safeRevision,
@@ -158,6 +182,7 @@ export type McpRunStartInput = z.infer<typeof mcpRunStartInputSchema>;
 export type McpRunGetInput = z.infer<typeof mcpRunGetInputSchema>;
 export type McpRunAdvanceInput = z.infer<typeof mcpRunAdvanceInputSchema>;
 export type McpRunCancelInput = z.infer<typeof mcpRunCancelInputSchema>;
+export type McpRunRecoverInput = z.infer<typeof mcpRunRecoverInputSchema>;
 export type McpRunClientEvent = z.infer<typeof mcpRunClientEventSchema>;
 export type McpRunResponse = z.infer<typeof mcpRunResponseSchema>;
 
@@ -166,6 +191,7 @@ export interface McpRunAdapter {
   get(input: McpRunGetInput, signal?: AbortSignal): Promise<McpRunResponse>;
   advance(input: McpRunAdvanceInput, signal?: AbortSignal): Promise<McpRunResponse>;
   cancel(input: McpRunCancelInput, signal?: AbortSignal): Promise<McpRunResponse>;
+  recover?(input: McpRunRecoverInput, signal?: AbortSignal): Promise<McpRunResponse>;
 }
 
 export function mcpRunToolResult(response: McpRunResponse): {
@@ -184,6 +210,7 @@ export const unavailableMcpRunAdapter: McpRunAdapter = {
   get: unavailable,
   advance: unavailable,
   cancel: unavailable,
+  recover: unavailable,
 };
 
 async function unavailable(): Promise<never> {

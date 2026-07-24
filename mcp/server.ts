@@ -11,6 +11,7 @@ import {
   mcpRunAdvanceInputSchema,
   mcpRunCancelInputSchema,
   mcpRunGetInputSchema,
+  mcpRunRecoverInputSchema,
   mcpRunResponseSchema,
   mcpRunStartInputSchema,
   mcpRunToolResult,
@@ -115,7 +116,7 @@ export function createServer(cwd = process.cwd(), options: CreateServerOptions =
     { name: "ai-orchestrator", version: packageVersion },
     {
       instructions:
-        "Prefer orchestrator_run_start/get/advance/cancel for server-owned durable runs. Wait for explicit plan approval, submit code and test evidence with the returned revision exactly, and read the run after a revision conflict. The stateless orchestrator_plan and orchestrator_judge tools remain available for compatibility.",
+        "Prefer orchestrator_run_start/get/advance/cancel for server-owned durable runs. Use orchestrator_run_recover only after the server has durably closed a provider failure or checker rejection, always with the returned revision; the server derives the failure evidence and never accepts client-authored categories or diagnoses. Wait for explicit plan approval, submit code and test evidence with the returned revision exactly, and read the run after a revision conflict. The stateless orchestrator_plan and orchestrator_judge tools remain available for compatibility.",
     },
   );
 
@@ -291,6 +292,20 @@ export function createServer(cwd = process.cwd(), options: CreateServerOptions =
       outputSchema: mcpRunResponseSchema,
     },
     async (input, extra) => mcpRunToolResult(await runAdapter.cancel(input, extra.signal)),
+  );
+
+  server.registerTool(
+    "orchestrator_run_recover",
+    {
+      title: "Classify a durable run failure",
+      description: "Derive the latest closed failure from durable server evidence, persist its scheduler-anchored recovery observation, and return the shared bounded retry, pause, or fail decision. Client-authored categories and diagnoses are rejected.",
+      inputSchema: mcpRunRecoverInputSchema,
+      outputSchema: mcpRunResponseSchema,
+    },
+    async (input, extra) => {
+      if (!runAdapter.recover) throw new Error("Stateful recovery is not available from this run adapter");
+      return mcpRunToolResult(await runAdapter.recover(input, extra.signal));
+    },
   );
 
   return server;

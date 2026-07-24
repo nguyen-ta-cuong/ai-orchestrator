@@ -7,6 +7,22 @@ import {
   type LoopConfig,
   type OrchestratorState,
 } from "../src/core/loop.js";
+import { compileGraph, type CompiledGraph, type GraphDefinition } from "../src/core/graph.js";
+import {
+  applyRecoveryDecisionToLedger,
+  createRecoveryLedger,
+  fingerprintFailure,
+  registerRecovery,
+  validateRecoveryLedger,
+  type FailureEvidence,
+  type RecoveryLedger,
+} from "../src/core/recovery.js";
+import {
+  createSchedulerRecoveryBinding,
+  schedulerFailureEvidence,
+  validateSchedulerRecoveryBinding,
+  type SchedulerRecoveryBinding,
+} from "../src/core/schedulerRecovery.js";
 import {
   MCP_RUN_ROUTING_MAX,
   mcpRunApproveVerdictSchema,
@@ -17,6 +33,7 @@ import {
   mcpRunJudgeRoutingDecisionSchema,
   mcpRunPlanRoutingDecisionSchema,
   mcpRunPlanTextSchema,
+  mcpRunRecoverInputSchema,
   mcpRunRejectVerdictSchema,
   mcpRunResponseSchema,
   mcpRunRoutingDecisionSchema,
@@ -32,7 +49,11 @@ import {
   MCP_PROVIDER_DEFINITE_FAILURE_CODES,
   MCP_PROVIDER_UNCERTAIN_FAILURE_CODES,
 } from "./failureCodes.js";
-import type { ArtifactReference } from "../src/core/scheduler.js";
+import type { ArtifactReference, GraphExecutionState } from "../src/core/scheduler.js";
+import {
+  validateRecoveryArtifactBinding,
+  type RecoveryArtifactBinding,
+} from "../src/runtime/recoveryArtifacts.js";
 
 type RunRoutingDecision = McpRunResponse["routing"][number];
 type PlanRoutingDecision = z.infer<typeof mcpRunPlanRoutingDecisionSchema>;
@@ -240,6 +261,19 @@ export interface McpRunRecord {
   requestAuthority: McpRunRequestAuthority;
   cancelledCheckpoint?: OrchestratorState;
   abandonedProviderAttempt?: ProviderEffectBase & { attempt: ProviderAttemptReservation };
+  recovery?: McpRunRecoveryEnvelope;
+}
+
+export interface McpRunRecoveryEnvelope {
+  version: 1;
+  binding: Readonly<SchedulerRecoveryBinding>;
+  ledger: Readonly<RecoveryLedger>;
+  artifacts: readonly Readonly<RecoveryArtifactBinding>[];
+}
+
+export interface McpRunRecoveryContext {
+  graphDefinition: GraphDefinition;
+  schedulerState: GraphExecutionState;
 }
 
 export type McpRunRecordDraft = Omit<McpRunRecord, "revision">;
@@ -254,7 +288,8 @@ interface McpRunRequestBase {
 export type McpRunMutationEffect =
   | { operation: "start" }
   | { operation: "advance"; event: McpRunClientEvent["type"] }
-  | { operation: "cancel" };
+  | { operation: "cancel" }
+  | { operation: "recover" };
 
 export type McpRunRequestUpdate =
   | (McpRunRequestBase & { state: "pending"; effect: ProviderEffect })
@@ -334,6 +369,14 @@ export interface McpRunTransaction {
   ): Promise<McpRunRecord | undefined>;
   /** Write immutable provider-result bytes while this lease generation is held. */
   writeProviderOutput(input: McpRunProviderOutput): Promise<ArtifactReference>;
+  /** Trusted scheduler state and graph bytes used to anchor the first recovery ledger. */
+  getRecoveryContext?(): Promise<McpRunRecoveryContext>;
+  /** Write one immutable content-addressed artifact while this lease generation is held. */
+  writeRecoveryArtifact?(input: {
+    runId: string;
+    semanticRef: string;
+    bytes: Uint8Array;
+  }): Promise<RecoveryArtifactBinding>;
 }
 
 /**
@@ -398,6 +441,7 @@ const mutationEffectSchema = z.discriminatedUnion("operation", [
     event: z.enum(["plan_approved", "plan_revision_requested", "code_result_submitted", "cancelled"]),
   }).strict(),
   z.object({ operation: z.literal("cancel") }).strict(),
+  z.object({ operation: z.literal("recover") }).strict(),
 ]);
 
 const requestBaseSchema = {
@@ -453,6 +497,7 @@ const runRecordSchema = z.object({
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     attempt: providerAttemptReservationSchema,
   }).strict().optional(),
+  recovery: z.unknown().optional(),
 }).strict();
 
 const requestRecordSchema = z.discriminatedUnion("state", [
@@ -492,6 +537,35 @@ export function parseMcpRunPublicationAuthority(unparsed: unknown): McpRunPublic
   if (!record) throw new Error("Run publication authority is missing its record");
   assertRequestReceiptAuthority(publication.request, record);
   return { record, request: structuredClone(publication.request) };
+}
+
+export function validateMcpRunRecoveryEnvelope(value: unknown): McpRunRecoveryEnvelope {
+  assertCanonicalJsonData(value, "MCP recovery envelope");
+  if (value === null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("MCP recovery envelope must be a plain object");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (stableJson(keys) !== stableJson(["artifacts", "binding", "ledger", "version"])) {
+    throw new Error("MCP recovery envelope has unexpected or missing fields");
+  }
+  if (record.version !== 1) throw new Error("MCP recovery envelope version must be 1");
+  const binding = validateSchedulerRecoveryBinding(record.binding);
+  const ledger = validateRecoveryLedger(record.ledger, binding.authority);
+  if (!Array.isArray(record.artifacts) || Object.keys(record.artifacts).length !== record.artifacts.length ||
+      record.artifacts.length > 4_096) {
+    throw new Error("MCP recovery artifacts must be a bounded dense array");
+  }
+  const artifacts = record.artifacts.map(validateRecoveryArtifactBinding);
+  if (new Set(artifacts.map(({ semanticRef }) => semanticRef)).size !== artifacts.length) {
+    throw new Error("MCP recovery artifact references must be unique");
+  }
+  return Object.freeze({
+    version: 1,
+    binding,
+    ledger,
+    artifacts: Object.freeze(artifacts),
+  });
 }
 
 export interface CreateMcpRunServiceOptions {
@@ -618,7 +692,9 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
           return conflictResponse(current, input.expectedRevision);
         }
         if (current.pendingProviderIntent && input.event.type !== "cancelled") return responseFor(current, "current");
-        assertMutable(current);
+        if (current.recovery !== undefined && input.event.type !== "cancelled") return responseFor(current, "current");
+        if (input.event.type === "cancelled") assertCancellable(current);
+        else assertMutable(current);
 
         switch (input.event.type) {
           case "plan_approved":
@@ -646,8 +722,26 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
         if (current.revision !== input.expectedRevision) {
           return conflictResponse(current, input.expectedRevision);
         }
-        assertMutable(current);
+        assertCancellable(current);
         return cancelRun(transaction, current, input.reason, identity);
+      });
+    },
+
+    recover: async (unparsed) => {
+      const input = mcpRunRecoverInputSchema.parse(unparsed);
+      const identity = requestIdentity("recover", input.requestId, input);
+      return options.repository.withRunLease(input.runId, async (transaction) => {
+        const replay = requestForLookup(await transaction.getRequest(identity.requestRef), identity.requestRef, input.runId);
+        if (replay) return replayRequest(replay, identity.requestHash, options.repository);
+        const current = await requireTransactionRun(transaction, options.repository, input.runId);
+        if (current.revision !== input.expectedRevision) return conflictResponse(current, input.expectedRevision);
+        if (current.pendingProviderIntent) {
+          throw new Error("Recovery cannot replace an unresolved provider outcome; cancel or reconcile it first");
+        }
+        if (current.status === "done" || current.status === "cancelled") {
+          throw new Error(`Recovery cannot mutate terminal run status ${current.status}`);
+        }
+        return classifyMcpRunRecovery(transaction, current, identity);
       });
     },
   };
@@ -657,6 +751,197 @@ interface RequestIdentity {
   requestRef: string;
   requestHash: string;
   mutationEffect: McpRunMutationEffect;
+}
+
+async function classifyMcpRunRecovery(
+  transaction: McpRunTransaction,
+  current: McpRunRecord,
+  identity: RequestIdentity,
+): Promise<McpRunResponse> {
+  if (!current.state.plan) throw new Error("Recovery requires an authenticated approved-plan artifact");
+  if (!transaction.getRecoveryContext || !transaction.writeRecoveryArtifact) {
+    throw new Error("Stateful recovery is unavailable for this MCP repository");
+  }
+  const context = await transaction.getRecoveryContext();
+  const graph = compileGraph(context.graphDefinition);
+  const existingEnvelope = current.recovery === undefined
+    ? undefined
+    : validateMcpRunRecoveryEnvelope(current.recovery);
+  const binding = existingEnvelope?.binding ?? createSchedulerRecoveryBinding(graph, context.schedulerState, {
+    nodeId: context.graphDefinition.entry,
+    activePlanVersion: current.planVersion,
+    activePlanHash: currentPlanArtifactHash(current),
+  });
+  const failure = deriveMcpRunFailureEvidence(graph, binding, current);
+  let envelope = existingEnvelope ?? await createInitialRecoveryEnvelope(transaction, current, context, binding);
+  const fingerprint = fingerprintFailure(failure);
+  if (envelope.ledger.records.some((record) =>
+    record.kind === "registration" && record.state.fingerprint === fingerprint)) {
+    throw new Error("The latest closed failure is already registered in this recovery ledger");
+  }
+  envelope = {
+    ...envelope,
+    ledger: registerRecovery(envelope.ledger, envelope.binding.authority, failure),
+  };
+
+  envelope = {
+    ...envelope,
+    ledger: applyRecoveryDecisionToLedger(
+      envelope.ledger,
+      envelope.binding.authority,
+      fingerprint,
+      undefined,
+    ),
+  };
+  const committed = await compareAndSwapValidated(
+    transaction,
+    current.revision,
+    draftFrom(current, { recovery: envelope }),
+    settledRequest(identity, "advanced"),
+    "advanced",
+  );
+  return responseFor(requireCommitted(committed, "persisting recovery decision"), "advanced");
+}
+
+async function createInitialRecoveryEnvelope(
+  transaction: McpRunTransaction,
+  current: McpRunRecord,
+  context: McpRunRecoveryContext,
+  binding: SchedulerRecoveryBinding,
+): Promise<McpRunRecoveryEnvelope> {
+  if (!transaction.getRecoveryContext || !transaction.writeRecoveryArtifact || !current.state.plan) {
+    throw new Error("Stateful recovery repository context is unavailable");
+  }
+  const activePlanHash = currentPlanArtifactHash(current);
+  const graphRef = `plan-versions/${current.planVersion}/graph.json`;
+  const planRef = `plan-versions/${current.planVersion}/plan.md`;
+  const graphArtifact = await transaction.writeRecoveryArtifact({
+    runId: current.runId,
+    semanticRef: graphRef,
+    bytes: Buffer.from(stableJson(context.graphDefinition), "utf8"),
+  });
+  const planArtifact = await transaction.writeRecoveryArtifact({
+    runId: current.runId,
+    semanticRef: planRef,
+    bytes: Buffer.from(current.state.plan, "utf8"),
+  });
+  if (graphArtifact.sha256 !== binding.authority.graphDigest || planArtifact.sha256 !== activePlanHash) {
+    throw new Error("Recovery genesis artifacts do not match scheduler and approved-plan authority");
+  }
+  return validateMcpRunRecoveryEnvelope({
+    version: 1,
+    binding,
+    ledger: createRecoveryLedger(binding.authority),
+    artifacts: [graphArtifact, planArtifact],
+  });
+}
+
+function currentPlanArtifactHash(record: McpRunRecord): string {
+  const plans = record.providerEvidence.filter((evidence) =>
+    evidence.kind === "plan" && evidence.phase === "output_committed");
+  const current = plans.at(-1);
+  if (!current || current.phase !== "output_committed") {
+    throw new Error("Recovery requires an immutable committed PLAN output");
+  }
+  return current.resultRef.sha256;
+}
+
+/**
+ * Derive the only recovery observation the MCP fast-path can currently prove.
+ * The client never supplies category, contract, attempt, or lineage data.
+ */
+export function deriveMcpRunFailureEvidence(
+  graph: CompiledGraph,
+  binding: SchedulerRecoveryBinding,
+  record: McpRunRecord,
+): FailureEvidence {
+  if (record.runId !== binding.authority.runId ||
+      record.planVersion !== binding.authority.activePlanVersion ||
+      currentPlanArtifactHash(record) !== binding.authority.activePlanHash) {
+    throw new Error("Recovery failure evidence is not bound to the current approved plan");
+  }
+
+  const latestEvidence = record.providerEvidence.at(-1);
+  if (record.status === "failed" && latestEvidence?.phase === "failed") {
+    const outputContract = `mcp-${latestEvidence.kind}-output-v1:${latestEvidence.effectId}`;
+    const observation = providerFailureObservation(latestEvidence.failureCode, outputContract);
+    return schedulerFailureEvidence(graph, binding, record.providerAttempts, {
+      ...observation,
+      artifactHashes: [binding.authority.activePlanHash],
+    });
+  }
+
+  const latestCommitted = [...record.providerEvidence].reverse()
+    .find((evidence) => evidence.phase === "output_committed");
+  const lastReport = record.state.judgeReports.at(-1);
+  if (latestEvidence?.phase === "output_committed" && latestEvidence === latestCommitted &&
+      latestEvidence.kind === "judge" && record.lastVerdict?.verdict === "reject" &&
+      lastReport?.verdict === "reject" && record.state.coderIterations > 0) {
+    return schedulerFailureEvidence(graph, binding, record.state.coderIterations, {
+      category: "implementation-defect",
+      contractViolation: "validator-rejected",
+      contractId: `mcp-judge-output-v1:${latestEvidence.effectId}`,
+      artifactHashes: [binding.authority.activePlanHash],
+    });
+  }
+
+  throw new Error("Recovery requires a server-authenticated closed provider failure or checker rejection");
+}
+
+function providerFailureObservation(
+  code: Extract<ProviderAttemptEvidence, { phase: "failed" }>["failureCode"],
+  contractId: string,
+): { category: FailureEvidence["category"]; contractViolation?: FailureEvidence["contractViolation"]; contractId?: string } {
+  switch (code) {
+    case "provider_unconfigured":
+    case "missing_api_key":
+    case "unsupported_api":
+      return { category: "configuration" };
+    case "invalid_json":
+    case "schema_validation_failed":
+    case "truncated":
+    case "response_too_large":
+      return { category: "output-contract", contractViolation: "invalid-output", contractId };
+    case "empty_response":
+      return { category: "output-contract", contractViolation: "missing-output", contractId };
+    case "http_error":
+    case "provider_response_failed":
+      return { category: "transient-provider" };
+    default:
+      return assertNever(code);
+  }
+}
+
+function recoveryResponseFor(envelopeValue: McpRunRecoveryEnvelope): NonNullable<McpRunResponse["recovery"]> {
+  const envelope = validateMcpRunRecoveryEnvelope(envelopeValue);
+  const tail = envelope.ledger.records.at(-1);
+  if (!tail) throw new Error("Persisted MCP recovery envelope has no decision");
+  const state = tail.state;
+  let decision: Extract<RecoveryLedger["records"][number], { kind: "decision" }>["decision"] | undefined;
+  for (let index = envelope.ledger.records.length - 1; index >= 0; index -= 1) {
+    const candidate = envelope.ledger.records[index]!;
+    if (candidate.kind === "decision" && candidate.fingerprint === state.fingerprint) {
+      decision = candidate.decision;
+      break;
+    }
+  }
+  return {
+    failureFingerprint: state.fingerprint,
+    status: state.status,
+    ...(decision === undefined ? {} : { action: decision.action, reason: decision.reason, targetPlanVersion: decision.targetPlanVersion }),
+    sourcePlanVersion: state.sourcePlanVersion,
+    remaining: structuredClone(state.remaining),
+  };
+}
+
+function currentRecoveryPlanVersion(envelope: McpRunRecoveryEnvelope): number {
+  let version = envelope.binding.authority.activePlanVersion;
+  for (const record of envelope.ledger.records) {
+    if (record.kind === "successor" && record.event.phase === "activated") {
+      version = record.event.targetPlanVersion;
+    }
+  }
+  return version;
 }
 
 async function approvePlan(
@@ -912,7 +1197,13 @@ async function cancelRun(
   const providerEvidence = pendingEffect?.phase === "awaiting_output_commit"
     ? markProviderOutputUnknownForCancellation(current.providerEvidence, pendingEffect)
     : current.providerEvidence;
-  const state = nextPhase(current.state, { type: "cancelled" }, current.loop);
+  const state = current.status === "failed" && current.recovery !== undefined
+    ? createIdleState({
+        originalModel: current.state.originalModel
+          ? structuredClone(current.state.originalModel)
+          : undefined,
+      })
+    : nextPhase(current.state, { type: "cancelled" }, current.loop);
   const committed = await compareAndSwapValidated(
     transaction,
     current.revision,
@@ -1368,7 +1659,9 @@ function attemptWithoutOutcome(result: RoutedCompletionAttemptResult): RoutedCom
 
 function responseFor(record: McpRunRecord, outcome: RunOutcome): McpRunResponse {
   const loop = record.loop;
-  const blocked = record.pendingProviderIntent;
+  const providerBlocked = record.pendingProviderIntent;
+  const recoveryBlocked = record.recovery !== undefined && record.status !== "cancelled";
+  const blocked = providerBlocked || recoveryBlocked;
   const visibleState = record.status === "cancelled" && record.cancelledCheckpoint
     ? record.cancelledCheckpoint
     : record.state;
@@ -1399,8 +1692,8 @@ function responseFor(record: McpRunRecord, outcome: RunOutcome): McpRunResponse 
     currentNode: visibleState.phase,
     requiredAction,
     permittedEvents,
-    ...(blocked || visibleState.plan === undefined ? {} : { plan: visibleState.plan }),
-    ...(blocked || record.lastVerdict === undefined ? {} : { lastVerdict: structuredClone(record.lastVerdict) }),
+    ...(providerBlocked || visibleState.plan === undefined ? {} : { plan: visibleState.plan }),
+    ...(providerBlocked || record.lastVerdict === undefined ? {} : { lastVerdict: structuredClone(record.lastVerdict) }),
     routing: structuredClone(record.routing),
     progress: {
       coderIterations: visibleState.coderIterations,
@@ -1417,8 +1710,11 @@ function responseFor(record: McpRunRecord, outcome: RunOutcome): McpRunResponse 
       consecutiveRejections: Math.max(0, loop.plannerEscalationAfterRejections - visibleState.consecutiveRejections),
       providerCalls: Math.max(0, record.maxProviderCalls - record.providerAttempts),
     },
-    ...(blocked
+    ...(record.recovery === undefined ? {} : { recovery: recoveryResponseFor(record.recovery) }),
+    ...(providerBlocked
       ? { message: "A provider returned but its durable outcome is uncertain; this run requires recovery before it can advance." }
+      : recoveryBlocked
+        ? { message: "A scheduler-anchored recovery decision is pending execution; inspect the typed recovery result before advancing." }
       : record.terminalMessage === undefined
         ? {}
         : { message: record.terminalMessage }),
@@ -1434,6 +1730,7 @@ function conflictResponse(record: McpRunRecord, expectedRevision: number): McpRu
     message: _message,
     routing: _routing,
     permittedEvents: _permittedEvents,
+    recovery: _recovery,
     ...safeStatus
   } = response;
   return mcpRunResponseSchema.parse({
@@ -1712,6 +2009,13 @@ function assertRunBusinessInvariants(record: McpRunRecord): void {
   if (record.requireDifferentCheckerFamily && record.coderFamily === undefined) {
     throw new Error("Coder family is required for checker family separation");
   }
+  if (record.recovery !== undefined) {
+    const recovery = validateMcpRunRecoveryEnvelope(record.recovery);
+    if (recovery.binding.authority.runId !== record.runId ||
+        currentRecoveryPlanVersion(recovery) !== record.planVersion) {
+      throw new Error("Persisted MCP recovery authority is not bound to the run's approved plan lineage");
+    }
+  }
 
   const phase = record.state.phase;
   if (record.status === "active" && !["planning", "awaiting_approval", "coding", "judging", "replanning"].includes(phase)) {
@@ -1722,8 +2026,10 @@ function assertRunBusinessInvariants(record: McpRunRecord): void {
   if (record.status === "cancelled") {
     if (phase !== "idle" || !record.cancelledCheckpoint) throw new Error("Cancelled run must retain an idle reducer plus its last active checkpoint");
     if (record.state.task !== "" || record.state.plan !== undefined) throw new Error("Cancelled reducer state must be reset");
-    if (!["planning", "awaiting_approval", "coding", "judging", "replanning"].includes(record.cancelledCheckpoint.phase)) {
-      throw new Error("Cancelled run checkpoint must retain a formerly active lifecycle phase");
+    const cancellableCheckpointPhases = ["planning", "awaiting_approval", "coding", "judging", "replanning"];
+    const failedRecoveryCheckpoint = record.cancelledCheckpoint.phase === "failed" && record.recovery !== undefined;
+    if (!cancellableCheckpointPhases.includes(record.cancelledCheckpoint.phase) && !failedRecoveryCheckpoint) {
+      throw new Error("Cancelled run checkpoint must retain an active or failed recovery lifecycle phase");
     }
   } else if (record.cancelledCheckpoint !== undefined) {
     throw new Error("Only cancelled runs may retain a cancellation checkpoint");
@@ -1908,6 +2214,13 @@ function assertMutationEffectShape(record: McpRunRecord): void {
     }
     return;
   }
+  if (mutation.operation === "recover") {
+    if (record.requestAuthority.state !== "settled" || record.requestAuthority.outcome !== "advanced" || ids.length !== 0) {
+      throw new Error("Recovery request must settle without provider effects");
+    }
+    if (record.recovery === undefined) throw new Error("Recovery request did not persist recovery authority");
+    return;
+  }
   if (record.requestAuthority.state === "settled") {
     const expectedOutcome = mutation.operation === "cancel" || mutation.event === "cancelled"
       ? "cancelled"
@@ -2090,7 +2403,9 @@ function reachableFinalStates(
   if (record.status === "done") {
     return !hasUncommittedEffect && replay.phase === "done" ? [replay] : [];
   }
-  if (record.status === "failed") {
+  const failedRecoveryCancellation = record.status === "cancelled" &&
+    record.recovery !== undefined && record.cancelledCheckpoint?.phase === "failed";
+  if (record.status === "failed" || failedRecoveryCancellation) {
     if (replay.phase === "failed") return hasUncommittedEffect ? [] : [replay];
     const providerFailureIsReachable = hasUncommittedEffect
       ? ["planning", "judging", "replanning"].includes(replay.phase)
@@ -2211,7 +2526,7 @@ function providerEffectIdsFor(
   return [...record.requestAuthority.providerEffectIds];
 }
 
-function requestIdentity(operation: "start" | "advance" | "cancel", requestId: string, input: unknown): RequestIdentity {
+function requestIdentity(operation: "start" | "advance" | "cancel" | "recover", requestId: string, input: unknown): RequestIdentity {
   const mutationEffect: McpRunMutationEffect = operation === "advance"
     ? {
         operation,
@@ -2258,6 +2573,12 @@ function statusFor(state: OrchestratorState): Exclude<RunStatus, "blocked" | "ca
 
 function assertMutable(record: McpRunRecord): void {
   if (record.status !== "active") throw new Error(`Run ${record.runId} is terminal and immutable`);
+}
+
+function assertCancellable(record: McpRunRecord): void {
+  if (record.status === "active") return;
+  if (record.status === "failed" && record.recovery !== undefined) return;
+  throw new Error(`Run ${record.runId} is terminal and immutable`);
 }
 
 function assertPhase(record: McpRunRecord, expected: OrchestratorState["phase"], event: McpRunClientEvent["type"]): void {

@@ -229,6 +229,7 @@ describe("MCP server", () => {
         "orchestrator_run_advance",
         "orchestrator_run_cancel",
         "orchestrator_run_get",
+        "orchestrator_run_recover",
         "orchestrator_run_start",
       ]);
 
@@ -237,6 +238,7 @@ describe("MCP server", () => {
         "orchestrator_run_get",
         "orchestrator_run_advance",
         "orchestrator_run_cancel",
+        "orchestrator_run_recover",
       ]) {
         const tool = result.tools.find((candidate) => candidate.name === name);
         expect(tool?.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
@@ -301,6 +303,7 @@ describe("MCP server", () => {
         "orchestrator_run_advance",
         "orchestrator_run_cancel",
         "orchestrator_run_get",
+        "orchestrator_run_recover",
         "orchestrator_run_start",
       ]);
     });
@@ -335,6 +338,51 @@ describe("MCP server", () => {
         revision: started.revision,
         outcome: "current",
         currentNode: "awaiting_approval",
+      });
+
+      const manufacturedRecovery = await client.request("tools/call", {
+        name: "orchestrator_run_recover",
+        arguments: {
+          requestId: "packed-stateful-manufactured-recovery",
+          runId: started.runId,
+          expectedRevision: started.revision,
+        },
+      }) as { isError?: boolean };
+      expect(manufacturedRecovery.isError).toBe(true);
+
+      const approvedResult = await client.request("tools/call", {
+        name: "orchestrator_run_advance",
+        arguments: {
+          requestId: "packed-stateful-approve",
+          runId: started.runId,
+          expectedRevision: started.revision,
+          event: { type: "plan_approved" },
+        },
+      });
+      const approved = toolStructuredContent(approvedResult) as { revision: number };
+      const rejectedResult = await client.request("tools/call", {
+        name: "orchestrator_run_advance",
+        arguments: {
+          requestId: "packed-stateful-code",
+          runId: started.runId,
+          expectedRevision: approved.revision,
+          event: { type: "code_result_submitted", diff: "unacceptable diff", testOutput: "failed" },
+        },
+      });
+      const rejected = toolStructuredContent(rejectedResult) as { revision: number };
+      const recoveryResult = await client.request("tools/call", {
+        name: "orchestrator_run_recover",
+        arguments: {
+          requestId: "packed-stateful-recovery",
+          runId: started.runId,
+          expectedRevision: rejected.revision,
+        },
+      });
+      expect(toolStructuredContent(recoveryResult)).toMatchObject({
+        runId: started.runId,
+        status: "blocked",
+        requiredAction: "inspect_run",
+        recovery: { action: "pause", reason: "diagnosis-required", status: "waiting-diagnosis" },
       });
     });
   });

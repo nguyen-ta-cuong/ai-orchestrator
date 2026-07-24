@@ -17,6 +17,12 @@ import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { McpRunStorageConfig } from "../src/core/config.js";
 import { compileGraph, type CompiledGraph, type GraphDefinition } from "../src/core/graph.js";
 import {
+  applyRecoveryDecisionToLedger,
+  createRecoveryLedger,
+  fingerprintFailure,
+  registerRecovery,
+} from "../src/core/recovery.js";
+import {
   applySchedulerEvent,
   createGraphExecutionState,
   evaluateExecutionGuard,
@@ -28,6 +34,7 @@ import {
   type GraphEvent,
   type GraphExecutionState,
 } from "../src/core/scheduler.js";
+import { assertSchedulerRecoveryAnchor } from "../src/core/schedulerRecovery.js";
 import {
   acquireGraphCheckpointLease,
   assertGraphCheckpointPathsSafe,
@@ -50,12 +57,20 @@ import {
   type GraphCheckpointLease,
   type GraphCheckpointPaths,
 } from "../src/runtime/graphCheckpoint.js";
+import {
+  authenticateRecoveryArtifacts,
+  recoveryArtifactBinding,
+  type RecoveryArtifactBinding,
+} from "../src/runtime/recoveryArtifacts.js";
 import { mcpRunIdSchema, MCP_RUN_ROUTING_MAX } from "./runProtocol.js";
 import {
   createMcpRunRequestRecord,
+  deriveMcpRunFailureEvidence,
   parseMcpRunPublicationAuthority,
+  validateMcpRunRecoveryEnvelope,
   type McpRunCheckpointReference,
   type McpRunProviderOutput,
+  type McpRunRecoveryContext,
   type McpRunPublication,
   type McpRunPublicationGuard,
   type McpRunRecord,
@@ -244,6 +259,8 @@ class DiskMcpRunRepository implements DurableMcpRunRepository {
         return this.publish(paths, lease, current, draft, request, beforePublication, loaded);
       },
       writeProviderOutput: async (input) => this.writeProviderOutput(paths, lease, runId, input),
+      getRecoveryContext: async () => this.recoveryContext(paths, lease),
+      writeRecoveryArtifact: async (input) => this.writeRecoveryArtifact(paths, lease, runId, input),
     };
   }
 
@@ -321,6 +338,7 @@ class DiskMcpRunRepository implements DurableMcpRunRepository {
       throw new Error("MCP publication lease generation changed during validation");
     }
     parseMcpRunPublicationAuthority(publication);
+    assertRecoveryPublication(this.graph, paths, loaded.checkpoint.genesisState, loaded.events, current, record);
 
     const bytes = Buffer.from(canonicalJson(publication), "utf8");
     const digest = sha256(bytes);
@@ -388,6 +406,32 @@ class DiskMcpRunRepository implements DurableMcpRunRepository {
       contract: `${expectedContract}:${input.effect.effectId}`,
       bytes: Buffer.from(input.bytes),
     });
+  }
+
+  private recoveryContext(paths: GraphCheckpointPaths, lease: GraphCheckpointLease): McpRunRecoveryContext {
+    const loaded = this.load(paths, lease);
+    return {
+      graphDefinition: clone(this.graph.definition),
+      schedulerState: clone(loaded.state),
+    };
+  }
+
+  private writeRecoveryArtifact(
+    paths: GraphCheckpointPaths,
+    lease: GraphCheckpointLease,
+    runId: string,
+    input: { runId: string; semanticRef: string; bytes: Uint8Array },
+  ): RecoveryArtifactBinding {
+    if (input.runId !== runId) throw new Error("Recovery artifact crossed an MCP run boundary");
+    if (!ownsGraphCheckpointLease(paths, lease)) throw new Error("Recovery artifact lease generation is no longer owned");
+    const bytes = Buffer.from(input.bytes);
+    const digest = sha256(bytes);
+    const storageRef = writeGraphMutationArtifact(paths, {
+      owner: lease,
+      mutationId: digest,
+      bytes,
+    });
+    return recoveryArtifactBinding(input.semanticRef, storageRef);
   }
 
   private requestByRef(
@@ -462,10 +506,22 @@ class DiskMcpRunRepository implements DurableMcpRunRepository {
       if (graphEventDigest(expectedEvent) !== graphEventDigest(event) || canonicalJson(expectedEvent) !== canonicalJson(event)) {
         throw new Error(`MCP scheduler event ${event.sequence} does not authenticate its publication transition`);
       }
+      assertRecoveryPublication(
+        this.graph,
+        paths,
+        checkpoint.genesisState,
+        events.slice(0, event.sequence - 1),
+        prior,
+        publication.record,
+        false,
+      );
       validateProviderArtifacts(paths, publication, committedOutputs);
       replay = applySchedulerEvent(this.graph, replay, event);
       publications.push(publication);
       prior = publication.record;
+    }
+    if (prior?.recovery !== undefined) {
+      authenticateRecoveryEnvelope(paths, validateMcpRunRecoveryEnvelope(prior.recovery));
     }
     if (canonicalJson(replay) !== canonicalJson(state)) {
       throw new Error("MCP publication replay does not match scheduler authority");
@@ -692,6 +748,113 @@ function validateProviderArtifacts(
     }
     seen.add(evidence.providerAttemptIdempotencyKey);
   }
+}
+
+function assertRecoveryPublication(
+  graph: CompiledGraph,
+  paths: GraphCheckpointPaths,
+  genesis: Readonly<GraphExecutionState>,
+  priorEvents: readonly GraphEvent[],
+  prior: McpRunRecord | undefined,
+  next: McpRunRecord,
+  authenticateArtifacts = true,
+): void {
+  const operation = next.requestAuthority.mutationEffect.operation;
+  if (next.recovery === undefined) {
+    if (prior?.recovery !== undefined) throw new Error("MCP recovery authority cannot be removed");
+    if (operation === "recover") throw new Error("MCP recovery mutation did not persist a recovery ledger");
+    return;
+  }
+  const recovery = validateMcpRunRecoveryEnvelope(next.recovery);
+  if (recovery.binding.anchor.schedulerRevision > priorEvents.length) {
+    throw new Error("MCP recovery anchor points beyond durable scheduler authority");
+  }
+  const anchorState = schedulerStateAtRevision(graph, genesis, priorEvents, recovery.binding.anchor.schedulerRevision);
+  assertSchedulerRecoveryAnchor(graph, anchorState, recovery.binding);
+  if (authenticateArtifacts) authenticateRecoveryEnvelope(paths, recovery);
+
+  if (prior?.recovery === undefined) {
+    if (operation !== "recover" || recovery.binding.anchor.schedulerRevision !== priorEvents.length) {
+      throw new Error("MCP recovery genesis is not anchored to the immediately prior WAL head");
+    }
+    if (!prior) throw new Error("MCP recovery genesis requires a prior run authority checkpoint");
+    assertRecoveryRegistrationMatchesClosedFailure(graph, recovery, prior, recovery.ledger.records);
+    return;
+  }
+  const previous = validateMcpRunRecoveryEnvelope(prior.recovery);
+  if (canonicalJson(previous.binding) !== canonicalJson(recovery.binding)) {
+    throw new Error("MCP recovery changed its frozen scheduler authority");
+  }
+  if (recovery.ledger.records.length < previous.ledger.records.length ||
+      canonicalJson(recovery.ledger.records.slice(0, previous.ledger.records.length)) !== canonicalJson(previous.ledger.records)) {
+    throw new Error("MCP recovery ledger is not append-only");
+  }
+  if (recovery.artifacts.length < previous.artifacts.length ||
+      canonicalJson(recovery.artifacts.slice(0, previous.artifacts.length)) !== canonicalJson(previous.artifacts)) {
+    throw new Error("MCP recovery artifact bindings are not append-only");
+  }
+  const changed = canonicalJson(previous) !== canonicalJson(recovery);
+  if (operation === "recover" && !changed) throw new Error("MCP recovery mutation made no monotonic progress");
+  if (operation !== "recover" && changed) throw new Error("Only an explicit recovery mutation may change recovery authority");
+  if (operation === "recover") {
+    assertRecoveryRegistrationMatchesClosedFailure(
+      graph,
+      recovery,
+      prior,
+      recovery.ledger.records.slice(previous.ledger.records.length),
+    );
+  }
+}
+
+function assertRecoveryRegistrationMatchesClosedFailure(
+  graph: CompiledGraph,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  prior: McpRunRecord,
+  appendedRecords: readonly ReturnType<typeof validateMcpRunRecoveryEnvelope>["ledger"]["records"][number][],
+): void {
+  const expected = deriveMcpRunFailureEvidence(graph, recovery.binding, prior);
+  const baseLedger = prior.recovery === undefined
+    ? createRecoveryLedger(recovery.binding.authority)
+    : validateMcpRunRecoveryEnvelope(prior.recovery).ledger;
+  const registered = registerRecovery(baseLedger, recovery.binding.authority, expected);
+  const decided = applyRecoveryDecisionToLedger(
+    registered,
+    recovery.binding.authority,
+    fingerprintFailure(expected),
+    undefined,
+  );
+  const expectedRecords = decided.records.slice(baseLedger.records.length);
+  if (canonicalJson(appendedRecords) !== canonicalJson(expectedRecords)) {
+    throw new Error("Recovery mutation does not match the exact server-derived registration and no-diagnosis decision");
+  }
+}
+
+function authenticateRecoveryEnvelope(
+  paths: GraphCheckpointPaths,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+): void {
+  authenticateRecoveryArtifacts({
+    authority: recovery.binding.authority,
+    ledger: recovery.ledger,
+    bindings: recovery.artifacts,
+    readArtifact: (reference) => readGraphMutationArtifact(paths, reference),
+  });
+}
+
+function schedulerStateAtRevision(
+  graph: CompiledGraph,
+  genesis: Readonly<GraphExecutionState>,
+  events: readonly GraphEvent[],
+  revision: number,
+): GraphExecutionState {
+  if (!Number.isSafeInteger(revision) || revision < 0 || revision > events.length) {
+    throw new Error("MCP recovery scheduler revision is unavailable");
+  }
+  let state = clone(genesis);
+  for (let index = 0; index < revision; index += 1) {
+    state = applySchedulerEvent(graph, state, events[index]!);
+  }
+  return state;
 }
 
 function usageFor(attempt: ProviderAttemptReservation, record: McpRunRecord): {

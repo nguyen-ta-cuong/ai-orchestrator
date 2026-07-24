@@ -179,9 +179,10 @@ The MCP server routes only its planner and checker calls. Cursor's selected host
 5. Implement only while `currentNode` is `coding`; collect the unstaged/staged diff and relevant test output.
 6. Submit `code_result_submitted` with a fresh request ID and exact current revision. The server owns checker selection, iteration and rejection counters, automatic re-plan thresholds, and terminal caps.
 7. Follow `currentNode`, `permittedEvents`, `requiredAction`, `limits`, and `remaining` exactly. Address every required fix before submitting refreshed evidence. Stop on terminal or blocked status.
-8. Reuse a request ID only for the identical mutation after a lost response. On revision conflict call `orchestrator_run_get`, reconcile current authority, and use a new ID for changed input. Use `orchestrator_run_cancel` for explicit cancellation.
+8. Use `orchestrator_run_recover` only after the server has durably closed a provider failure or checker rejection. The server derives category, contract, attempt, and lineage from that evidence; the client cannot author a diagnosis. The response uses the shared classifier and blocks ordinary advancement until independent DEBUG and the matching action executor are wired.
+9. Reuse a request ID only for the identical mutation after a lost response. On revision conflict call `orchestrator_run_get`, reconcile current authority, and use a new ID for changed input. Use `orchestrator_run_cancel` for explicit cancellation.
 
-Run authority and immutable provider-output evidence live in the trusted user store and survive MCP restart. An optional project mirror contains only sanitized status. The stateless `orchestrator_plan`/`orchestrator_judge` flow remains available during the compatibility window.
+Run authority, immutable provider-output evidence, the recovery ledger, and content-addressed diagnosis evidence live in the trusted user store and survive MCP restart. Recovery caps and failure lineage are frozen at an authenticated scheduler WAL head. An optional project mirror contains only sanitized status. The stateless `orchestrator_plan`/`orchestrator_judge` flow remains available during the compatibility window.
 
 ## Cursor without MCP
 

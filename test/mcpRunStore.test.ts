@@ -3,9 +3,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { RoutedCompletionAttempt } from "../mcp/llm.js";
-import { createMcpRunService, type McpRunJudgeRequest, type McpRunPlanRequest, type McpRunProvider } from "../mcp/runService.js";
+import type { McpProviderDefiniteFailureCode } from "../mcp/failureCodes.js";
+import {
+  createMcpRunService,
+  validateMcpRunRecoveryEnvelope,
+  type McpRunJudgeRequest,
+  type McpRunPlanRequest,
+  type McpRunProvider,
+  type McpRunRepository,
+} from "../mcp/runService.js";
 import { createMcpRunStore } from "../mcp/runStore.js";
 import { DEFAULT_CONFIG, executionLimitsFrom, loopConfigFrom } from "../src/core/config.js";
+import {
+  applyRecoveryDecisionToLedger,
+  fingerprintFailure,
+  validateRecoveryDirective,
+} from "../src/core/recovery.js";
 
 describe("durable MCP run store", () => {
   it("restarts from append-only authority and resolves exact historical checkpoints", async () => {
@@ -209,6 +222,223 @@ describe("durable MCP run store", () => {
       .resolves.toMatchObject({ currentNode: "awaiting_approval" });
     expect(readdirSync(outside)).toEqual([]);
   });
+
+  it("derives bounded retry only from a closed provider failure and preserves it across restart", async () => {
+    const retryFixture = createFixture();
+    const retryService = serviceFor(retryFixture, new PlanProvider([], ["http_error"]));
+    const retryRun = await retryService.start(startInput("recovery-retry-start"));
+    const approved = await retryService.advance({
+      requestId: "recovery-retry-approve",
+      runId: retryRun.runId,
+      expectedRevision: retryRun.revision,
+      event: { type: "plan_approved" },
+    });
+    const failed = await retryService.advance({
+      requestId: "recovery-retry-code",
+      runId: retryRun.runId,
+      expectedRevision: approved.revision,
+      event: { type: "code_result_submitted", diff: "provider failure", testOutput: "not reached" },
+    });
+    expect(failed).toMatchObject({ status: "failed", currentNode: "failed" });
+    const retried = await retryService.recover({
+      requestId: "recovery-retry-1",
+      runId: retryRun.runId,
+      expectedRevision: failed.revision,
+    });
+    expect(retried.recovery).toMatchObject({
+      status: "released",
+      action: "retry",
+      reason: "transient-failure",
+      remaining: { retry: 0, repair: 1, replan: 1 },
+    });
+    expect(await retryService.advance({
+      requestId: "recovery-cannot-bypass",
+      runId: retryRun.runId,
+      expectedRevision: retried.revision,
+      event: { type: "plan_approved" },
+    })).toMatchObject({ status: "blocked", revision: retried.revision, requiredAction: "inspect_run" });
+    expect(await retryService.recover({
+      requestId: "recovery-retry-1",
+      runId: retryRun.runId,
+      expectedRevision: failed.revision,
+    })).toEqual(retried);
+    const stale = await retryService.recover({
+      requestId: "recovery-stale",
+      runId: retryRun.runId,
+      expectedRevision: failed.revision,
+    });
+    expect(stale).toMatchObject({ outcome: "conflict", revision: retried.revision, requiredAction: "inspect_run" });
+    expect(stale.recovery).toBeUndefined();
+    const retryStore = createStore(retryFixture);
+    const retryAuthority = await retryStore.get(retryRun.runId);
+    const registrations = retryAuthority?.recovery?.ledger.records.filter((record) => record.kind === "registration") ?? [];
+    expect(registrations).toHaveLength(1);
+    expect(registrations[0]?.kind === "registration" ? registrations[0].failure.failureLineageId : undefined)
+      .toMatch(/^lineage-[a-f0-9]{48}$/);
+    expect((await serviceFor(retryFixture, new PlanProvider(), retryStore).get({ runId: retryRun.runId })).recovery)
+      .toEqual(retried.recovery);
+
+    await expect(retryService.recover({
+      requestId: "recovery-retry-2",
+      runId: retryRun.runId,
+      expectedRevision: retried.revision,
+    })).rejects.toThrow(/already registered/i);
+
+    const cancelled = await retryService.cancel({
+      requestId: "recovery-retry-cancel",
+      runId: retryRun.runId,
+      expectedRevision: retried.revision,
+      reason: "operator stopped recovery",
+    });
+    expect(cancelled).toMatchObject({ status: "cancelled", outcome: "cancelled", currentNode: "failed" });
+  }, 30_000);
+
+  it("rejects manufactured observations and derives checker rejection without client-authored diagnosis", async () => {
+    const fixture = createFixture();
+    const service = serviceFor(fixture, new PlanProvider(["reject"]));
+    const started = await service.start(startInput("recovery-reject-start"));
+    await expect(service.recover({
+      requestId: "recovery-manufactured",
+      runId: started.runId,
+      expectedRevision: started.revision,
+    })).rejects.toThrow(/server-authenticated closed/i);
+
+    const approved = await service.advance({
+      requestId: "recovery-reject-approve",
+      runId: started.runId,
+      expectedRevision: started.revision,
+      event: { type: "plan_approved" },
+    });
+    const rejected = await service.advance({
+      requestId: "recovery-reject-code",
+      runId: started.runId,
+      expectedRevision: approved.revision,
+      event: { type: "code_result_submitted", diff: "bad diff", testOutput: "failed" },
+    });
+    const classified = await service.recover({
+      requestId: "recovery-reject-classify",
+      runId: started.runId,
+      expectedRevision: rejected.revision,
+    });
+    expect(classified.recovery).toMatchObject({
+      status: "waiting-diagnosis",
+      action: "pause",
+      reason: "diagnosis-required",
+      remaining: { retry: 1, repair: 1, replan: 1 },
+    });
+    await expect(service.recover({
+      requestId: "recovery-client-diagnosis",
+      runId: started.runId,
+      expectedRevision: classified.revision,
+      category: "implementation-defect",
+      diagnosis: {
+        rootCauseCategory: "implementation-defect",
+        confidence: "high",
+        content: "self-authored",
+        repairScope: ["src"],
+        validationRequirements: ["tests"],
+        topologyAssessment: "preserve",
+      },
+    } as never)).rejects.toThrow();
+  }, 30_000);
+
+  it("rejects a correct recovery registration bundled with a forged diagnosis decision", async () => {
+    const fixture = createFixture();
+    const store = createStore(fixture);
+    let injected = false;
+    const repository: McpRunRepository = {
+      withStartLease: store.withStartLease.bind(store),
+      withRunLease: (runId, work) => store.withRunLease(runId, async (transaction) => work({
+        get: transaction.get.bind(transaction),
+        getRequest: transaction.getRequest.bind(transaction),
+        writeProviderOutput: transaction.writeProviderOutput.bind(transaction),
+        getRecoveryContext: transaction.getRecoveryContext?.bind(transaction),
+        writeRecoveryArtifact: transaction.writeRecoveryArtifact?.bind(transaction),
+        compareAndSwap: async (expectedRevision, draft, update, beforePublication) => {
+          if (!injected && update.mutationEffect.operation === "recover" && draft.recovery !== undefined) {
+            injected = true;
+            const envelope = validateMcpRunRecoveryEnvelope(draft.recovery);
+            const registration = envelope.ledger.records.find((record) => record.kind === "registration");
+            if (!registration || registration.kind !== "registration" || !transaction.writeRecoveryArtifact) {
+              throw new Error("Expected an initial recovery registration and artifact writer");
+            }
+            const fingerprint = fingerprintFailure(registration.failure);
+            const content = "Client-authored diagnosis must not become durable authority.";
+            const diagnosisRef = `plan-versions/${registration.failure.planVersion}/diagnoses/${fingerprint}.md`;
+            const directive = validateRecoveryDirective({
+              version: 1,
+              failureFingerprint: fingerprint,
+              rootCauseCategory: "implementation-defect",
+              confidence: "high",
+              diagnosisRef,
+              diagnosisHash: createHash("sha256").update(content).digest("hex"),
+              evidenceRefs: [],
+              repairScope: ["src"],
+              validationRequirements: ["tests"],
+              topologyAssessment: "preserve",
+            });
+            const diagnosis = await transaction.writeRecoveryArtifact({
+              runId,
+              semanticRef: diagnosisRef,
+              bytes: Buffer.from(content, "utf8"),
+            });
+            const forged = validateMcpRunRecoveryEnvelope({
+              ...envelope,
+              ledger: applyRecoveryDecisionToLedger(
+                envelope.ledger,
+                envelope.binding.authority,
+                fingerprint,
+                directive,
+              ),
+              artifacts: [...envelope.artifacts, diagnosis],
+            });
+            return transaction.compareAndSwap(
+              expectedRevision,
+              { ...draft, recovery: forged },
+              update,
+              () => undefined,
+            );
+          }
+          return transaction.compareAndSwap(expectedRevision, draft, update, beforePublication);
+        },
+      })),
+      get: store.get.bind(store),
+      getCheckpoint: store.getCheckpoint.bind(store),
+    };
+    const service = createMcpRunService({
+      repository,
+      provider: new PlanProvider(["reject"]),
+      loop: loopConfigFrom(DEFAULT_CONFIG),
+      maxProviderCalls: store.providerCallLimit,
+      createRunId: (requestRef) => store.runIdForRequest(requestRef),
+    });
+    const started = await service.start(startInput("recovery-forged-diagnosis-start"));
+    const approved = await service.advance({
+      requestId: "recovery-forged-diagnosis-approve",
+      runId: started.runId,
+      expectedRevision: started.revision,
+      event: { type: "plan_approved" },
+    });
+    const rejected = await service.advance({
+      requestId: "recovery-forged-diagnosis-code",
+      runId: started.runId,
+      expectedRevision: approved.revision,
+      event: { type: "code_result_submitted", diff: "bad diff", testOutput: "failed" },
+    });
+
+    await expect(service.recover({
+      requestId: "recovery-forged-diagnosis",
+      runId: started.runId,
+      expectedRevision: rejected.revision,
+    })).rejects.toThrow(/exact server-derived registration and no-diagnosis decision/i);
+    expect(injected).toBe(true);
+    const afterRejectedPublication = await store.get(started.runId);
+    expect(afterRejectedPublication?.revision).toBe(rejected.revision);
+    expect(afterRejectedPublication?.recovery).toBeUndefined();
+    const restarted = await createStore(fixture).get(started.runId);
+    expect(restarted?.revision).toBe(rejected.revision);
+    expect(restarted?.recovery).toBeUndefined();
+  }, 30_000);
 });
 
 interface Fixture {
@@ -258,7 +488,10 @@ class PlanProvider implements McpRunProvider {
   planCalls = 0;
   judgeCalls = 0;
 
-  constructor(private readonly verdicts: Array<"approve" | "reject"> = []) {}
+  constructor(
+    private readonly verdicts: Array<"approve" | "reject"> = [],
+    private readonly judgeFailures: McpProviderDefiniteFailureCode[] = [],
+  ) {}
 
   preflight() {
     return { coderFamily: "cursor-family", requireDifferentCheckerFamily: false };
@@ -321,6 +554,11 @@ class PlanProvider implements McpRunProvider {
       estimatedCostUsd: 0.01,
     };
     await input.beforeAttempt(attempt);
+    const failureCode = this.judgeFailures.shift();
+    if (failureCode !== undefined) {
+      await input.afterAttempt({ ...attempt, outcome: "failed", failureCode });
+      throw new Error(failureCode);
+    }
     await input.afterAttempt({ ...attempt, outcome: "succeeded" });
     const routing = {
       decisionId: decision.decisionId,
@@ -343,3 +581,4 @@ class PlanProvider implements McpRunProvider {
 function digest(value: string): string {
   return Buffer.from(value).toString("hex").padEnd(64, "0").slice(0, 64);
 }
+import { createHash } from "node:crypto";

@@ -90,6 +90,7 @@ Restart or reload Cursor after installation. For MCP mode, enable the `ai-orches
 - `orchestrator_run_get`
 - `orchestrator_run_advance`
 - `orchestrator_run_cancel`
+- `orchestrator_run_recover`
 - `orchestrator_plan`
 - `orchestrator_judge`
 

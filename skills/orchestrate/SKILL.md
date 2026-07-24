@@ -21,14 +21,15 @@ Pi performs configured model switching and records routing evidence. Capability-
 
 ## Cursor with MCP tools
 
-When `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, and `orchestrator_run_cancel` are available:
+When `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, `orchestrator_run_recover`, and `orchestrator_run_cancel` are available:
 
 1. Select and record the Cursor host coder as exact `coderIdentity`; `orchestrator_models` may preview server-side routes but cannot select the host coder.
 2. Start with a fresh `requestId`. Keep the returned opaque `runId` and exact `revision`, show the proposed plan, and wait for explicit approval.
 3. Advance approval with a new request ID and the exact revision. Implement only when the server returns `currentNode: "coding"`.
 4. Gather unstaged/staged diff and test output, then submit `code_result_submitted` at the exact current revision. The server owns iteration/rejection counters, independent checker routing, re-plans, and caps.
 5. Follow `currentNode`, `permittedEvents`, `requiredAction`, and terminal/blocked status exactly. Approve every replacement plan separately and address all required fixes before resubmission.
-6. Reuse a request ID only for the identical body after a lost response. On conflict, read the run and reconcile before issuing a changed mutation under a new ID. Cancel explicitly with `orchestrator_run_cancel`.
+6. Call `orchestrator_run_recover` only after the server has durably closed a provider failure or checker rejection. Do not supply a category or diagnosis: those must come from server evidence and an independently wired DEBUG stage. Stop while recovery is blocked; this milestone does not authorize the client to execute the returned action itself.
+7. Reuse a request ID only for the identical body after a lost response. On conflict, read the run and reconcile before issuing a changed mutation under a new ID. Cancel explicitly with `orchestrator_run_cancel`.
 
 Cursor instructions and MCP cannot switch Cursor's host model. Durable user-owned run authority survives MCP restart and exposes no provider endpoints or key state. The stateless plan/judge tools remain compatibility-only. Named models are configured preferences, not universal requirements.
 
