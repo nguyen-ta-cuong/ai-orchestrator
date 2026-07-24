@@ -5,6 +5,7 @@ import {
   assertScheduleValid,
   evaluateExecutionGuard,
   type ArtifactReference,
+  type GraphCheckpointRef,
   type GraphEvent,
   type GraphExecutionState,
 } from "./scheduler.js";
@@ -547,7 +548,7 @@ export function createBuildHumanWaitEvent(
     nodeId,
     priorStatus: "ready",
     nextStatus: "waiting_human",
-    attempt: state.nodeStates[nodeId]!.attempts,
+    attempt: state.nodeStates[nodeId]!.attempts + 1,
     timestamp: input.now,
     artifactRefs: [],
   });
@@ -571,7 +572,7 @@ export function createBuildHumanIntegrationAction(
     planHash: compiled.hash,
     nodeId,
     visit: nodeState.visits,
-    attempt: nodeState.attempts + 1,
+    attempt: nodeState.attempts,
     purpose: "human-integration",
     ordinal: BUILD_EFFECT_ORDINAL["human-integration"],
     workspace: { kind: "shared" },
@@ -584,6 +585,7 @@ export function createBuildHumanIntegrationResultEvent(
   state: Readonly<GraphExecutionState>,
   decisionValue: unknown,
   evidenceValue: unknown,
+  graphEvidenceValue: unknown,
   receiptValue: unknown,
   checkpointValue: unknown,
   eventId: string,
@@ -622,6 +624,12 @@ export function createBuildHumanIntegrationResultEvent(
     });
   }
   const evidence = receipt.artifactRef!;
+  const graphEvidence = normalizeHumanEvidence(graphEvidenceValue, state, decision.nodeId);
+  if (evidence.planVersion !== graphEvidence.planVersion || evidence.nodeId !== graphEvidence.nodeId ||
+      evidence.contract !== graphEvidence.contract || evidence.sha256 !== graphEvidence.sha256 ||
+      evidence.sizeBytes !== graphEvidence.sizeBytes) {
+    throw new Error("BUILD integration graph evidence does not mirror its trusted receipt artifact");
+  }
   const expectedContracts = buildNode(compiled, decision.nodeId).outputContracts.map(({ id }) => id);
   if (expectedContracts.length !== 1 || evidence.contract !== expectedContracts[0]) {
     throw new Error("BUILD integration evidence does not match its human-review output contract");
@@ -642,7 +650,7 @@ export function createBuildHumanIntegrationResultEvent(
     attempt: nodeState.attempts,
     timestamp: decision.recordedAt,
     validatorResult: { status: "passed" as const, contracts: [evidence.contract] },
-    artifactRefs: [evidence],
+    artifactRefs: [graphEvidence],
   });
 }
 
@@ -793,6 +801,8 @@ export function createBuildWorkerBudgetIntent(
     observedCostUsd: number | "unknown";
     inputTokens: number | "unknown";
     outputTokens: number | "unknown";
+    checkpointRef: Readonly<GraphCheckpointRef>;
+    routingDecisionId: string;
   }>,
 ): BuildWorkerBudgetIntent {
   assertBuildIdentity(compiled, state);
@@ -868,8 +878,11 @@ export function createBuildWorkerBudgetIntent(
     attempt: action.attempt,
     timestamp: input.now,
     artifactRefs: [],
+    checkpointRef: input.checkpointRef,
+    routingDecisionId: input.routingDecisionId,
     sideEffect: {
       phase: "intent",
+      ordinal: nodeState.sideEffectOrdinal + 1,
       idempotencyKey: reservation.outerIdempotencyKey,
       class: "model",
     },
@@ -976,6 +989,8 @@ export function recoverBuildWorkerBudgetReservation(
     ...estimatesValue,
     now: event.timestamp,
     eventId: event.eventId,
+    checkpointRef: event.checkpointRef,
+    routingDecisionId: event.routingDecisionId,
   });
   const budgetIdentity = {
     schemaVersion: 1 as const,
@@ -1041,15 +1056,20 @@ function normalizeBudgetIntentInput(value: unknown): {
   observedCostUsd: number | "unknown";
   inputTokens: number | "unknown";
   outputTokens: number | "unknown";
+  checkpointRef: Readonly<GraphCheckpointRef>;
+  routingDecisionId: string;
 } {
   const record = requireRecord(value, "BUILD worker budget input");
   assertOnlyKeys(record, [
     "now", "unattended", "eventId", "estimatedCostUsd", "observedCostUsd", "inputTokens", "outputTokens",
+    "checkpointRef", "routingDecisionId",
   ], "BUILD worker budget input");
   assertIsoTimestamp(record.now, "BUILD worker budget timestamp");
-  if (typeof record.unattended !== "boolean" || typeof record.eventId !== "string" || !TOKEN.test(record.eventId)) {
+  if (typeof record.unattended !== "boolean" || typeof record.eventId !== "string" || !TOKEN.test(record.eventId) ||
+      typeof record.routingDecisionId !== "string" || !TOKEN.test(record.routingDecisionId)) {
     throw new Error("BUILD worker budget execution identity is invalid");
   }
+  const checkpointRef = normalizeCheckpointRef(record.checkpointRef);
   const result = {
     now: record.now,
     unattended: record.unattended,
@@ -1058,11 +1078,29 @@ function normalizeBudgetIntentInput(value: unknown): {
     observedCostUsd: normalizeUsageEstimate(record.observedCostUsd, "BUILD worker observed cost", false),
     inputTokens: normalizeUsageEstimate(record.inputTokens, "BUILD worker input tokens", true),
     outputTokens: normalizeUsageEstimate(record.outputTokens, "BUILD worker output tokens", true),
+    checkpointRef,
+    routingDecisionId: record.routingDecisionId,
   };
   if (result.unattended && Object.values(result).some((item) => item === "unknown")) {
     throw new Error("BUILD worker unattended budget input cannot contain unknown usage");
   }
   return result;
+}
+
+function normalizeCheckpointRef(value: unknown): Readonly<GraphCheckpointRef> {
+  const record = requireRecord(value, "BUILD worker budget checkpoint");
+  assertOnlyKeys(record, ["path", "sha256", "sizeBytes"], "BUILD worker budget checkpoint");
+  if (typeof record.path !== "string" || !/^mutations\/[a-f0-9]{64}\.json$/.test(record.path) ||
+      typeof record.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(record.sha256) ||
+      !Number.isSafeInteger(record.sizeBytes) || (record.sizeBytes as number) < 0 ||
+      (record.sizeBytes as number) > 64 * 1024 * 1024) {
+    throw new Error("BUILD worker budget checkpoint reference is invalid");
+  }
+  return Object.freeze({
+    path: record.path,
+    sha256: record.sha256,
+    sizeBytes: record.sizeBytes as number,
+  });
 }
 
 function normalizeUsageEstimate(value: unknown, label: string, integer: boolean): number | "unknown" {

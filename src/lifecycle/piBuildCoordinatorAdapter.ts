@@ -11,6 +11,7 @@ import {
   type BuildWorkspaceIdentity,
 } from "../core/buildExecution.js";
 import type { GraphExecutionState } from "../core/scheduler.js";
+import type { GraphCheckpointLease } from "../runtime/graphCheckpoint.js";
 import {
   createBuildWorkerRequest,
   dispatchBuildWorker,
@@ -56,7 +57,7 @@ export interface ReviewedCommandResult {
 export interface PiBuildCoordinatorRuntimeOptions {
   compiled: Readonly<CompiledBuildPlan>;
   paths: RunPaths;
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
   repositoryRoot: string;
   candidateRoot: string;
   git: GitRunner;

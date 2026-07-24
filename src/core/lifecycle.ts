@@ -90,6 +90,19 @@ export interface LifecycleState {
   yolo: boolean;
   originalModel?: LifecycleOriginalModelState;
   graphExecution?: GraphExecutionState;
+  envelopeRevision?: number;
+  previousEnvelopeHash?: string;
+  envelopeHash?: string;
+  revisionFeedback?: {
+    artifact: "spec" | "plan";
+    feedback: string;
+    recordedAt: string;
+  };
+  reminder?: {
+    phase: LifecyclePhase;
+    kind: "artifact" | "verdict" | "debug";
+    recordedAt: string;
+  };
 }
 
 export type LifecycleEvent =
@@ -149,6 +162,8 @@ export function createIdleLifecycleState(overrides: Partial<LifecycleState> = {}
   state.finalization = overrides.finalization ? { ...overrides.finalization } : undefined;
   state.originalModel = overrides.originalModel ? { ...overrides.originalModel } : undefined;
   state.graphExecution = overrides.graphExecution ? structuredClone(overrides.graphExecution) : undefined;
+  state.revisionFeedback = overrides.revisionFeedback ? { ...overrides.revisionFeedback } : undefined;
+  state.reminder = overrides.reminder ? { ...overrides.reminder } : undefined;
   return state;
 }
 
@@ -177,6 +192,7 @@ export function nextStage(
   }
 
   if (event.type === "cancelled") {
+    if (state.phase === "done" || state.phase === "failed") return cloneLifecycleState(state);
     const cancelled = cloneLifecycleState(state);
     cancelled.phase = "idle";
     return cancelled;
@@ -375,6 +391,8 @@ function cloneLifecycleState(state: LifecycleState): LifecycleState {
     pendingCheckerVerdict: state.pendingCheckerVerdict ? { ...state.pendingCheckerVerdict } : undefined,
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
     graphExecution: state.graphExecution ? structuredClone(state.graphExecution) : undefined,
+    revisionFeedback: state.revisionFeedback ? { ...state.revisionFeedback } : undefined,
+    reminder: state.reminder ? { ...state.reminder } : undefined,
   };
 }
 

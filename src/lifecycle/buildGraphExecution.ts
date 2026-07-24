@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { CompiledBuildPlan } from "../core/buildPlan.js";
@@ -6,15 +7,22 @@ import {
   graphDefinitionDigest,
   schedulerMetadataFingerprint,
   type ExecutionLimits,
+  type ArtifactReference,
   type GraphEvent,
   type GraphExecutionState,
 } from "../core/scheduler.js";
 import type { RunPaths } from "./artifacts.js";
 import { assertRunPathsSafe, ownsRunLease } from "./artifacts.js";
 import {
+  readBuildDispatchSeal,
+  readBuildNodeArtifact,
+  type BuildDispatchSealReference,
+} from "./buildArtifacts.js";
+import {
   acquireGraphCheckpointLease,
   checkpointGraphEvent,
   createGraphCheckpointPaths,
+  graphSnapshotDigest,
   ownsGraphCheckpointLease,
   readGraphEvents,
   readGraphSnapshot,
@@ -23,20 +31,23 @@ import {
   replayGraphEvents,
   writeGraphSnapshot,
   writeImmutableGraphCheckpoint,
+  writeNodeArtifact,
   type CheckpointFailurePoint,
+  type GraphCheckpointLease,
   type GraphCheckpointPaths,
 } from "../runtime/graphCheckpoint.js";
 
 export interface BuildGraphExecutionOptions {
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
+  graphOwner: Readonly<GraphCheckpointLease>;
   now: string;
   pid: number;
   limits: Readonly<ExecutionLimits>;
-  isProcessAlive?(pid: number): boolean;
 }
 
 export interface BuildGraphCheckpointOptions {
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
+  graphOwner: Readonly<GraphCheckpointLease>;
   tempId: string;
   failAt?(point: CheckpointFailurePoint): void;
 }
@@ -46,60 +57,96 @@ export function buildGraphExecutionPaths(paths: RunPaths): GraphCheckpointPaths 
   return createGraphCheckpointPaths(join(paths.root, "build", "execution"));
 }
 
+export function acquireBuildGraphExecutionLease(
+  paths: RunPaths,
+  owner: Readonly<GraphCheckpointLease>,
+  options: Readonly<{
+    now: string;
+    pid: number;
+    isProcessAlive?(pid: number): boolean;
+  }>,
+): GraphCheckpointLease {
+  assertLifecycleAuthority(paths, owner);
+  if (options.pid !== owner.pid) {
+    throw new Error("BUILD graph lease pid must match the active lifecycle lease generation");
+  }
+  const checkpointPaths = buildGraphExecutionPaths(paths);
+  const identity = buildGraphLeaseIdentity(checkpointPaths, owner);
+  return acquireGraphCheckpointLease(checkpointPaths, identity.owner, {
+    now: options.now,
+    pid: options.pid,
+    nonce: identity.nonce,
+    ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
+  });
+}
+
 /**
- * Acquire the nested BUILD executor lease and create or recover its immutable
- * graph snapshot. The lifecycle lease remains the outer authority.
+ * Create or recover the immutable BUILD graph under both the outer lifecycle
+ * generation and the separately acquired nested graph generation.
  */
 export function initializeBuildGraphExecution(
   paths: RunPaths,
   compiled: Readonly<CompiledBuildPlan>,
   options: Readonly<BuildGraphExecutionOptions>,
 ): GraphExecutionState {
-  assertLifecycleAuthority(paths, options.owner);
+  assertBuildAuthority(paths, options);
   const checkpointPaths = buildGraphExecutionPaths(paths);
-  const alreadyOwned = ownsGraphCheckpointLease(checkpointPaths, options.owner);
-  acquireGraphCheckpointLease(checkpointPaths, options.owner, {
-    now: options.now,
-    pid: options.pid,
-    ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
-  });
-  try {
-    writeImmutableGraphCheckpoint(checkpointPaths, compiled.graph, compiled.schedulerMetadata, { owner: options.owner });
+  let initial: GraphExecutionState;
+  if (existsSync(checkpointPaths.graph)) {
     const immutable = readImmutableGraphCheckpoint(checkpointPaths);
     if (immutable.graphDigest !== graphDefinitionDigest(compiled.graph) ||
-        immutable.metadataFingerprint !== schedulerMetadataFingerprint(compiled.schedulerMetadata)) {
+        immutable.metadataFingerprint !== schedulerMetadataFingerprint(compiled.schedulerMetadata) ||
+        immutable.runId !== planRunId(paths) ||
+        immutable.genesisState.planVersion !== compiled.plan.planVersion) {
       throw new Error("BUILD execution checkpoint does not match the immutable BUILD plan");
     }
-    if (!existsSync(checkpointPaths.state)) {
-      if (readGraphEvents(checkpointPaths).length > 0) {
-        throw new Error("BUILD execution event log exists without its initial snapshot");
-      }
-      const initial = createGraphExecutionState(compiled.graph, {
+    initial = immutable.genesisState;
+  } else {
+    if (existsSync(checkpointPaths.state) || readGraphEvents(checkpointPaths).length > 0) {
+      throw new Error("BUILD execution state exists without its immutable graph genesis");
+    }
+    initial = createGraphExecutionState(compiled.graph, {
         runId: planRunId(paths),
         now: options.now,
         planVersion: compiled.plan.planVersion,
         metadata: compiled.schedulerMetadata,
         limits: options.limits,
-      });
-      writeGraphSnapshot(checkpointPaths, compiled.graph, initial, {
-        owner: options.owner,
-        tempId: `initial-${options.pid}`,
-      });
-      return initial;
-    }
-    return recoverBuildGraphExecution(paths, compiled, { owner: options.owner, tempId: `recover-${options.pid}` });
-  } catch (error) {
-    if (!alreadyOwned) releaseGraphCheckpointLease(checkpointPaths, options.owner);
-    throw error;
+    });
+    writeImmutableGraphCheckpoint(
+      checkpointPaths,
+      compiled.graph,
+      compiled.schedulerMetadata,
+      initial,
+      { owner: options.graphOwner },
+    );
   }
+  if (!existsSync(checkpointPaths.state)) {
+    if (readGraphEvents(checkpointPaths).length > 0) {
+      throw new Error("BUILD execution event log exists without its initial snapshot");
+    }
+    writeGraphSnapshot(checkpointPaths, compiled.graph, initial, {
+      owner: options.graphOwner,
+      tempId: `initial-${options.pid}`,
+    });
+    return initial;
+  }
+  return recoverBuildGraphExecution(paths, compiled, {
+    owner: options.owner,
+    graphOwner: options.graphOwner,
+    tempId: `recover-${options.pid}`,
+  });
 }
 
 export function recoverBuildGraphExecution(
   paths: RunPaths,
   compiled: Readonly<CompiledBuildPlan>,
-  options: Readonly<{ owner: string; tempId: string }>,
+  options: Readonly<{
+    owner: Readonly<GraphCheckpointLease>;
+    graphOwner: Readonly<GraphCheckpointLease>;
+    tempId: string;
+  }>,
 ): GraphExecutionState {
-  assertLifecycleAuthority(paths, options.owner);
+  assertBuildAuthority(paths, options);
   const checkpointPaths = buildGraphExecutionPaths(paths);
   const immutable = readImmutableGraphCheckpoint(checkpointPaths);
   if (immutable.graphDigest !== graphDefinitionDigest(compiled.graph) ||
@@ -107,12 +154,18 @@ export function recoverBuildGraphExecution(
     throw new Error("BUILD execution recovery graph identity does not match the immutable BUILD plan");
   }
   const snapshot = readGraphSnapshot(checkpointPaths, compiled.graph);
-  const recovered = replayGraphEvents(compiled.graph, snapshot, readGraphEvents(checkpointPaths));
+  const recovered = replayGraphEvents(
+    compiled.graph,
+    snapshot,
+    readGraphEvents(checkpointPaths),
+    immutable.genesisState,
+  );
   if (recovered.lastAppliedEventSequence !== snapshot.lastAppliedEventSequence) {
     writeGraphSnapshot(checkpointPaths, compiled.graph, recovered, {
-      owner: options.owner,
+      owner: options.graphOwner,
       tempId: options.tempId,
       expectedRevision: snapshot.revision,
+      expectedSnapshotHash: graphSnapshotDigest(snapshot),
     });
   }
   return recovered;
@@ -125,28 +178,98 @@ export function checkpointBuildGraphEvent(
   event: Readonly<GraphEvent>,
   options: Readonly<BuildGraphCheckpointOptions>,
 ): GraphExecutionState {
-  assertLifecycleAuthority(paths, options.owner);
+  assertBuildAuthority(paths, options);
   return checkpointGraphEvent({
     graph: compiled.graph,
     paths: buildGraphExecutionPaths(paths),
     state,
     event,
-    owner: options.owner,
+    owner: options.graphOwner,
     tempId: options.tempId,
     ...(options.failAt === undefined ? {} : { failAt: options.failAt }),
   });
 }
 
-export function releaseBuildGraphExecution(paths: RunPaths, owner: string): boolean {
+export function releaseBuildGraphExecution(
+  paths: RunPaths,
+  owner: Readonly<GraphCheckpointLease>,
+): boolean {
   assertRunPathsSafe(paths);
   return releaseGraphCheckpointLease(buildGraphExecutionPaths(paths), owner);
 }
 
-function assertLifecycleAuthority(paths: RunPaths, owner: string): void {
+export function mirrorBuildNodeArtifactToGraph(
+  paths: RunPaths,
+  reference: Readonly<ArtifactReference>,
+  options: Readonly<{
+    owner: Readonly<GraphCheckpointLease>;
+    graphOwner: Readonly<GraphCheckpointLease>;
+  }>,
+): ArtifactReference {
+  assertBuildAuthority(paths, options);
+  return writeNodeArtifact(buildGraphExecutionPaths(paths), {
+    owner: options.graphOwner,
+    planVersion: reference.planVersion,
+    nodeId: reference.nodeId,
+    contract: reference.contract,
+    bytes: readBuildNodeArtifact(paths, reference),
+  });
+}
+
+export function mirrorBuildDispatchSealToGraph(
+  paths: RunPaths,
+  reference: Readonly<BuildDispatchSealReference>,
+  options: Readonly<{
+    owner: Readonly<GraphCheckpointLease>;
+    graphOwner: Readonly<GraphCheckpointLease>;
+  }>,
+): ArtifactReference {
+  assertBuildAuthority(paths, options);
+  return writeNodeArtifact(buildGraphExecutionPaths(paths), {
+    owner: options.graphOwner,
+    planVersion: reference.planVersion,
+    nodeId: reference.nodeId,
+    contract: reference.contract,
+    bytes: readBuildDispatchSeal(paths, reference),
+  });
+}
+
+function assertLifecycleAuthority(paths: RunPaths, owner: Readonly<GraphCheckpointLease>): void {
   assertRunPathsSafe(paths);
   if (!ownsRunLease(paths, owner)) {
-    throw new Error(`BUILD graph checkpoint requires current lifecycle lease owner ${owner}`);
+    throw new Error(`BUILD graph checkpoint requires current lifecycle lease owner ${owner.owner}`);
   }
+}
+
+function assertBuildAuthority(
+  paths: RunPaths,
+  options: Readonly<{
+    owner: Readonly<GraphCheckpointLease>;
+    graphOwner: Readonly<GraphCheckpointLease>;
+  }>,
+): void {
+  assertLifecycleAuthority(paths, options.owner);
+  const identity = buildGraphLeaseIdentity(buildGraphExecutionPaths(paths), options.owner);
+  if (options.graphOwner.owner !== identity.owner || options.graphOwner.nonce !== identity.nonce ||
+      options.graphOwner.pid !== options.owner.pid) {
+    throw new Error("BUILD graph checkpoint nested lease does not belong to the active lifecycle generation");
+  }
+  if (!ownsGraphCheckpointLease(buildGraphExecutionPaths(paths), options.graphOwner)) {
+    throw new Error(`BUILD graph checkpoint requires nested lease generation ${options.graphOwner.owner}`);
+  }
+}
+
+function buildGraphLeaseIdentity(
+  paths: Readonly<GraphCheckpointPaths>,
+  owner: Readonly<GraphCheckpointLease>,
+): Readonly<{ owner: string; nonce: string }> {
+  const digest = createHash("sha256")
+    .update(`${owner.owner}\0${owner.nonce}\0${String(owner.dev)}\0${String(owner.ino)}\0${paths.root}`)
+    .digest("hex");
+  return Object.freeze({
+    owner: `build-${digest}`,
+    nonce: createHash("sha256").update(`build-lease\0${digest}`).digest("hex"),
+  });
 }
 
 function planRunId(paths: RunPaths): string {

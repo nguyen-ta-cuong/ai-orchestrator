@@ -98,6 +98,7 @@ export function nextPhase(
   }
 
   if (event.type === "cancelled") {
+    if (state.phase === "done" || state.phase === "failed") return cloneState(state);
     return createIdleState({
       originalModel: state.originalModel ? { ...state.originalModel } : undefined,
     });

@@ -1,19 +1,46 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import lifecycleExtension from "../extensions/lifecycle.js";
 import { DEFAULT_CONFIG } from "../src/core/config.js";
-import { createRun, readState, writeState } from "../src/lifecycle/artifacts.js";
-import type { LifecyclePhase } from "../src/core/lifecycle.js";
+import {
+  acquireRunLease,
+  checkpointLifecycleGraphEvent,
+  createRun,
+  readState,
+  releaseRunLease,
+  writeState,
+} from "../src/lifecycle/artifacts.js";
+import type { LifecyclePhase, LifecycleState } from "../src/core/lifecycle.js";
 
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 type EventHandler = (event: unknown, ctx: ExtensionContext) => Promise<void>;
 
 const tempDirs: string[] = [];
+
+function overwriteAsLegacy(paths: ReturnType<typeof createRun>["paths"], state: LifecycleState): void {
+  rmSync(paths.graph, { force: true });
+  writeFileSync(paths.events, "");
+  state.version = 1;
+  delete state.graphExecution;
+  delete state.envelopeRevision;
+  delete state.previousEnvelopeHash;
+  delete state.envelopeHash;
+  writeFileSync(paths.state, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function writeFixtureState(paths: ReturnType<typeof createRun>["paths"], state: LifecycleState): void {
+  const owner = acquireRunLease(paths, `fixture-${Math.random().toString(36).slice(2)}`);
+  try {
+    writeState(paths, state, { owner });
+  } finally {
+    releaseRunLease(paths, owner);
+  }
+}
 
 function makeRun(phase: LifecyclePhase) {
   const cwd = join(tmpdir(), `ai-orchestrator-extension-${process.pid}-${Math.random().toString(36).slice(2)}`);
@@ -39,7 +66,7 @@ function makeRun(phase: LifecyclePhase) {
   });
   writeFileSync(created.paths.spec, "# Specification\n");
   writeFileSync(created.paths.plan, "# Plan\n");
-  writeState(created.paths, state);
+  overwriteAsLegacy(created.paths, state);
   return { cwd, paths: created.paths };
 }
 
@@ -80,6 +107,8 @@ function extensionHarness(cwd: string, models: Array<Record<string, unknown>> = 
     sessionManager: { getBranch: () => [] },
     ui: {
       confirm: vi.fn(async () => true),
+      select: vi.fn(async () => "Approve"),
+      editor: vi.fn(async () => "Revise the artifact"),
       notify: vi.fn(),
       setStatus: vi.fn(),
       setWidget: vi.fn(),
@@ -185,7 +214,7 @@ describe("lifecycle Pi extension safety", () => {
     const run = makeRun("planning");
     const state = readState(run.paths)!;
     state.yolo = true;
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     const submitting = extensionHarness(run.cwd);
     await submitting.commands.get("lifecycle")!("resume", submitting.ctx);
     await submittedPlanTool(submitting).execute("plan", { plan: structuredPlan(1) });
@@ -200,6 +229,175 @@ describe("lifecycle Pi extension safety", () => {
       if (!(error instanceof Error) || !/Lifecycle phase building is not the active graph node/.test(error.message)) throw error;
     }
     expect(readFileSync(run.paths.journal, "utf8")).toContain("Recovered submitted BUILD plan v1");
+  });
+
+  it("reconciles an appended event under the lease before the first resume write", async () => {
+    const cwd = join(tmpdir(), `ai-orchestrator-extension-reconcile-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(cwd, { recursive: true });
+    tempDirs.push(cwd);
+    const run = createRun(cwd, DEFAULT_CONFIG.lifecycle.artifactsDir, "resume a durable event");
+    const snapshot = readState(run.paths)!;
+    const graph = snapshot.graphExecution!;
+    const crashWriter = acquireRunLease(run.paths, "crash-writer");
+    expect(() => checkpointLifecycleGraphEvent(run.paths, snapshot, {
+      schemaVersion: 1,
+      kind: "node-status",
+      sequence: graph.lastAppliedEventSequence + 1,
+      eventId: "resume-crash-entry",
+      runId: snapshot.runId,
+      graphId: graph.graphId,
+      graphVersion: graph.graphVersion,
+      graphDigest: graph.graphDigest,
+      planVersion: graph.planVersion,
+      nodeId: "defining",
+      priorStatus: "ready",
+      nextStatus: "running",
+      attempt: 1,
+      timestamp: new Date().toISOString(),
+      artifactRefs: [],
+    }, {
+      owner: crashWriter,
+      tempId: "resume-crash-entry",
+      failAt(point) {
+        if (point === "after-event-append") throw new Error("simulated append-before-snapshot crash");
+      },
+    })).toThrow("simulated append-before-snapshot crash");
+    expect(releaseRunLease(run.paths, crashWriter)).toBe(true);
+    expect(JSON.parse(readFileSync(run.paths.state, "utf8"))).toMatchObject({ graphExecution: { revision: 2 } });
+
+    const harness = extensionHarness(cwd);
+    await expect(harness.commands.get("lifecycle")!("resume", harness.ctx)).resolves.toBeUndefined();
+    expect(JSON.parse(readFileSync(run.paths.state, "utf8"))).toMatchObject({
+      originalModel: { provider: "test", id: "current-model" },
+      graphExecution: {
+        revision: 4,
+        nodeStates: {
+          defining: {
+            status: "running",
+            sideEffect: { status: "intent_recorded", class: "model" },
+          },
+        },
+      },
+    });
+    await harness.events.get("session_shutdown")!({}, harness.ctx as unknown as ExtensionContext);
+  });
+
+  it("durably enters human wait before approving an artifact", async () => {
+    const run = makeRun("awaiting_spec_approval");
+    const harness = extensionHarness(run.cwd);
+    let resolveChoice: ((value: string) => void) | undefined;
+    vi.mocked(harness.ctx.ui.select).mockImplementationOnce(() => new Promise((resolve) => { resolveChoice = resolve; }));
+
+    const resumed = harness.commands.get("lifecycle")!("resume", harness.ctx);
+    await vi.waitFor(() => {
+      expect(readState(run.paths)?.graphExecution?.nodeStates.awaiting_spec_approval).toMatchObject({ status: "waiting_human", attempts: 1 });
+      expect(readState(run.paths)?.graphExecution?.guard.humanWaitStartedAt).toBeTruthy();
+    });
+    resolveChoice!("Approve");
+    await resumed;
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "planning",
+      graphExecution: { nodeStates: { awaiting_spec_approval: { status: "blocked" }, planning: { status: "running" } } },
+    });
+  });
+
+  it("routes approval revision and cancellation from durable human wait", async () => {
+    const revisionRun = makeRun("awaiting_plan_approval");
+    const revisionHarness = extensionHarness(revisionRun.cwd);
+    vi.mocked(revisionHarness.ctx.ui.select).mockResolvedValueOnce("Revise");
+    vi.mocked(revisionHarness.ctx.ui.editor).mockResolvedValueOnce("Clarify the rollback requirements");
+    await revisionHarness.commands.get("lifecycle")!("resume", revisionHarness.ctx);
+    expect(readState(revisionRun.paths)).toMatchObject({
+      phase: "planning",
+      revisionFeedback: { artifact: "plan", feedback: "Clarify the rollback requirements" },
+      graphExecution: { nodeStates: { awaiting_plan_approval: { status: "blocked" }, planning: { status: "running" } } },
+    });
+
+    const cancellationRun = makeRun("awaiting_spec_approval");
+    const cancellationHarness = extensionHarness(cancellationRun.cwd);
+    vi.mocked(cancellationHarness.ctx.ui.select).mockResolvedValueOnce("Cancel");
+    await cancellationHarness.commands.get("lifecycle")!("resume", cancellationHarness.ctx);
+    expect(readState(cancellationRun.paths)).toMatchObject({
+      phase: "idle",
+      graphExecution: { ready: [], nodeStates: { awaiting_spec_approval: { status: "cancelled" } } },
+    });
+    expect(cancellationHarness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(existsSync(join(cancellationRun.paths.root, "..", "current"))).toBe(false);
+  });
+
+  it("enforces human-wait denial and durable timeout while cancellation remains available", async () => {
+    const deniedRun = makeRun("awaiting_spec_approval");
+    writeFileSync(join(deniedRun.cwd, ".ai-orchestrator.json"), JSON.stringify({ execution: { limits: { humanWait: "deny" } } }));
+    const deniedHarness = extensionHarness(deniedRun.cwd);
+    await expect(deniedHarness.commands.get("lifecycle")!("resume", deniedHarness.ctx)).resolves.toBeUndefined();
+    expect(readState(deniedRun.paths)?.graphExecution?.nodeStates.awaiting_spec_approval?.status).toBe("ready");
+    expect(deniedHarness.ctx.ui.select).not.toHaveBeenCalled();
+    expect(deniedHarness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(deniedHarness.pi.setModel).toHaveBeenCalled();
+    expect(existsSync(deniedRun.paths.executionLease)).toBe(false);
+    await deniedHarness.commands.get("lifecycle-stop")!("", deniedHarness.ctx);
+    expect(readState(deniedRun.paths)?.phase).toBe("idle");
+
+    const timeoutRun = makeRun("awaiting_plan_approval");
+    writeFileSync(join(timeoutRun.cwd, ".ai-orchestrator.json"), JSON.stringify({ execution: { limits: { maxHumanWaitMs: 1 } } }));
+    const first = extensionHarness(timeoutRun.cwd);
+    (first.ctx as unknown as { hasUI: boolean }).hasUI = false;
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    const waiting = readState(timeoutRun.paths)!;
+    expect(waiting.graphExecution?.nodeStates.awaiting_plan_approval?.status).toBe("waiting_human");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const resumed = extensionHarness(timeoutRun.cwd);
+    await expect(resumed.commands.get("lifecycle")!("resume", resumed.ctx)).resolves.toBeUndefined();
+    expect(readFileSync(timeoutRun.paths.journal, "utf8")).toContain("human-wait-timeout");
+    expect(resumed.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(existsSync(timeoutRun.paths.executionLease)).toBe(false);
+    await expect(resumed.commands.get("lifecycle-stop")!("", resumed.ctx)).resolves.toBeUndefined();
+    expect(readState(timeoutRun.paths)).toMatchObject({
+      phase: "idle",
+      graphExecution: { ready: [], nodeStates: { awaiting_plan_approval: { status: "cancelled" } } },
+    });
+  });
+
+  it("skips human-wait policy for a yolo ship gate", async () => {
+    const run = makeRun("awaiting_ship_approval");
+    const state = readState(run.paths)!;
+    state.yolo = true;
+    overwriteAsLegacy(run.paths, state);
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ execution: { limits: { humanWait: "deny" } }, ship: { commit: "never", openPr: "never" } }));
+    const harness = extensionHarness(run.cwd);
+
+    await expect(harness.commands.get("lifecycle")!("resume", harness.ctx)).resolves.toBeUndefined();
+
+    expect(readState(run.paths)?.phase).toBe("done");
+    expect(harness.ctx.ui.confirm).not.toHaveBeenCalledWith("SHIP report is GO", expect.anything());
+  });
+
+  it("fails closed on oversized and post-approval symlink-swapped lifecycle artifacts", async () => {
+    const oversizedRun = makeRun("planning");
+    writeFileSync(oversizedRun.paths.spec, Buffer.alloc(8 * 1024 * 1024 + 1, 0x61));
+    const oversizedHarness = extensionHarness(oversizedRun.cwd);
+    await oversizedHarness.commands.get("lifecycle")!("resume", oversizedHarness.ctx);
+    expect(readFileSync(oversizedRun.paths.journal, "utf8")).toContain("oversized and exceeds its limit");
+    expect(oversizedHarness.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(oversizedHarness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(existsSync(oversizedRun.paths.executionLease)).toBe(false);
+
+    const swappedRun = makeRun("awaiting_spec_approval");
+    const outside = join(swappedRun.cwd, "outside-spec.md");
+    writeFileSync(outside, "# Outside authority\n");
+    const swappedHarness = extensionHarness(swappedRun.cwd);
+    vi.mocked(swappedHarness.ctx.ui.select).mockImplementationOnce(async () => {
+      unlinkSync(swappedRun.paths.spec);
+      symlinkSync(outside, swappedRun.paths.spec);
+      return "Approve";
+    });
+    await expect(swappedHarness.commands.get("lifecycle")!("resume", swappedHarness.ctx)).rejects.toThrow(/symlink/);
+    expect(readFileSync(outside, "utf8")).toBe("# Outside authority\n");
+    expect(swappedHarness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(swappedHarness.pi.setModel).toHaveBeenCalled();
+    expect(existsSync(swappedRun.paths.executionLease)).toBe(false);
   });
 
   it("uses capability routing for BUILD and an independent VERIFY model", async () => {
@@ -219,30 +417,28 @@ describe("lifecycle Pi extension safety", () => {
     }));
     const buildHarness = extensionHarness(run.cwd, models);
     await buildHarness.commands.get("lifecycle")!("resume", buildHarness.ctx);
+    expect(readState(run.paths)?.modelSelections).toEqual(expect.arrayContaining([expect.objectContaining({
+      stage: "build",
+      model: "coder",
+      family: "maker",
+      routing: expect.objectContaining({ engine: "capability" }),
+    })]));
     expect(readState(run.paths)?.modelSelections.at(-1)).toMatchObject({
-      stage: "build", model: "coder", family: "maker", routing: { engine: "capability" },
+      stage: "verify", model: "checker", family: "checker", routing: { separation: "different-family" },
     });
-    const evidence = JSON.parse(readFileSync(run.paths.evidence, "utf8").trim());
-    expect(evidence).toMatchObject({ stage: "build", selected: { provider: "invented", model: "coder" } });
+    const evidence = readFileSync(run.paths.evidence, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(evidence).toEqual(expect.arrayContaining([expect.objectContaining({
+      stage: "build",
+      selected: expect.objectContaining({ provider: "invented", model: "coder" }),
+    })]));
     expect(JSON.stringify(evidence)).not.toContain("# Plan");
 
     await buildHarness.events.get("session_shutdown")!({}, buildHarness.ctx as unknown as ExtensionContext);
     const resumeHarness = extensionHarness(run.cwd, models);
     await resumeHarness.commands.get("lifecycle")!("resume", resumeHarness.ctx);
-    expect(readState(run.paths)?.modelSelections).toHaveLength(1);
-    expect(readFileSync(run.paths.journal, "utf8")).toContain("reused saved decision");
-    await resumeHarness.events.get("session_shutdown")!({}, resumeHarness.ctx as unknown as ExtensionContext);
-
-    const state = readState(run.paths)!;
-    state.version = 1;
-    state.graphExecution = undefined;
-    state.phase = "verifying";
-    writeState(run.paths, state);
-    const verifyHarness = extensionHarness(run.cwd, models);
-    await verifyHarness.commands.get("lifecycle")!("resume", verifyHarness.ctx);
-    expect(readState(run.paths)?.modelSelections.at(-1)).toMatchObject({
-      stage: "verify", model: "checker", family: "checker", routing: { separation: "different-family" },
-    });
+    expect(readState(run.paths)?.modelSelections).toHaveLength(2);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("ambiguous persisted side effect");
+    expect(resumeHarness.pi.sendUserMessage).not.toHaveBeenCalled();
     expect(readFileSync(run.paths.routing, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
@@ -260,7 +456,8 @@ describe("lifecycle Pi extension safety", () => {
 
     const state = readState(run.paths)!;
     state.buildIterations += 1;
-    writeState(run.paths, state);
+    state.phase = "building";
+    overwriteAsLegacy(run.paths, state);
     const next = extensionHarness(run.cwd, models);
     await next.commands.get("lifecycle")!("resume", next.ctx);
 
@@ -320,10 +517,13 @@ describe("lifecycle Pi extension safety", () => {
     writeFileSync(run.paths.spec, "");
     const harness = extensionHarness(run.cwd);
 
-    await expect(harness.commands.get("lifecycle")!("resume", harness.ctx)).rejects.toThrow(/spec artifact is missing/);
+    await expect(harness.commands.get("lifecycle")!("resume", harness.ctx)).resolves.toBeUndefined();
 
-    expect(harness.pi.setModel).not.toHaveBeenCalled();
+    expect(harness.pi.setModel).toHaveBeenCalledTimes(1);
+    expect(harness.pi.setModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "test", id: "original-model" }));
     expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("spec artifact is missing");
+    expect(existsSync(run.paths.executionLease)).toBe(false);
   });
 
   it("persists stage-ended usage, cost, compliance, and profile evidence", async () => {
@@ -354,8 +554,8 @@ describe("lifecycle Pi extension safety", () => {
     expect(events).toContainEqual(expect.objectContaining({
       stage: "build",
       profileVersion: "coder-profile-v1",
-      usage: { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 10 },
-      cost: expect.objectContaining({ observedUsd: 0.012 }),
+      usage: { inputTokens: 40, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      cost: expect.objectContaining({ observedUsd: 0.004 }),
       outcome: expect.objectContaining({ type: "stage-ended", structuredToolCompliance: true }),
     }));
     const userEvents = readFileSync(join(run.cwd, "home", ".ai-orchestrator", "routing-evidence", "events.jsonl"), "utf8");
@@ -378,6 +578,9 @@ describe("lifecycle Pi extension safety", () => {
     const first = extensionHarness(run.cwd, models);
     await first.commands.get("lifecycle")!("resume", first.ctx);
     await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+    const unfinishedBuild = readState(run.paths)!;
+    unfinishedBuild.phase = "building";
+    overwriteAsLegacy(run.paths, unfinishedBuild);
 
     writeRoutingConfig(9000);
     const resumed = extensionHarness(run.cwd, models);
@@ -391,8 +594,9 @@ describe("lifecycle Pi extension safety", () => {
     expect(readFileSync(run.paths.journal, "utf8")).toContain("Routing policy explicitly migrated");
     const migrated = extensionHarness(run.cwd, models);
     await migrated.commands.get("lifecycle")!("resume", migrated.ctx);
-    expect(migrated.pi.sendUserMessage).toHaveBeenCalled();
-    expect(readState(run.paths)?.modelSelections.at(-1)?.routing?.failureCategories).not.toContain("policy-migrated");
+    expect(readState(run.paths)?.phase).toBe("verifying");
+    expect(readState(run.paths)?.modelSelections.filter(({ stage }) => stage === "build").at(-1)
+      ?.routing?.failureCategories).not.toContain("policy-migrated");
   });
 
   it("retains convergence breakers when a re-plan is unchanged", async () => {
@@ -409,24 +613,13 @@ describe("lifecycle Pi extension safety", () => {
       .update(readFileSync(run.paths.plan, "utf8").trim().replace(/\s+/g, " ").toLowerCase())
       .digest("hex")
       .slice(0, 16);
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ routing: { circuitBreakers: { repeatedRejectionFingerprintLimit: 2 } } }));
     const harness = extensionHarness(run.cwd);
     await harness.commands.get("lifecycle")!("resume", harness.ctx);
-    await submittedPlanTool(harness).execute("plan", { plan: structuredPlan(2) });
-    await harness.events.get("agent_end")!({ messages: [{ role: "assistant", content: "plan unchanged" }] }, harness.ctx as unknown as ExtensionContext);
-    let blockedByPartialPlan13 = false;
-    try {
-      await harness.events.get("agent_settled")!({}, harness.ctx as unknown as ExtensionContext);
-    } catch (error) {
-      if (!(error instanceof Error) || !/Lifecycle phase building is not the active graph node/.test(error.message)) throw error;
-      blockedByPartialPlan13 = true;
-    }
 
     expect(readState(run.paths)?.rejectionFingerprints).toEqual(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"]);
-    if (!blockedByPartialPlan13) {
-      expect(readFileSync(run.paths.journal, "utf8")).toContain("identical checker rejections");
-    }
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("identical checker rejections");
   });
 
   it.each([
@@ -436,7 +629,7 @@ describe("lifecycle Pi extension safety", () => {
     const run = makeRun("building");
     const state = readState(run.paths)!;
     Object.assign(state, statePatch);
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ routing: { circuitBreakers: breakerPatch } }));
     const harness = extensionHarness(run.cwd);
 
@@ -514,14 +707,14 @@ describe("lifecycle Pi extension safety", () => {
     expect(getActiveTools).not.toHaveBeenCalled();
   });
 
-  it("persists provider errors and resumes with the next eligible candidate", async () => {
-    const run = makeRun("building");
+  it("persists provider errors as unknown and blocks automatic fallback until reconciliation", async () => {
+    const run = makeRun("verifying");
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
       routing: {
         engine: "capability", unknownCost: "allow",
         profiles: {
-          "invented/first": { confidence: 9000, version: "test", scores: { coding: 9500 } },
-          "invented/second": { confidence: 9000, version: "test", scores: { coding: 8500 } },
+          "invented/first": { confidence: 9000, version: "test", scores: { verification: 9500 } },
+          "invented/second": { confidence: 9000, version: "test", scores: { verification: 8500 } },
         },
       },
     }));
@@ -533,14 +726,19 @@ describe("lifecycle Pi extension safety", () => {
     await first.events.get("message_end")!({ message: { role: "assistant", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 0.03 } } } }, first.ctx as unknown as ExtensionContext);
     await first.events.get("agent_end")!({ messages: [{ role: "assistant", stopReason: "error" }] }, first.ctx as unknown as ExtensionContext);
     await first.events.get("agent_settled")!({}, first.ctx as unknown as ExtensionContext);
+    expect(readState(run.paths)?.graphExecution?.nodeStates.verifying?.sideEffect).toMatchObject({
+      status: "unknown",
+      outcome: "unknown",
+    });
 
     const resumed = extensionHarness(run.cwd, models);
     await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
 
-    expect(readState(run.paths)?.modelSelections).toEqual(expect.arrayContaining([
+    expect(readState(run.paths)?.modelSelections).toEqual([
       expect.objectContaining({ model: "first", routing: expect.objectContaining({ failureCategories: expect.arrayContaining(["provider-error"]) }) }),
-      expect.objectContaining({ model: "second", routing: expect.objectContaining({ fallbackCount: 0 }) }),
-    ]));
+    ]);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("ambiguous persisted side effect");
+    expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
     const ledger = readFileSync(join(run.cwd, "home", ".ai-orchestrator", "routing-evidence", "budget.jsonl"), "utf8")
       .trim().split("\n").map((line) => JSON.parse(line));
     expect(ledger).toEqual(expect.arrayContaining([expect.objectContaining({ outcome: "stage-ended", observedUsd: 0.03 })]));
@@ -569,11 +767,12 @@ describe("lifecycle Pi extension safety", () => {
     });
   });
 
-  it("keeps BUILD away from artifacts/publication and keeps PLAN bash read-only", async () => {
+  it("keeps post-BUILD VERIFY away from artifacts/publication and keeps PLAN bash read-only", async () => {
     const buildRun = makeRun("building");
     const buildHarness = extensionHarness(buildRun.cwd);
     await buildHarness.commands.get("lifecycle")!("resume", buildHarness.ctx);
-    expect(buildHarness.activeTools()).not.toContain("bash");
+    expect(readState(buildRun.paths)?.phase).toBe("verifying");
+    expect(buildHarness.activeTools()).toContain("bash");
     expect(buildHarness.activeTools()).not.toContain("agent_team");
 
     await expect(buildHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git push origin main" } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
@@ -582,7 +781,7 @@ describe("lifecycle Pi extension safety", () => {
     await expect(buildHarness.events.get("tool_call")!({ toolName: "bash", input: { command: "git reset --hard" } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
     await expect(buildHarness.events.get("tool_call")!({ toolName: "edit", input: { path: buildRun.paths.plan } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
     await expect(buildHarness.events.get("tool_call")!({ toolName: "write", input: { path: join(buildRun.cwd, ".ai-orchestrator", "active-run.json") } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
-    await expect(buildHarness.events.get("tool_call")!({ toolName: "edit", input: { path: join(buildRun.cwd, "src.ts") } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
+    await expect(buildHarness.events.get("tool_call")!({ toolName: "edit", input: { path: join(buildRun.cwd, "src.ts") } }, buildHarness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
 
     const planRun = makeRun("planning");
     writeFileSync(join(planRun.cwd, "package.json"), JSON.stringify({ scripts: { test: "vitest run" } }));
@@ -595,16 +794,16 @@ describe("lifecycle Pi extension safety", () => {
   it("fails closed when an approved prose plan changes after its legacy graph migration", async () => {
     const run = makeRun("building");
     const first = extensionHarness(run.cwd);
+    vi.mocked(first.pi.setModel).mockResolvedValue(false);
     await first.commands.get("lifecycle")!("resume", first.ctx);
-    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
     writeFileSync(run.paths.plan, "# Replaced plan\n");
 
     const resumed = extensionHarness(run.cwd);
-    await expect(resumed.commands.get("lifecycle")!("resume", resumed.ctx))
-      .rejects.toThrow(/prose plan no longer matches.*immutable legacy/i);
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("prose plan no longer matches");
   });
 
-  it("allows source edits beside a custom nested artifact directory", async () => {
+  it("protects a custom nested artifact directory after BUILD advances to VERIFY", async () => {
     const cwd = join(tmpdir(), `ai-orchestrator-custom-artifacts-${process.pid}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(cwd, { recursive: true });
     tempDirs.push(cwd);
@@ -620,12 +819,13 @@ describe("lifecycle Pi extension safety", () => {
     Object.assign(state, { version: 1, graphExecution: undefined, phase: "building", baselinePaths: [], baselineStagedPaths: [], originalModel: { provider: "test", id: "original", thinking: "high" }, modelRestored: false });
     writeFileSync(created.paths.spec, "# Spec\n");
     writeFileSync(created.paths.plan, "# Plan\n");
-    writeState(created.paths, state);
+    overwriteAsLegacy(created.paths, state);
     writeFileSync(join(cwd, ".ai-orchestrator.json"), JSON.stringify({ lifecycle: { artifactsDir: "src/orch-runs" } }));
     const harness = extensionHarness(cwd);
     await harness.commands.get("lifecycle")!("resume", harness.ctx);
 
-    await expect(harness.events.get("tool_call")!({ toolName: "edit", input: { path: join(cwd, "src", "feature.ts") } }, harness.ctx as unknown as ExtensionContext)).resolves.toBeUndefined();
+    expect(readState(created.paths)?.phase).toBe("verifying");
+    await expect(harness.events.get("tool_call")!({ toolName: "edit", input: { path: join(cwd, "src", "feature.ts") } }, harness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
     await expect(harness.events.get("tool_call")!({ toolName: "edit", input: { path: created.paths.plan } }, harness.ctx as unknown as ExtensionContext)).resolves.toMatchObject({ block: true });
   });
 
@@ -636,6 +836,172 @@ describe("lifecycle Pi extension safety", () => {
     await harness.commands.get("lifecycle")!("resume", harness.ctx);
 
     expect(harness.activeTools()).toEqual(["read", "grep", "find", "ls", "bash", "ship_decision"]);
+  });
+
+  it("releases a live VERIFY model reservation before absorbing lifecycle cancellation", async () => {
+    const run = makeRun("building");
+    const harness = extensionHarness(run.cwd);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "verifying",
+      graphExecution: {
+        guard: { modelCallsInFlight: 1, providerCallsInFlight: 1 },
+        nodeStates: { verifying: { status: "running", sideEffect: { status: "intent_recorded", class: "model" } } },
+      },
+    });
+
+    await harness.commands.get("lifecycle-stop")!("", harness.ctx);
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "idle",
+      modelRestored: true,
+      graphExecution: {
+        ready: [],
+        guard: { modelCallsInFlight: 0, providerCallsInFlight: 0 },
+        nodeStates: { verifying: { status: "cancelled", sideEffect: { status: "unknown", class: "model" } } },
+      },
+    });
+    expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(existsSync(run.paths.executionLease)).toBe(false);
+  });
+
+  it("recovers changed artifact bytes after a model-intent crash without repeating DEFINE", async () => {
+    const run = makeRun("defining");
+    const first = extensionHarness(run.cwd);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+    expect(readState(run.paths)?.graphExecution?.nodeStates.defining?.sideEffect?.status).toBe("unknown");
+
+    writeFileSync(run.paths.spec, "# Specification recovered from the interrupted model call\n");
+    const resumed = extensionHarness(run.cwd);
+    vi.mocked(resumed.ctx.ui.select).mockResolvedValueOnce("Revise");
+    vi.mocked(resumed.ctx.ui.editor).mockResolvedValueOnce("");
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "awaiting_spec_approval",
+      graphExecution: {
+        guard: { modelCallsInFlight: 0, providerCallsInFlight: 0 },
+        nodeStates: { defining: { status: "blocked", sideEffect: { status: "succeeded", class: "model" } } },
+      },
+    });
+    expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(readState(run.paths)?.modelSelections.filter((selection) => selection.stage === "define")).toHaveLength(1);
+    expect(existsSync(run.paths.executionLease)).toBe(false);
+  });
+
+  it("keeps an unchanged artifact request ambiguous after a model-intent crash", async () => {
+    const run = makeRun("defining");
+    const first = extensionHarness(run.cwd);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+
+    const resumed = extensionHarness(run.cwd);
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "defining",
+      graphExecution: {
+        guard: { modelCallsInFlight: 0, providerCallsInFlight: 0 },
+        nodeStates: { defining: { status: "running", sideEffect: { status: "unknown", class: "model" } } },
+      },
+    });
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("ambiguous persisted side effect");
+    expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(existsSync(run.paths.executionLease)).toBe(false);
+  });
+
+  it("reconciles a durable DEBUG diagnosis before taking the terminal failure edge", async () => {
+    const run = makeRun("debugging");
+    const prepared = readState(run.paths)!;
+    prepared.buildIterations = DEFAULT_CONFIG.loop.maxCoderIterations;
+    prepared.consecutiveRejections = 1;
+    prepared.verdicts = [{ stage: "verify", verdict: "reject", reasons: "tests still fail", requiredFixes: "repair the defect" }];
+    writeFixtureState(run.paths, prepared);
+
+    const first = extensionHarness(run.cwd);
+    await first.commands.get("lifecycle")!("resume", first.ctx);
+    const debugTool = vi.mocked(first.pi.registerTool).mock.calls.find(([tool]) => (tool as { name?: string }).name === "debug_diagnosis")?.[0] as {
+      execute: (id: string, params: unknown) => Promise<unknown>;
+    };
+    await debugTool.execute("diagnosis", {
+      rootCause: "The retry budget is exhausted by the same defect",
+      evidence: "The final verification still fails",
+      confidence: "high",
+      recommendedFix: "Re-plan before another build",
+      filesLikelyAffected: ["src/feature.ts"],
+      validationCommands: ["npm test"],
+    });
+    await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
+    expect(readState(run.paths)?.graphExecution?.nodeStates.debugging?.sideEffect?.status).toBe("unknown");
+
+    const resumed = extensionHarness(run.cwd);
+    await resumed.commands.get("lifecycle")!("resume", resumed.ctx);
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "failed",
+      modelRestored: true,
+      graphExecution: {
+        ready: [],
+        guard: { modelCallsInFlight: 0, providerCallsInFlight: 0 },
+        nodeStates: {
+          debugging: { status: "failed", sideEffect: { status: "succeeded", class: "model" } },
+          failed: { status: "executed" },
+        },
+      },
+    });
+    expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(existsSync(run.paths.executionLease)).toBe(false);
+  });
+
+  it("restores tools, model, and lease after a non-human execution ceiling rejects entry", async () => {
+    const run = makeRun("building");
+    writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({
+      execution: { limits: { maxWallTimeMs: 1 } },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const harness = extensionHarness(run.cwd);
+
+    await expect(harness.commands.get("lifecycle")!("resume", harness.ctx)).resolves.toBeUndefined();
+
+    expect(readState(run.paths)).toMatchObject({
+      phase: "building",
+      modelRestored: true,
+      graphExecution: { nodeStates: { building: { status: "ready" } } },
+    });
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("wall-time-limit");
+    expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(harness.pi.setModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "test", id: "original-model" }));
+    expect(existsSync(run.paths.executionLease)).toBe(false);
+  });
+
+  it("restores tools, model, and lease when shutdown uncertainty checkpointing fails", async () => {
+    const run = makeRun("building");
+    const harness = extensionHarness(run.cwd);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+    writeFileSync(run.paths.events, "partial-event-without-newline");
+
+    await expect(harness.events.get("session_shutdown")!({}, harness.ctx as unknown as ExtensionContext))
+      .rejects.toThrow(/event log|corrupt|partial/i);
+
+    expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(harness.pi.setModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "test", id: "original-model" }));
+    expect(existsSync(run.paths.executionLease)).toBe(false);
+  });
+
+  it("restores tools, model, and lease when durable cancellation checkpointing fails", async () => {
+    const run = makeRun("building");
+    const harness = extensionHarness(run.cwd);
+    await harness.commands.get("lifecycle")!("resume", harness.ctx);
+    writeFileSync(run.paths.events, "partial-event-without-newline");
+
+    await expect(harness.commands.get("lifecycle-stop")!("", harness.ctx))
+      .rejects.toThrow(/event log|corrupt|partial/i);
+
+    expect(harness.activeTools()).toEqual(["read", "bash", "agent_team"]);
+    expect(harness.pi.setModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "test", id: "original-model" }));
+    expect(existsSync(run.paths.executionLease)).toBe(false);
   });
 
   it("recovers a checker verdict persisted before agent settlement", async () => {
@@ -686,7 +1052,7 @@ describe("lifecycle Pi extension safety", () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
     state.finalization = { commitBaseSha: "abc1234", commitMessage: "Implement crafted checkpoint" };
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     writeFileSync(join(run.cwd, "feature.ts"), "export const feature = true;\n");
     const harness = extensionHarness(run.cwd);
     harness.exec.mockImplementation(async (command: string, args: string[]) => {
@@ -731,7 +1097,7 @@ describe("lifecycle Pi extension safety", () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
     state.finalization = { commitBaseSha: "abc1234", commitMessage: "Implement recovered work" };
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     writeFileSync(join(run.cwd, ".ai-orchestrator.json"), JSON.stringify({ ship: { openPr: "never" } }));
     const harness = extensionHarness(run.cwd);
     harness.exec.mockImplementation(async (command: string, args: string[]) => {
@@ -751,8 +1117,12 @@ describe("lifecycle Pi extension safety", () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
     state.finalization = { commitSha: "abc1234" };
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     const harness = extensionHarness(run.cwd);
+    harness.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === "git" && args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: "abc1234\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    });
 
     await harness.commands.get("lifecycle")!("resume", harness.ctx);
 
@@ -765,7 +1135,7 @@ describe("lifecycle Pi extension safety", () => {
     const run = makeRun("finalizing");
     const state = readState(run.paths)!;
     state.finalization = { commitSha: "abc1234", prHead: "feature/crafted" };
-    writeState(run.paths, state);
+    writeFixtureState(run.paths, state);
     const harness = extensionHarness(run.cwd);
     const confirm = vi.mocked(harness.ctx.ui.confirm);
     confirm.mockImplementationOnce(async () => {

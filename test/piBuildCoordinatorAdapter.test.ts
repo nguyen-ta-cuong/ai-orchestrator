@@ -7,12 +7,13 @@ import { DEFAULT_EXECUTION_LIMITS } from "../src/core/scheduler.js";
 import { acquireRunLease, createRun } from "../src/lifecycle/artifacts.js";
 import { writeImmutableBuildPlan } from "../src/lifecycle/buildArtifacts.js";
 import { runBuildCoordinator } from "../src/lifecycle/buildCoordinator.js";
+import { acquireBuildGraphExecutionLease } from "../src/lifecycle/buildGraphExecution.js";
 import { createPiBuildCoordinatorAdapter } from "../src/lifecycle/piBuildCoordinatorAdapter.js";
 import type { GitRunner } from "../src/lifecycle/worktreeExecution.js";
 import type { BuildWorkerAdapter } from "../src/runtime/buildWorker.js";
 
 const now = "2026-07-22T00:00:00.000Z";
-const owner = "pi-build-adapter-owner";
+const ownerToken = "pi-build-adapter-owner";
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -28,7 +29,8 @@ describe("production Pi BUILD coordinator adapter", () => {
     const candidateRoot = join(cwd, ".ai-orchestrator", "build-worktrees");
     mkdirSync(candidateRoot, { recursive: true });
     const run = createRun(cwd, ".ai-orchestrator/runs", "pi adapter");
-    acquireRunLease(run.paths, owner);
+    const owner = acquireRunLease(run.paths, ownerToken);
+    const graphOwner = acquireBuildGraphExecutionLease(run.paths, owner, { now, pid: process.pid });
     const compiled = compileLegacySequentialBuildPlan("Implement the approved change.", 1, ["src"]);
     writeImmutableBuildPlan(run.paths, compiled, { owner });
     const invoke = vi.fn<BuildWorkerAdapter["invoke"]>(async (request) => {
@@ -72,7 +74,8 @@ describe("production Pi BUILD coordinator adapter", () => {
     } as const;
     const coordinatorOptions = {
       owner,
-      pid: 123,
+      graphOwner,
+      pid: process.pid,
       now: () => now,
       limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
       policy: {
@@ -83,6 +86,7 @@ describe("production Pi BUILD coordinator adapter", () => {
         trustRepositoryCheckout: false,
       },
       maxActionConcurrency: 2,
+      routingDecisionId: "build-route-1",
       isProcessAlive: () => true,
     } as const;
     const firstAdapter = createPiBuildCoordinatorAdapter(adapterOptions);
@@ -101,7 +105,7 @@ describe("production Pi BUILD coordinator adapter", () => {
     expect(invoke).toHaveBeenCalledOnce();
     expect(result.state.nodeStates["legacy-build"]?.outputRefs).toMatchObject([{
       contract: "legacy-build-output",
-      path: "nodes/1/legacy-build/attempt-1/legacy-build-output.json",
+      path: expect.stringMatching(/^nodes\/1\/legacy-build\/[a-f0-9]{64}-[a-f0-9]{64}\.artifact$/),
     }]);
     expect(result.state.guard).toMatchObject({
       modelCallsInFlight: 0,
@@ -120,7 +124,8 @@ describe("production Pi BUILD coordinator adapter", () => {
     const candidateRoot = join(cwd, ".ai-orchestrator", "build-worktrees");
     mkdirSync(candidateRoot, { recursive: true });
     const run = createRun(cwd, ".ai-orchestrator/runs", "pre-existing change");
-    acquireRunLease(run.paths, owner);
+    const owner = acquireRunLease(run.paths, ownerToken);
+    const graphOwner = acquireBuildGraphExecutionLease(run.paths, owner, { now, pid: process.pid });
     const compiled = compileLegacySequentialBuildPlan("Implement the approved change.", 1, ["src"]);
     writeImmutableBuildPlan(run.paths, compiled, { owner });
     const worker: BuildWorkerAdapter = {
@@ -164,7 +169,8 @@ describe("production Pi BUILD coordinator adapter", () => {
 
     await expect(runBuildCoordinator(run.paths, compiled, adapter, {
       owner,
-      pid: 123,
+      graphOwner,
+      pid: process.pid,
       now: () => now,
       limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
       policy: {
@@ -175,6 +181,7 @@ describe("production Pi BUILD coordinator adapter", () => {
         trustRepositoryCheckout: false,
       },
       maxActionConcurrency: 2,
+      routingDecisionId: "build-route-1",
       isProcessAlive: () => true,
     })).rejects.toThrow(/did not change its declared workspace state/i);
   }, 20_000);

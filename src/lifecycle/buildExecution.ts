@@ -7,6 +7,7 @@ import {
 } from "../core/buildExecution.js";
 import type { RunPaths } from "./artifacts.js";
 import type { GraphExecutionState } from "../core/scheduler.js";
+import type { GraphCheckpointLease } from "../runtime/graphCheckpoint.js";
 import {
   appendBuildDispatchCheckpoint,
   readBuildDispatchLedger,
@@ -47,7 +48,11 @@ export async function executeDurableBuildAction(
   paths: RunPaths,
   actionValue: Readonly<BuildRunningAction>,
   executor: Readonly<BuildActionExecutor>,
-  options: Readonly<{ owner: string; recordedAt: string; context?: Readonly<BuildActionExecutionContext> }>,
+  options: Readonly<{
+    owner: Readonly<GraphCheckpointLease>;
+    recordedAt: string;
+    context?: Readonly<BuildActionExecutionContext>;
+  }>,
 ): Promise<DurableBuildActionResult> {
   const action = normalizeAction(actionValue);
   assertIsoTimestamp(options.recordedAt, "BUILD action intent timestamp");

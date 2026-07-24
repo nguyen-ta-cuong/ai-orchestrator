@@ -15,10 +15,15 @@ import {
   evaluateExecutionGuard,
   type ArtifactReference,
   type ExecutionLimits,
+  type GraphCheckpointRef,
   type GraphEvent,
   type GraphExecutionState,
 } from "../core/scheduler.js";
-import { readGraphEvents } from "../runtime/graphCheckpoint.js";
+import {
+  readGraphEvents,
+  writeGraphMutationArtifact,
+  type GraphCheckpointLease,
+} from "../runtime/graphCheckpoint.js";
 import { runBoundedBuildWorkerTasks } from "../runtime/buildWorker.js";
 import type { RunPaths } from "./artifacts.js";
 import {
@@ -29,6 +34,8 @@ import {
   checkpointBuildGraphEvent,
   buildGraphExecutionPaths,
   initializeBuildGraphExecution,
+  mirrorBuildDispatchSealToGraph,
+  mirrorBuildNodeArtifactToGraph,
 } from "./buildGraphExecution.js";
 import {
   executeDurableBuildAction,
@@ -58,12 +65,14 @@ export interface BuildCoordinatorAdapter extends BuildActionExecutor {
 }
 
 export interface BuildCoordinatorOptions {
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
+  graphOwner: Readonly<GraphCheckpointLease>;
   pid: number;
   now(): string;
   limits: Readonly<ExecutionLimits>;
   policy: Omit<BuildExecutionPolicy, "now">;
   maxActionConcurrency: number;
+  routingDecisionId: string;
   maxPasses?: number;
   isProcessAlive?(pid: number): boolean;
   signal?: AbortSignal;
@@ -88,6 +97,7 @@ export async function runBuildCoordinator(
 ): Promise<BuildCoordinatorResult> {
   let state = initializeBuildGraphExecution(paths, compiled, {
     owner: options.owner,
+    graphOwner: options.graphOwner,
     now: options.now(),
     pid: options.pid,
     limits: options.limits,
@@ -115,6 +125,14 @@ export async function runBuildCoordinator(
         eventId: eventId(state, starts.humanIntegrationNodeId, "human-wait"),
       });
       state = checkpoint(paths, compiled, state, event, options, "human-wait");
+      state = checkpoint(
+        paths,
+        compiled,
+        state,
+        buildHumanIntegrationIntent(paths, compiled, state, starts.humanIntegrationNodeId, options),
+        options,
+        "human-integration-intent",
+      );
       return Object.freeze({ status: "waiting-human", state, reason: starts.humanIntegrationNodeId });
     }
 
@@ -132,6 +150,22 @@ export async function runBuildCoordinator(
       }> = [];
       for (const action of actions) {
         let reservation: Readonly<BuildWorkerBudgetReservation> | undefined;
+        const definition = compiled.plan.nodes.find(({ id }) => id === action.nodeId);
+        if (!definition) throw new Error(`BUILD action ${action.nodeId} is absent from the immutable plan`);
+        const activeNode = state.nodeStates[action.nodeId]!;
+        const activeEffect = activeNode.sideEffect;
+        if (definition.handler === "validate" &&
+            (!activeEffect || activeEffect.attempt !== activeNode.attempts ||
+             activeEffect.status === "failed")) {
+          state = checkpoint(
+            paths,
+            compiled,
+            state,
+            buildReadEffectIntent(state, action.nodeId, options.now()),
+            options,
+            "validation-intent",
+          );
+        }
         if (action.purpose === "worker") {
           const key = `${action.nodeId}:${action.visit}:${action.attempt}`;
           reservation = reservations.get(key);
@@ -163,6 +197,15 @@ export async function runBuildCoordinator(
                 ...estimates,
                 now: options.now(),
                 eventId: eventId(state, action.nodeId, "worker-budget"),
+                checkpointRef: writeBuildWorkerBudgetCheckpoint(
+                  paths,
+                  compiled,
+                  state,
+                  action,
+                  estimates,
+                  options,
+                ),
+                routingDecisionId: options.routingDecisionId,
               });
               state = checkpoint(paths, compiled, state, budget.event, options, "worker-budget");
               reservation = budget.reservation;
@@ -221,15 +264,19 @@ export async function runBuildCoordinator(
         attempt: nodeState.attempts,
         expectedHead: ledger.head,
       }, { owner: options.owner });
+      const graphSeal = mirrorBuildDispatchSealToGraph(paths, seal, {
+        owner: options.owner,
+        graphOwner: options.graphOwner,
+      });
+      const graphOutputs = seal.outputArtifacts.map((reference) =>
+        mirrorBuildNodeArtifactToGraph(paths, reference, {
+          owner: options.owner,
+          graphOwner: options.graphOwner,
+        }));
       state = settleOuterEffect(paths, compiled, state, nodeId, "succeeded", {
-        planVersion: seal.planVersion,
-        nodeId: seal.nodeId,
-        contract: seal.contract,
-        path: seal.path,
-        sha256: seal.sha256,
-        sizeBytes: seal.sizeBytes,
+        ...graphSeal,
       }, adapter, options);
-      state = checkpoint(paths, compiled, state, completionEvent(state, nodeId, seal.outputArtifacts, options.now()), options, "complete");
+      state = checkpoint(paths, compiled, state, completionEvent(state, nodeId, graphOutputs, options.now()), options, "complete");
       completedNode = true;
     }
     if (completedNode) continue;
@@ -306,15 +353,165 @@ function settleOuterEffect(
     artifactRefs: [],
     sideEffect: {
       phase: "result",
+      ordinal: sideEffect.ordinal,
       idempotencyKey: sideEffect.idempotencyKey,
       class: sideEffect.class,
       outcome,
       ...(resultRef === undefined ? {} : { resultRef }),
     },
-    reservation: { modelCalls: -1, providerCalls: -1 },
-    ...(adapter.workerUsage === undefined ? {} : { usage: adapter.workerUsage(nodeId) }),
+    ...(sideEffect.routingDecisionId === undefined ? {} : {
+      routingDecisionId: sideEffect.routingDecisionId,
+    }),
+    ...(sideEffect.checkpointRef === undefined ? {} : {
+      checkpointRef: sideEffect.checkpointRef,
+    }),
+    ...(sideEffect.class === "model" ? {
+      reservation: { modelCalls: -1, providerCalls: -1 },
+      usage: completeWorkerUsage(nodeId, adapter),
+    } : {}),
   };
   return checkpoint(paths, compiled, state, event, options, "outer-result");
+}
+
+function buildReadEffectIntent(
+  state: Readonly<GraphExecutionState>,
+  nodeId: string,
+  timestamp: string,
+): GraphEvent {
+  const node = state.nodeStates[nodeId]!;
+  const ordinal = node.sideEffectOrdinal + 1;
+  const requestRef = createHash("sha256")
+    .update(`ai-orchestrator/build-validation/v1\0${state.runId}\0${state.planVersion}\0${nodeId}\0${node.visits}\0${node.attempts}\0${ordinal}`)
+    .digest("hex");
+  return {
+    schemaVersion: 1,
+    kind: "side-effect-intent",
+    sequence: state.lastAppliedEventSequence + 1,
+    eventId: eventId(state, nodeId, "validation-intent"),
+    requestRef,
+    runId: state.runId,
+    graphId: state.graphId,
+    graphVersion: state.graphVersion,
+    graphDigest: state.graphDigest,
+    planVersion: state.planVersion,
+    nodeId,
+    priorStatus: "running",
+    nextStatus: "running",
+    attempt: node.attempts,
+    timestamp,
+    artifactRefs: [],
+    sideEffect: {
+      phase: "intent",
+      ordinal,
+      idempotencyKey: requestRef,
+      class: "tool",
+    },
+  };
+}
+
+function buildHumanIntegrationIntent(
+  paths: RunPaths,
+  compiled: Readonly<CompiledBuildPlan>,
+  state: Readonly<GraphExecutionState>,
+  nodeId: string,
+  options: Readonly<BuildCoordinatorOptions>,
+): GraphEvent {
+  const node = state.nodeStates[nodeId]!;
+  const ordinal = node.sideEffectOrdinal + 1;
+  const record = {
+    schemaVersion: 1,
+    kind: "build-human-integration-request",
+    runId: state.runId,
+    planVersion: state.planVersion,
+    planHash: compiled.hash,
+    nodeId,
+    visit: node.visits,
+    attempt: node.attempts,
+    ordinal,
+    inputArtifactRefs: Object.values(state.nodeStates)
+      .flatMap(({ outputRefs }) => outputRefs)
+      .sort((left, right) => left.path.localeCompare(right.path)),
+  };
+  const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+  const requestRef = createHash("sha256").update(bytes).digest("hex");
+  const checkpointRef = writeGraphMutationArtifact(buildGraphExecutionPaths(paths), {
+    owner: options.graphOwner,
+    mutationId: requestRef,
+    bytes,
+  });
+  return {
+    schemaVersion: 1,
+    kind: "side-effect-intent",
+    sequence: state.lastAppliedEventSequence + 1,
+    eventId: eventId(state, nodeId, "human-integration-intent"),
+    requestRef,
+    checkpointRef,
+    runId: state.runId,
+    graphId: state.graphId,
+    graphVersion: state.graphVersion,
+    graphDigest: state.graphDigest,
+    planVersion: state.planVersion,
+    nodeId,
+    priorStatus: "waiting_human",
+    nextStatus: "waiting_human",
+    attempt: node.attempts,
+    timestamp: options.now(),
+    artifactRefs: [],
+    sideEffect: {
+      phase: "intent",
+      ordinal,
+      idempotencyKey: requestRef,
+      class: "external",
+    },
+  };
+}
+
+function completeWorkerUsage(
+  nodeId: string,
+  adapter: Readonly<BuildCoordinatorAdapter>,
+): NonNullable<GraphEvent["usage"]> {
+  const estimates = adapter.workerBudgetEstimates(nodeId);
+  const observed = adapter.workerUsage?.(nodeId);
+  return {
+    estimatedCostUsd: observed?.estimatedCostUsd ?? estimates.estimatedCostUsd,
+    observedCostUsd: observed?.observedCostUsd ?? estimates.observedCostUsd,
+    inputTokens: observed?.inputTokens ?? estimates.inputTokens,
+    outputTokens: observed?.outputTokens ?? estimates.outputTokens,
+  };
+}
+
+function writeBuildWorkerBudgetCheckpoint(
+  paths: RunPaths,
+  compiled: Readonly<CompiledBuildPlan>,
+  state: Readonly<GraphExecutionState>,
+  action: Readonly<BuildRunningAction>,
+  estimates: Readonly<BuildWorkerBudgetEstimates>,
+  options: Readonly<BuildCoordinatorOptions>,
+): GraphCheckpointRef {
+  const record = {
+    schemaVersion: 1,
+    kind: "build-worker-budget-request",
+    runId: state.runId,
+    planVersion: state.planVersion,
+    planHash: compiled.hash,
+    nodeId: action.nodeId,
+    visit: action.visit,
+    attempt: action.attempt,
+    purpose: action.purpose,
+    routingDecisionId: options.routingDecisionId,
+    unattended: estimates.unattended,
+    estimatedCostUsd: estimates.estimatedCostUsd,
+    observedCostUsd: estimates.observedCostUsd,
+    inputTokens: estimates.inputTokens,
+    outputTokens: estimates.outputTokens,
+  };
+  const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+  const mutationId = createHash("sha256").update(bytes).digest("hex");
+  return writeGraphMutationArtifact(buildGraphExecutionPaths(paths), {
+    owner: options.graphOwner,
+    mutationId,
+    bytes,
+  });
 }
 
 function failNode(
@@ -396,6 +593,7 @@ function checkpoint(
 ): GraphExecutionState {
   return checkpointBuildGraphEvent(paths, compiled, state, event, {
     owner: options.owner,
+    graphOwner: options.graphOwner,
     tempId: `${label}-${event.sequence}`,
   });
 }

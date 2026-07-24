@@ -8,6 +8,8 @@ import {
   computeReadySet,
   createGraphExecutionState,
   evaluateExecutionGuard,
+  graphEventDigest,
+  migrateLegacyNodePlanVersions,
   type ExecutionLimits,
   type GraphEvent,
   type SchedulerMetadata,
@@ -46,11 +48,15 @@ function stateMachine() {
     version: "1",
     kind: "state-machine",
     entry: "work",
-    nodes: [node("work"), node("check"), node("done", true)],
+    nodes: [node("work"), node("check"), node("idle"), node("done", true), node("failed", true)],
     edges: [
       { from: "work", to: "check", event: "built", boundedBy: "loop-budget" },
+      { from: "work", to: "idle", event: "cancelled", boundedBy: "loop-budget" },
       { from: "check", to: "work", event: "retry", boundedBy: "loop-budget" },
+      { from: "check", to: "idle", event: "cancelled", boundedBy: "loop-budget" },
       { from: "check", to: "done", event: "approved", boundedBy: "loop-budget" },
+      { from: "check", to: "failed", event: "provider_failed", boundedBy: "loop-budget" },
+      { from: "idle", to: "work", event: "start", boundedBy: "loop-budget" },
     ],
   } satisfies GraphDefinition);
 }
@@ -112,6 +118,11 @@ function event(
 
 function requestRef(idempotencyKey: string): string {
   return createHash("sha256").update(idempotencyKey).digest("hex");
+}
+
+function mutationCheckpoint(seed: string) {
+  const digest = requestRef(`checkpoint:${seed}`);
+  return { path: `mutations/${digest}.json`, sha256: digest, sizeBytes: seed.length + 1 };
 }
 
 describe("durable graph scheduler", () => {
@@ -218,7 +229,7 @@ describe("durable graph scheduler", () => {
     })).toThrow(/SHA-256/);
   });
 
-  it("consumes boundedBy on state-machine edges and never readies a cancelled target", () => {
+  it("consumes boundedBy on business and cancellation edges and activates the exact cancellation target", () => {
     const graph = stateMachine();
     const limits = { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: { "loop-budget": 2 } };
     let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
@@ -242,13 +253,17 @@ describe("durable graph scheduler", () => {
     }))).toThrow(/loop-budget.*exhausted/);
 
     const fresh = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
-    const cancelWithEdge = event(fresh, "work", "ready", "cancelled", {
+    const wrongCancelEdge = event(fresh, "work", "ready", "cancelled", {
       chosenEdge: { from: "work", to: "check", event: "built", boundedBy: "loop-budget" },
     });
-    expect(() => applySchedulerEvent(graph, fresh, cancelWithEdge)).toThrow(/cancelled.*chosen edge/);
-    const cancelled = applySchedulerEvent(graph, fresh, event(fresh, "work", "ready", "cancelled"));
+    expect(() => applySchedulerEvent(graph, fresh, wrongCancelEdge)).toThrow(/cancellation edge/i);
+    expect(() => applySchedulerEvent(graph, fresh, event(fresh, "work", "ready", "cancelled"))).toThrow(/requires one chosen edge/);
+    const cancelled = applySchedulerEvent(graph, fresh, event(fresh, "work", "ready", "cancelled", {
+      chosenEdge: { from: "work", to: "idle", event: "cancelled", boundedBy: "loop-budget" },
+    }));
     expect(cancelled.ready).toEqual([]);
-    expect(cancelled.guard.backEdgeRemaining["loop-budget"]).toBe(2);
+    expect(cancelled.nodeStates.idle!.status).toBe("pending");
+    expect(cancelled.guard.backEdgeRemaining["loop-budget"]).toBe(1);
   });
 
   it("rejects missing and forged state-machine edges before consuming a budget", () => {
@@ -290,6 +305,29 @@ describe("durable graph scheduler", () => {
     expect(() => applySchedulerEvent(graph, initial, { ...started, sequence: 2 })).toThrow(/out of order/);
   });
 
+  it("rejects inherited and accessor-backed graph event fields", () => {
+    const graph = dag();
+    const state = createGraphExecutionState(graph, {
+      runId: "opaque-run-id", now, limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    const inherited = event(state, "start", "ready", "running") as GraphEvent & Record<string, unknown>;
+    delete inherited.schemaVersion;
+    Object.defineProperty(Object.prototype, "schemaVersion", { value: 1, configurable: true });
+    try {
+      expect(() => applySchedulerEvent(graph, state, inherited as GraphEvent)).toThrow(/cannot inherit fields/);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).schemaVersion;
+    }
+
+    const accessor = event(state, "start", "ready", "running");
+    Object.defineProperty(accessor, "eventId", { enumerable: true, get: () => "accessor-event" });
+    expect(() => applySchedulerEvent(graph, state, accessor)).toThrow(/accessor fields/);
+
+    const hidden = event(state, "start", "ready", "running");
+    Object.defineProperty(hidden, "eventId", { value: "hidden-event", enumerable: false });
+    expect(() => graphEventDigest(hidden)).toThrow(/non-enumerable fields/);
+  });
+
   it("accounts visits, retries, reservations, usage, side effects, and no-progress events", () => {
     const graph = dag("read");
     let state = createGraphExecutionState(graph, {
@@ -304,10 +342,13 @@ describe("durable graph scheduler", () => {
     expect(state.guard).toMatchObject({ steps: 1, runningNodes: ["start"] });
 
     const key = "model-request-1";
+    const checkpointRef = mutationCheckpoint(key);
     const intent = event(state, "start", "running", "running", {
       kind: "side-effect-intent",
       requestRef: requestRef(key),
-      sideEffect: { phase: "intent", idempotencyKey: key, class: "model" },
+      checkpointRef,
+      routingDecisionId: "route-model-1",
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey: key, class: "model" },
       reservation: { modelCalls: 1, providerCalls: 1 },
     });
     state = applySchedulerEvent(graph, state, intent);
@@ -319,13 +360,15 @@ describe("durable graph scheduler", () => {
       ...intent,
       sequence: state.lastAppliedEventSequence + 1,
       eventId: "duplicate-intent",
-    })).toThrow(/intent already recorded/);
+    })).toThrow(/unresolved side effect/);
 
     const resultRef = event(state, "start", "running", "executed").artifactRefs[0]!;
     state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
       kind: "side-effect-result",
       requestRef: requestRef(key),
-      sideEffect: { phase: "result", idempotencyKey: key, class: "model", outcome: "succeeded", resultRef },
+      checkpointRef,
+      routingDecisionId: "route-model-1",
+      sideEffect: { phase: "result", ordinal: 1, idempotencyKey: key, class: "model", outcome: "succeeded", resultRef },
       reservation: { modelCalls: -1, providerCalls: -1 },
       usage: { estimatedCostUsd: 0.2, observedCostUsd: 0.1, inputTokens: 20, outputTokens: 5 },
     }));
@@ -343,6 +386,200 @@ describe("durable graph scheduler", () => {
       kind: "progress", progressFingerprint: fingerprint,
     }));
     expect(state.guard).toMatchObject({ noProgressFingerprint: fingerprint, noProgressRepeats: 2 });
+  });
+
+  it("sequences effects, binds results to request bytes, and never reuses a succeeded key", () => {
+    const graph = dag("read");
+    let state = createGraphExecutionState(graph, {
+      runId: "opaque-run-id", now, limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    state = applySchedulerEvent(graph, state, event(state, "start", "ready", "running"));
+    const evidence = (contract: string) => ({
+      planVersion: 1,
+      nodeId: "start",
+      contract,
+      path: `nodes/1/start/${contract}.json`,
+      sha256: "b".repeat(64),
+      sizeBytes: 3,
+    });
+    const request = (label: string) => createHash("sha256").update(JSON.stringify({ prompt: label })).digest("hex");
+    const settle = (key: string, ordinal: number, requestRef: string, contract: string) => {
+      state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+        kind: "side-effect-intent",
+        requestRef,
+        sideEffect: { phase: "intent", ordinal, idempotencyKey: key, class: "tool" },
+      }));
+      state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+        kind: "side-effect-result",
+        requestRef,
+        sideEffect: {
+          phase: "result", ordinal, idempotencyKey: key, class: "tool", outcome: "succeeded", resultRef: evidence(contract),
+        },
+      }));
+    };
+
+    settle("key-k", 1, request("request-k"), "tool-result-k");
+    settle("key-l", 2, request("request-l"), "tool-result-l");
+    expect(state.nodeStates.start).toMatchObject({
+      sideEffectOrdinal: 2,
+      succeededSideEffectKeys: ["key-k", "key-l"],
+    });
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-intent",
+      requestRef: request("different-request-k"),
+      sideEffect: { phase: "intent", ordinal: 3, idempotencyKey: "key-k", class: "tool" },
+    }))).toThrow(/repeat a succeeded idempotency key/);
+
+    state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-intent",
+      requestRef: request("request-m"),
+      sideEffect: { phase: "intent", ordinal: 3, idempotencyKey: "key-m", class: "tool" },
+    }));
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-result",
+      requestRef: request("changed-request-m"),
+      sideEffect: {
+        phase: "result", ordinal: 3, idempotencyKey: "key-m", class: "tool", outcome: "succeeded", resultRef: evidence("mismatch"),
+      },
+    }))).toThrow(/does not match the persisted intent/);
+  });
+
+  it("blocks unknown effects until an explicit immutable reconciliation settles them", () => {
+    const graph = dag("read");
+    let state = createGraphExecutionState(graph, {
+      runId: "opaque-run-id", now, limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    state = applySchedulerEvent(graph, state, event(state, "start", "ready", "running"));
+    const digest = requestRef("actual-request-bytes");
+    const checkpointRef = {
+      path: `mutations/${"d".repeat(64)}.json`,
+      sha256: "d".repeat(64),
+      sizeBytes: 27,
+    };
+    state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-intent",
+      requestRef: digest,
+      checkpointRef,
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey: "unknown-key", class: "tool" },
+    }));
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-result",
+      requestRef: digest,
+      sideEffect: { phase: "result", ordinal: 1, idempotencyKey: "unknown-key", class: "tool", outcome: "unknown" },
+    }))).toThrow(/does not match the persisted intent/);
+    state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-result",
+      requestRef: digest,
+      checkpointRef,
+      sideEffect: { phase: "result", ordinal: 1, idempotencyKey: "unknown-key", class: "tool", outcome: "unknown" },
+    }));
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "executed"))).toThrow(/succeeded side-effect result/);
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "failed_retryable", {
+      errorCategory: "ambiguous",
+    }))).toThrow(/unknown.*side effect/);
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-intent",
+      requestRef: requestRef("next-request"),
+      sideEffect: { phase: "intent", ordinal: 2, idempotencyKey: "next-key", class: "tool" },
+    }))).toThrow(/requiring reconciliation/);
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-result",
+      requestRef: digest,
+      checkpointRef: { ...checkpointRef, sha256: "e".repeat(64) },
+      sideEffect: {
+        phase: "result", ordinal: 1, idempotencyKey: "unknown-key", class: "tool", outcome: "succeeded", reconciliation: true,
+        resultRef: {
+          planVersion: 1, nodeId: "start", contract: "wrong-checkpoint",
+          path: "nodes/1/start/wrong-checkpoint.json", sha256: "e".repeat(64), sizeBytes: 4,
+        },
+      },
+    }))).toThrow(/does not match the persisted intent/);
+
+    const resultRef = {
+      planVersion: 1, nodeId: "start", contract: "reconciliation-evidence",
+      path: "nodes/1/start/reconciliation.json", sha256: "c".repeat(64), sizeBytes: 4,
+    };
+    state = applySchedulerEvent(graph, state, event(state, "start", "running", "running", {
+      kind: "side-effect-result",
+      requestRef: digest,
+      checkpointRef,
+      sideEffect: {
+        phase: "result", ordinal: 1, idempotencyKey: "unknown-key", class: "tool",
+        outcome: "succeeded", reconciliation: true, resultRef,
+      },
+    }));
+    expect(state.nodeStates.start!.sideEffect).toMatchObject({ status: "succeeded", reconciled: true, resultRef });
+  });
+
+  it("mechanically couples model reservations and usage while forbidding them on non-model effects", () => {
+    const graph = dag("read");
+    let state = createGraphExecutionState(graph, {
+      runId: "opaque-run-id", now, limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    state = applySchedulerEvent(graph, state, event(state, "start", "ready", "running"));
+    const digest = requestRef("model-request-bytes");
+    const checkpointRef = mutationCheckpoint("model-request-bytes");
+    const modelIntent = event(state, "start", "running", "running", {
+      kind: "side-effect-intent",
+      requestRef: digest,
+      checkpointRef,
+      routingDecisionId: "route-model-2",
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey: "model-key", class: "model" },
+    });
+    expect(() => applySchedulerEvent(graph, state, modelIntent)).toThrow(/exact model\/provider reservations/);
+    expect(() => applySchedulerEvent(graph, state, {
+      ...modelIntent,
+      routingDecisionId: undefined,
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey: "tool-key", class: "tool" },
+      reservation: { modelCalls: 1, providerCalls: 1 },
+    })).toThrow(/Non-model.*cannot reserve/);
+
+    state = applySchedulerEvent(graph, state, {
+      ...modelIntent,
+      reservation: { modelCalls: 1, providerCalls: 1 },
+    });
+    const resultRef = {
+      planVersion: 1, nodeId: "start", contract: "provider-result",
+      path: "nodes/1/start/provider.json", sha256: "d".repeat(64), sizeBytes: 5,
+    };
+    const result = event(state, "start", "running", "running", {
+      kind: "side-effect-result",
+      requestRef: digest,
+      checkpointRef,
+      routingDecisionId: "route-model-2",
+      sideEffect: {
+        phase: "result", ordinal: 1, idempotencyKey: "model-key", class: "model", outcome: "succeeded", resultRef,
+      },
+      reservation: { modelCalls: -1, providerCalls: -1 },
+    });
+    expect(() => applySchedulerEvent(graph, state, result)).toThrow(/explicit cost and token usage/);
+    expect(() => applySchedulerEvent(graph, state, {
+      ...result,
+      usage: { estimatedCostUsd: 0, observedCostUsd: 0, inputTokens: 1, outputTokens: 1 },
+      reservation: { modelCalls: 0, providerCalls: -1 },
+    })).toThrow(/exact model\/provider reservation release/);
+    expect(() => applySchedulerEvent(graph, state, {
+      ...result,
+      routingDecisionId: "route-substitution",
+      usage: { estimatedCostUsd: 0, observedCostUsd: 0, inputTokens: 1, outputTokens: 1 },
+    })).toThrow(/does not match the persisted intent/);
+  });
+
+  it("rejects backdated events and guard probes relative to the last durable event", () => {
+    const graph = dag();
+    const limits = { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} };
+    let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
+    state = applySchedulerEvent(graph, state, event(state, "start", "ready", "running", {
+      timestamp: "2026-07-22T00:00:02.000Z",
+    }));
+    expect(() => applySchedulerEvent(graph, state, event(state, "start", "running", "failed", {
+      timestamp: "2026-07-22T00:00:01.000Z",
+      errorCategory: "backdated",
+    }))).toThrow(/predates the last durable event/);
+    expect(evaluateExecutionGuard(graph, state, limits, {
+      action: "node", nodeId: "alpha", nodeAttempts: 1, concurrency: 1,
+      now: "2026-07-22T00:00:01.000Z", unattended: false,
+    })).toMatchObject({ allowed: false, code: "invalid-guard-probe" });
   });
 
   it("separates business visits from bounded retries and global attempts", () => {
@@ -416,7 +653,18 @@ describe("durable graph scheduler", () => {
         },
         limits: { maxReadyWidth: 1 },
       },
-      { code: "concurrency-limit", mutate: (value) => { value.guard.runningNodes = ["start"]; }, probe: { concurrency: 1 }, limits: { maxConcurrency: 1 } },
+      {
+        code: "concurrency-limit",
+        mutate: (value) => {
+          value.nodeStates.start!.status = "running";
+          value.nodeStates.start!.attempts = 1;
+          value.nodeStates.start!.startedAt = now;
+          value.ready = [];
+          value.guard.steps = 1;
+          value.guard.runningNodes = ["start"];
+        },
+        probe: { concurrency: 1 }, limits: { maxConcurrency: 1 },
+      },
       { code: "model-concurrency-limit", mutate: (value) => { value.guard.modelCallsInFlight = 1; }, probe: modelProbe, limits: { maxModelConcurrency: 1 } },
       { code: "provider-concurrency-limit", mutate: (value) => { value.guard.providerCallsInFlight = 1; }, probe: modelProbe, limits: { maxProviderConcurrency: 1 } },
       { code: "wall-time-limit", probe: { now: "2026-07-22T00:00:02.000Z" }, limits: { maxWallTimeMs: 1_000 } },
@@ -460,6 +708,26 @@ describe("durable graph scheduler", () => {
       });
       expect(decision, selected.code).toMatchObject({ allowed: false, code: selected.code });
     }
+  });
+
+  it("counts a waiting-human phase as an attempt and checkpoints its external intent", () => {
+    const graph = dag("external");
+    const limits = { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} };
+    let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
+    state = applySchedulerEvent(graph, state, event(state, "start", "ready", "waiting_human", { attempt: 1 }));
+    expect(state.nodeStates.start).toMatchObject({ status: "waiting_human", attempts: 1 });
+    expect(state.guard).toMatchObject({ steps: 1, humanWaitStartedAt: now });
+
+    const idempotencyKey = "start-visit-1-attempt-1";
+    const checkpointRef = mutationCheckpoint(idempotencyKey);
+    state = applySchedulerEvent(graph, state, {
+      ...event(state, "start", "waiting_human", "waiting_human", { attempt: 1 }),
+      kind: "side-effect-intent",
+      requestRef: createHash("sha256").update(idempotencyKey).digest("hex"),
+      checkpointRef,
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey, class: "external" },
+    });
+    expect(state.nodeStates.start!.sideEffect).toMatchObject({ status: "intent_recorded", class: "external", attempt: 1 });
   });
 
   it("freezes execution limits and rejects malformed or budget-masking guard probes", () => {
@@ -510,6 +778,119 @@ describe("durable graph scheduler", () => {
         now, unattended: false, ...bypass,
       } as never), bypass.action).toMatchObject({ allowed: false, code: "invalid-guard-probe" });
     }
+  });
+
+  it("admits an exact absorbing cancellation after global ceilings and no further work", () => {
+    const graph = stateMachine();
+    const edge = { from: "work", to: "idle", event: "cancelled", boundedBy: "loop-budget" } as const;
+    const later = "2026-07-22T00:00:02.000Z";
+    const cases = [
+      {
+        name: "wall time",
+        limits: { maxWallTimeMs: 1_000 },
+        mutate: (_state: ReturnType<typeof createGraphExecutionState>) => {},
+        unattended: false,
+      },
+      {
+        name: "human wait",
+        limits: { maxHumanWaitMs: 1_000 },
+        mutate: (state: ReturnType<typeof createGraphExecutionState>) => { state.guard.humanWaitStartedAt = now; },
+        unattended: false,
+      },
+      {
+        name: "unknown cost",
+        limits: {},
+        mutate: (state: ReturnType<typeof createGraphExecutionState>) => { state.guard.estimatedCostUsd = "unknown"; },
+        unattended: true,
+      },
+      {
+        name: "no progress",
+        limits: { maxNoProgressRepeats: 1 },
+        mutate: (state: ReturnType<typeof createGraphExecutionState>) => { state.guard.noProgressRepeats = 1; },
+        unattended: false,
+      },
+    ];
+
+    for (const selected of cases) {
+      const limits: ExecutionLimits = {
+        ...DEFAULT_EXECUTION_LIMITS,
+        backEdgeBudgets: { "loop-budget": 2 },
+        ...selected.limits,
+      };
+      let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
+      selected.mutate(state);
+      expect(evaluateExecutionGuard(graph, state, limits, {
+        action: "transition",
+        nodeId: "work",
+        additionalReady: 0,
+        edge,
+        terminalStop: "cancelled",
+        now: later,
+        unattended: selected.unattended,
+      }), selected.name).toEqual({ allowed: true });
+
+      state = applySchedulerEvent(graph, state, event(state, "work", "ready", "cancelled", {
+        chosenEdge: edge,
+        timestamp: later,
+      }));
+      expect(state.ready, selected.name).toEqual([]);
+      expect(state.nodeStates).toMatchObject({ work: { status: "cancelled" }, idle: { status: "pending" } });
+      expect(state.guard.backEdgeRemaining["loop-budget"]).toBe(1);
+
+      const deniedProbes = [
+        { action: "node", nodeId: "work", nodeAttempts: 1, concurrency: 1 },
+        {
+          action: "model", nodeId: "work", nodeAttempts: 0, concurrency: 0, modelCalls: 1, providerCalls: 1,
+          sideEffectAttempts: 1, estimatedCostUsd: 0, observedCostUsd: 0, inputTokens: 0, outputTokens: 0,
+        },
+        { action: "side_effect", nodeId: "work", nodeAttempts: 0, concurrency: 0, sideEffectAttempts: 1, sideEffectClass: "external" },
+      ] as const;
+      for (const probe of deniedProbes) {
+        expect(evaluateExecutionGuard(graph, state, limits, {
+          ...probe,
+          now: later,
+          unattended: false,
+        }), `${selected.name}:${probe.action}`).toMatchObject({ allowed: false, code: "invalid-guard-probe" });
+      }
+    }
+  });
+
+  it("reserves the final back-edge unit for exact terminal cleanup", () => {
+    const graph = stateMachine();
+    const limits = { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: { "loop-budget": 1 } };
+    let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
+    expect(evaluateExecutionGuard(graph, state, limits, {
+      action: "transition",
+      nodeId: "work",
+      additionalReady: 1,
+      edge: { from: "work", to: "check", event: "built", boundedBy: "loop-budget" },
+      now,
+      unattended: false,
+    })).toMatchObject({ allowed: false, code: "back-edge-budget" });
+
+    const cancellationEdge = { from: "work", to: "idle", event: "cancelled", boundedBy: "loop-budget" } as const;
+    expect(evaluateExecutionGuard(graph, state, limits, {
+      action: "transition",
+      nodeId: "work",
+      additionalReady: 0,
+      edge: cancellationEdge,
+      terminalStop: "cancelled",
+      now,
+      unattended: false,
+    })).toEqual({ allowed: true });
+    state = applySchedulerEvent(graph, state, event(state, "work", "ready", "cancelled", { chosenEdge: cancellationEdge }));
+    expect(state.guard.backEdgeRemaining["loop-budget"]).toBe(0);
+
+    const fresh = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
+    expect(evaluateExecutionGuard(graph, fresh, limits, {
+      action: "transition",
+      nodeId: "work",
+      additionalReady: 1,
+      edge: { from: "work", to: "check", event: "built", boundedBy: "loop-budget" },
+      terminalStop: "cancelled",
+      now,
+      unattended: false,
+    })).toMatchObject({ allowed: false, code: "invalid-guard-probe" });
   });
 
   it("allows the final admitted node's model effect but blocks the next node start", () => {
@@ -701,5 +1082,142 @@ describe("durable graph scheduler", () => {
     }));
     expect(unbound.nodeStates.consumer!.status).toBe("pending");
     expect(unbound.ready).toEqual([]);
+  });
+
+  it("reserves the next plan namespace while retaining prior-version node evidence", () => {
+    const graph = stateMachine();
+    const limits = { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: { "loop-budget": 8 } };
+    let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits });
+    state = applySchedulerEvent(graph, state, event(state, "work", "ready", "running"));
+    state = applySchedulerEvent(graph, state, event(state, "work", "running", "blocked", {
+      chosenEdge: { from: "work", to: "check", event: "built", boundedBy: "loop-budget" },
+    }));
+    expect(state.nodeStates.work).toMatchObject({ planVersion: 1, status: "blocked" });
+    expect(state.nodeStates.work!.outputRefs[0]!.planVersion).toBe(1);
+
+    const activationRef = {
+      planVersion: 2,
+      nodeId: "check",
+      contract: "plan-version-intent",
+      path: "nodes/2/check/plan-version-intent.json",
+      sha256: "e".repeat(64),
+      sizeBytes: 4,
+    };
+    const reservation = {
+      ...event(state, "check", "ready", "ready"),
+      kind: "plan-version-reserved",
+      priorPlanVersion: 1,
+      nextPlanVersion: 2,
+      activationRef,
+    } as const satisfies GraphEvent;
+    state = applySchedulerEvent(graph, state, reservation);
+    expect(state.planVersion).toBe(2);
+    expect(state.nodeStates.check).toMatchObject({ status: "ready", planVersion: 2 });
+    expect(state.nodeStates.work).toMatchObject({ status: "blocked", planVersion: 1 });
+    expect(() => assertScheduleValid(graph, state)).not.toThrow();
+    expect(applySchedulerEvent(graph, state, reservation)).toEqual(state);
+    expect(applySchedulerEvent(graph, state, event(state, "check", "ready", "running")).nodeStates.check!.status).toBe("running");
+
+    expect(() => applySchedulerEvent(graph, state, {
+      ...event(state, "check", "ready", "ready"),
+      kind: "plan-version-reserved",
+      priorPlanVersion: 1,
+      nextPlanVersion: 3,
+      activationRef: { ...activationRef, planVersion: 3, path: "nodes/3/check/plan-version-intent.json" },
+    })).toThrow(/exactly one|current scheduler namespace/);
+  });
+
+  it("activates the exact terminal failure edge and rejects unresolved provider reservations", () => {
+    const graph = stateMachine();
+    const limits = { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: { "loop-budget": 8 } };
+    let state = createGraphExecutionState(graph, { runId: "opaque-run-id", now, limits, currentNodeId: "check" });
+    state = applySchedulerEvent(graph, state, event(state, "check", "ready", "running"));
+    const failed = event(state, "check", "running", "failed", {
+      chosenEdge: { from: "check", to: "failed", event: "provider_failed", boundedBy: "loop-budget" },
+      errorCategory: "provider-unavailable",
+    });
+    const terminal = applySchedulerEvent(graph, state, failed);
+    expect(terminal.nodeStates.check!.status).toBe("failed");
+    expect(terminal.nodeStates.failed).toMatchObject({ status: "executed", visits: 1 });
+    expect(terminal.ready).toEqual([]);
+
+    expect(() => applySchedulerEvent(graph, state, { ...failed, chosenEdge: undefined })).toThrow(/requires one chosen edge/);
+    expect(() => applySchedulerEvent(graph, state, {
+      ...failed,
+      chosenEdge: { from: "check", to: "work", event: "retry", boundedBy: "loop-budget" },
+    })).toThrow(/terminal target/);
+
+    const modelGraph = compileGraph({
+      ...graph.definition,
+      id: "scheduler-machine-model",
+      nodes: graph.definition.nodes.map((definition) => definition.id === "check"
+        ? { ...definition, sideEffect: "read" as const }
+        : { ...definition }),
+      edges: graph.definition.edges.map((edge) => ({ ...edge })),
+    });
+    let reserved = createGraphExecutionState(modelGraph, { runId: "opaque-run-id", now, limits, currentNodeId: "check" });
+    reserved = applySchedulerEvent(modelGraph, reserved, event(reserved, "check", "ready", "running"));
+    const checkpointRef = mutationCheckpoint("provider-call");
+    reserved = applySchedulerEvent(modelGraph, reserved, event(reserved, "check", "running", "running", {
+      kind: "side-effect-intent",
+      requestRef: requestRef("provider-call"),
+      checkpointRef,
+      routingDecisionId: "route-provider-call",
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey: "provider-call", class: "model" },
+      reservation: { modelCalls: 1, providerCalls: 1 },
+    }));
+    expect(() => applySchedulerEvent(modelGraph, reserved, event(reserved, "check", "running", "failed", {
+      chosenEdge: { from: "check", to: "failed", event: "provider_failed", boundedBy: "loop-budget" },
+      errorCategory: "provider-unavailable",
+    }))).toThrow(/reservation remains unresolved/);
+  });
+
+  it("lets a DAG human node settle its external effect before executing", () => {
+    const graph = dag("external");
+    let state = createGraphExecutionState(graph, {
+      runId: "opaque-run-id", now, limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    state = applySchedulerEvent(graph, state, event(state, "start", "ready", "waiting_human", { attempt: 1 }));
+    const digest = requestRef("human-integration");
+    const checkpointRef = mutationCheckpoint("human-integration");
+    state = applySchedulerEvent(graph, state, event(state, "start", "waiting_human", "waiting_human", {
+      kind: "side-effect-intent",
+      requestRef: digest,
+      checkpointRef,
+      sideEffect: { phase: "intent", ordinal: 1, idempotencyKey: "human-integration", class: "external" },
+    }));
+    const resultRef = event(state, "start", "waiting_human", "executed").artifactRefs[0]!;
+    state = applySchedulerEvent(graph, state, event(state, "start", "waiting_human", "waiting_human", {
+      kind: "side-effect-result",
+      requestRef: digest,
+      checkpointRef,
+      sideEffect: {
+        phase: "result", ordinal: 1, idempotencyKey: "human-integration", class: "external", outcome: "succeeded", resultRef,
+      },
+    }));
+    state = applySchedulerEvent(graph, state, event(state, "start", "waiting_human", "executed"));
+    expect(state.nodeStates.start!.status).toBe("executed");
+    expect(state.ready).toEqual(["alpha", "beta"]);
+  });
+
+  it("migrates legacy node namespaces only when retained evidence is consistent", () => {
+    const graph = dag();
+    const state = createGraphExecutionState(graph, {
+      runId: "opaque-run-id", now, limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    const legacy = structuredClone(state);
+    for (const node of Object.values(legacy.nodeStates)) delete (node as typeof node & { planVersion?: number }).planVersion;
+    expect(migrateLegacyNodePlanVersions(legacy)).toMatchObject({
+      nodeStates: { start: { planVersion: 1 }, alpha: { planVersion: 1 } },
+    });
+
+    const mixed = structuredClone(state);
+    const rawStart = mixed.nodeStates.start as typeof mixed.nodeStates.start & { planVersion?: number };
+    delete rawStart!.planVersion;
+    rawStart!.outputRefs = [
+      { planVersion: 1, nodeId: "start", contract: "start-output", path: "nodes/1/start/a", sha256: "a".repeat(64), sizeBytes: 1 },
+      { planVersion: 2, nodeId: "start", contract: "start-output", path: "nodes/2/start/b", sha256: "b".repeat(64), sizeBytes: 1 },
+    ];
+    expect(() => migrateLegacyNodePlanVersions(mixed)).toThrow(/mixes artifact plan versions/);
   });
 });

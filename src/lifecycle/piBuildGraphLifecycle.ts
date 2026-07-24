@@ -2,6 +2,7 @@ import type { ModelRegistry, ThinkingLevel } from "@earendil-works/pi-coding-age
 import type { CompiledBuildPlan } from "../core/buildPlan.js";
 import type { BuildExecutionPolicy } from "../core/buildExecution.js";
 import type { ExecutionLimits } from "../core/scheduler.js";
+import type { GraphCheckpointLease } from "../runtime/graphCheckpoint.js";
 import { createPiBuildWorkerAdapter, type PiBuildModel, type PiNestedSessionFactory } from "../runtime/piBuildWorker.js";
 import type { RunPaths } from "./artifacts.js";
 import {
@@ -19,7 +20,8 @@ import { createLocalGitRunner, type GitRunner } from "./worktreeExecution.js";
 export interface ExecutePiBuildGraphLifecycleOptions {
   compiled: Readonly<CompiledBuildPlan>;
   paths: RunPaths;
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
+  graphOwner: Readonly<GraphCheckpointLease>;
   repositoryRoot: string;
   candidateRoot: string;
   protectedWorkspacePaths: readonly string[];
@@ -32,6 +34,7 @@ export interface ExecutePiBuildGraphLifecycleOptions {
   limits: Readonly<ExecutionLimits>;
   policy: Omit<BuildExecutionPolicy, "now">;
   maxActionConcurrency: number;
+  routingDecisionId: string;
   budgetForNode(nodeId: string): Readonly<Omit<BuildWorkerBudgetEstimates, "unattended">>;
   runReviewedCommand(
     command: string,
@@ -84,11 +87,13 @@ export async function executeBuildGraphLifecycle(
   });
   return runBuildCoordinator(options.paths, options.compiled, adapter, {
     owner: options.owner,
+    graphOwner: options.graphOwner,
     pid: options.pid,
     now: options.now,
     limits: options.limits,
     policy: options.policy,
     maxActionConcurrency: options.maxActionConcurrency,
+    routingDecisionId: options.routingDecisionId,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
   });

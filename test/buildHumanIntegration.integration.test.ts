@@ -9,6 +9,10 @@ import { acquireRunLease, createRun } from "../src/lifecycle/artifacts.js";
 import { writeImmutableBuildPlan } from "../src/lifecycle/buildArtifacts.js";
 import { runBuildCoordinator } from "../src/lifecycle/buildCoordinator.js";
 import {
+  acquireBuildGraphExecutionLease,
+  initializeBuildGraphExecution,
+} from "../src/lifecycle/buildGraphExecution.js";
+import {
   completeBuildHumanIntegration,
   prepareBuildHumanIntegrationReview,
 } from "../src/lifecycle/buildHumanIntegration.js";
@@ -17,7 +21,7 @@ import { createLocalGitRunner } from "../src/lifecycle/worktreeExecution.js";
 import type { BuildWorkerAdapter } from "../src/runtime/buildWorker.js";
 
 const now = "2026-07-22T00:00:00.000Z";
-const owner = "human-integration-owner";
+const ownerToken = "human-integration-owner";
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -28,7 +32,7 @@ describe("trusted BUILD human integration", () => {
   it("records an already-committed manual integration without merging or cleaning candidates", async () => {
     const fixture = await reachHumanGate();
     const review = prepareBuildHumanIntegrationReview(fixture.run.paths, fixture.compiled, fixture.waiting.state, {
-      owner,
+      owner: fixture.owner,
       repositoryRoot: fixture.repositoryRoot,
       git: fixture.git,
       now: () => now,
@@ -52,12 +56,41 @@ describe("trusted BUILD human integration", () => {
     git(fixture.repositoryRoot, "add", "src/a.ts");
     git(fixture.repositoryRoot, "commit", "-m", "integrate candidate manually");
 
-    const completed = await completeBuildHumanIntegration(
+    await expect(completeBuildHumanIntegration(
       fixture.run.paths,
       fixture.compiled,
       fixture.waiting.state,
       { decision: "integrated", selectedCandidateNodeIds: ["implement-a"], confirmedByUser: true },
-      { owner, repositoryRoot: fixture.repositoryRoot, git: fixture.git, now: () => now },
+      {
+        owner: fixture.owner,
+        graphOwner: fixture.graphOwner,
+        repositoryRoot: fixture.repositoryRoot,
+        git: fixture.git,
+        now: () => now,
+        failAt() {
+          throw new Error("simulated crash after human effect result");
+        },
+      },
+    )).rejects.toThrow(/simulated crash/i);
+    const recoveredState = initializeBuildGraphExecution(fixture.run.paths, fixture.compiled, {
+      owner: fixture.owner,
+      graphOwner: fixture.graphOwner,
+      now,
+      pid: process.pid,
+      limits: fixture.options.limits,
+    });
+    const completed = await completeBuildHumanIntegration(
+      fixture.run.paths,
+      fixture.compiled,
+      recoveredState,
+      { decision: "integrated", selectedCandidateNodeIds: ["implement-a"], confirmedByUser: true },
+      {
+        owner: fixture.owner,
+        graphOwner: fixture.graphOwner,
+        repositoryRoot: fixture.repositoryRoot,
+        git: fixture.git,
+        now: () => now,
+      },
     );
     expect(completed.state.nodeStates.integrate).toMatchObject({ status: "executed" });
     expect(completed.decision.mainWorkspaceHeadBefore).not.toBe(completed.decision.mainWorkspaceHeadAfter);
@@ -73,7 +106,7 @@ describe("trusted BUILD human integration", () => {
   it("records a decline only while the main workspace still matches the captured gate", async () => {
     const fixture = await reachHumanGate();
     const review = prepareBuildHumanIntegrationReview(fixture.run.paths, fixture.compiled, fixture.waiting.state, {
-      owner,
+      owner: fixture.owner,
       repositoryRoot: fixture.repositoryRoot,
       git: fixture.git,
       now: () => now,
@@ -84,7 +117,13 @@ describe("trusted BUILD human integration", () => {
       fixture.compiled,
       fixture.waiting.state,
       { decision: "declined", selectedCandidateNodeIds: [], confirmedByUser: true },
-      { owner, repositoryRoot: fixture.repositoryRoot, git: fixture.git, now: () => now },
+      {
+        owner: fixture.owner,
+        graphOwner: fixture.graphOwner,
+        repositoryRoot: fixture.repositoryRoot,
+        git: fixture.git,
+        now: () => now,
+      },
     );
     expect(completed.state.nodeStates.integrate?.status).toBe("cancelled");
     expect(git(fixture.repositoryRoot, "rev-parse", "HEAD")).toBe(mainHead);
@@ -125,7 +164,8 @@ function createFixture(overrides: Readonly<{ mutateCandidate?: boolean; validato
   git(repositoryRoot, "commit", "-m", "fixture");
 
   const run = createRun(repositoryRoot, ".ai-orchestrator/runs", "human integration");
-  acquireRunLease(run.paths, owner);
+  const owner = acquireRunLease(run.paths, ownerToken);
+  const graphOwner = acquireBuildGraphExecutionLease(run.paths, owner, { now, pid: process.pid });
   const compiled = compileBuildPlan(plan());
   writeImmutableBuildPlan(run.paths, compiled, { owner });
   const candidateRoot = join(run.paths.root, "build", "worktrees");
@@ -169,7 +209,8 @@ function createFixture(overrides: Readonly<{ mutateCandidate?: boolean; validato
   });
   const options = {
     owner,
-    pid: 123,
+    graphOwner,
+    pid: process.pid,
     now: () => now,
     limits: { ...DEFAULT_EXECUTION_LIMITS, maxConcurrency: 2, maxModelConcurrency: 2, maxProviderConcurrency: 2, backEdgeBudgets: {} },
     policy: {
@@ -180,9 +221,20 @@ function createFixture(overrides: Readonly<{ mutateCandidate?: boolean; validato
       trustRepositoryCheckout: true,
     },
     maxActionConcurrency: 2,
+    routingDecisionId: "build-route-1",
     isProcessAlive: () => true,
   } as const;
-  return { repositoryRoot, run, compiled, git: localGit, adapter, options, runReviewedCommand };
+  return {
+    repositoryRoot,
+    run,
+    compiled,
+    owner,
+    graphOwner,
+    git: localGit,
+    adapter,
+    options,
+    runReviewedCommand,
+  };
 }
 
 function plan(): BuildPlan {

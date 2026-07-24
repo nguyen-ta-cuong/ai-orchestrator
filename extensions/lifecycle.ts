@@ -34,6 +34,15 @@ import {
   type LifecycleStageVerdict,
   type LifecycleState,
 } from "../src/core/lifecycle.js";
+import { compileGraph, type GraphEdgeDefinition } from "../src/core/graph.js";
+import {
+  evaluateExecutionGuard,
+  type ArtifactReference,
+  type ExecutionGuardProbe,
+  type GraphCheckpointRef,
+  type GraphEvent,
+  type SideEffectExecutionState,
+} from "../src/core/scheduler.js";
 import { recommendRoutingPolicyChanges } from "../src/core/routingEvidence.js";
 import {
   buildPlanContentFingerprint,
@@ -50,12 +59,19 @@ import {
   appendJournal,
   appendRoutingTrace,
   assertRunPathsSafe,
+  checkpointLifecycleGraphEvent,
   createRun,
   currentRun,
+  ensureLifecycleGraphCheckpoint,
   ownsRunLease,
+  readLifecycleArtifactBounded,
+  readLifecycleNodeResult,
   readState,
+  reconcileLifecycleCheckpoint,
   releaseRun,
   releaseRunLease,
+  writeLifecycleNodeResult,
+  writeLifecyclePlanVersionIntent,
   writeState,
   type RunPaths,
 } from "../src/lifecycle/artifacts.js";
@@ -74,6 +90,7 @@ import {
   writeImmutableBuildPlan,
 } from "../src/lifecycle/buildArtifacts.js";
 import {
+  acquireBuildGraphExecutionLease,
   initializeBuildGraphExecution,
   releaseBuildGraphExecution,
 } from "../src/lifecycle/buildGraphExecution.js";
@@ -87,6 +104,11 @@ import { createLocalGitRunner } from "../src/lifecycle/worktreeExecution.js";
 import type { PiBuildModel } from "../src/runtime/piBuildWorker.js";
 import { applyWorkflowTransition } from "../src/adapters/piWorkflow/graphExecution.js";
 import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
+import {
+  readGraphMutationArtifact,
+  writeGraphMutationArtifact,
+  type GraphCheckpointLease,
+} from "../src/runtime/graphCheckpoint.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -94,9 +116,15 @@ const WIDGET_KEY = ENTRY_TYPE;
 const VERDICT_TOOLS = new Set(["submit_build_plan", "verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
+const COMPILED_LIFECYCLE_GRAPH = compileGraph(lifecycleWorkflowGraph());
 const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
 const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
 const TESTABLE_READ_ONLY_PHASES = new Set<LifecyclePhase>(["verifying", "reviewing", "debugging", "shipping"]);
+const HUMAN_APPROVAL_PHASES = new Set<LifecyclePhase>([
+  "awaiting_spec_approval",
+  "awaiting_plan_approval",
+  "awaiting_ship_approval",
+]);
 
 type StandaloneStage = "spec" | "plan" | "build" | "test" | "debug" | "review" | "ship";
 interface PendingDiagnosis {
@@ -124,12 +152,11 @@ interface Runtime {
   invocationOriginal?: LifecycleState["originalModel"];
   pendingVerdict?: PendingVerdict;
   pendingDiagnosis?: PendingDiagnosis;
-  remindedPhase?: LifecyclePhase;
   pendingBuildPlanVersion?: number;
-  specRevisionFeedback?: string;
-  planRevisionFeedback?: string;
   attemptedModels: string[];
-  leaseOwner: string;
+  leaseOwner: GraphCheckpointLease;
+  buildLease?: GraphCheckpointLease;
+  trustedRecoveryRequestRef?: string;
   lastUsage?: {
     inputTokens: number;
     outputTokens: number;
@@ -156,13 +183,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     description: "Run or resume the durable DEFINE → SHIP lifecycle",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
-      if (args.trim() === "resume") {
-        await resumeRun(ctx);
-      } else if (args.trim() === "migrate-routing") {
-        await migrateRoutingPolicy(ctx);
-      } else {
-        await startPipeline(args, ctx);
-      }
+      await runLifecycleCommandSafely(ctx, async () => {
+        if (args.trim() === "resume") {
+          await resumeRun(ctx);
+        } else if (args.trim() === "migrate-routing") {
+          await migrateRoutingPolicy(ctx);
+        } else {
+          await startPipeline(args, ctx);
+        }
+      });
     },
   });
 
@@ -288,6 +317,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     try {
       const stopReason = lastAssistantStopReason(messages);
       if (stopReason === "aborted" || stopReason === "error") {
+        markUnfinishedCurrentEffectUnknown();
         if (stopReason === "error") recordProviderFailure();
         await interruptRun(ctx, stopReason === "aborted"
           ? "Lifecycle turn was aborted. Run /lifecycle resume to continue."
@@ -339,9 +369,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
 
     if (loaded.state.modelRestored === false) {
-      const sessionLeaseOwner = randomUUID();
+      let sessionLeaseOwner: GraphCheckpointLease;
       try {
-        acquireRunLease(loaded.paths, sessionLeaseOwner);
+        sessionLeaseOwner = acquireRunLease(loaded.paths, randomUUID());
       } catch {
         clearUi(ctx);
         notify(ctx, `Lifecycle run ${loaded.state.runId} is executing in another Pi process; this session will not restore or mutate it.`, "warning");
@@ -349,7 +379,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       try {
         const restored = await restoreOriginalModel(ctx, loaded.state);
-        writeState(loaded.paths, loaded.state);
+        writeState(loaded.paths, loaded.state, { owner: sessionLeaseOwner });
         if (!restored) {
           clearUi(ctx);
           notify(ctx, `Lifecycle run ${loaded.state.runId} still needs original-model restoration. Fix model availability and use /lifecycle resume or /lifecycle-stop.`, "warning");
@@ -370,15 +400,49 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    let cleanupError: unknown;
     if (runtime) {
-      restoreTools();
-      await restoreRuntimeModel(ctx);
-      persistMirror(runtime.state);
-      releaseRuntimeLease();
+      try {
+        try {
+          markUnfinishedCurrentEffectUnknown();
+        } catch (error) {
+          cleanupError = error;
+        }
+        try {
+          restoreTools();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        try {
+          await restoreRuntimeModel(ctx);
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        try {
+          persistMirror(runtime.state);
+        } catch (error) {
+          cleanupError ??= error;
+        }
+      } finally {
+        try {
+          releaseRuntimeLease();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+      }
     }
     runtime = undefined;
-    deactivateVerdictTools();
-    clearUi(ctx);
+    try {
+      deactivateVerdictTools();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    try {
+      clearUi(ctx);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (cleanupError) throw cleanupError;
   });
 
   function registerVerdictTools(): void {
@@ -451,7 +515,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         const markdown = readFileSync(reference.markdownPath, "utf8");
         assertRunPathsSafe(runtime!.paths);
         writeFileSync(runtime!.paths.plan, markdown);
-        appendJournal(runtime!.paths, `Structured BUILD plan v${reference.planVersion} checkpointed: ${reference.planHash}`);
+        appendRuntimeJournal(runtime!, `Structured BUILD plan v${reference.planVersion} checkpointed: ${reference.planHash}`);
         return {
           content: [{ type: "text", text: `Recorded immutable BUILD plan v${reference.planVersion} (${reference.planHash}).` }],
           details: { planVersion: reference.planVersion, planHash: reference.planHash },
@@ -515,10 +579,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         const diagnosis = params as PendingDiagnosis;
         runtime!.pendingDiagnosis = diagnosis;
         runtime!.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
-        writeState(runtime!.paths, runtime!.state);
+        runtime!.state.reminder = undefined;
+        writeRuntimeState();
         assertRunPathsSafe(runtime!.paths);
         writeFileSync(runtime!.paths.debug, formatDiagnosis(diagnosis));
-        appendJournal(runtime!.paths, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
+        appendRuntimeJournal(runtime!, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
         persistMirror(runtime!.state);
         return { content: [{ type: "text", text: "Recorded DEBUG diagnosis." }], details: diagnosis, terminate: true };
       },
@@ -559,8 +624,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (verdict.verdict === "reject" && !requiredFixes) throw new Error("checker rejection requires non-empty requiredFixes");
     runtime.pendingVerdict = { ...verdict, reasons, ...(requiredFixes ? { requiredFixes } : {}) };
     runtime.state.pendingCheckerVerdict = { phase, ...runtime.pendingVerdict };
-    writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `${verdict.kind.toUpperCase()} structured verdict checkpointed`);
+    runtime.state.reminder = undefined;
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, `${verdict.kind.toUpperCase()} structured verdict checkpointed`);
     persistMirror(runtime.state);
   }
 
@@ -573,9 +639,24 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       description,
       handler: async (args, ctx) => {
         await ctx.waitForIdle();
-        await handler(args, ctx);
+        await runLifecycleCommandSafely(ctx, () => handler(args, ctx));
       },
     });
+  }
+
+  async function runLifecycleCommandSafely(
+    ctx: ExtensionCommandContext,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await operation();
+    } catch (error) {
+      if (!runtime) throw error;
+      await interruptRun(
+        ctx,
+        `Lifecycle paused after a guarded execution error: ${errorMessage(error)}. Inspect the durable state, then resume or stop the run.`,
+      );
+    }
   }
 
   async function applyRoutingRecommendation(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -715,13 +796,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!state) throw new Error("new lifecycle state could not be read");
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, true, undefined, currentModelState(ctx));
     runtime.state.originalModel = currentModelState(ctx);
-    writeState(created.paths, runtime.state);
+    writeRuntimeState();
     const baseline = await workingTreeStatus(ctx);
     if (!ownsRun(state.runId, "defining")) return;
     runtime.state.baselinePaths = baseline?.paths;
     runtime.state.baselineStagedPaths = baseline?.stagedPaths;
-    writeState(created.paths, runtime.state);
-    appendJournal(created.paths, "Lifecycle pipeline started");
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, "Lifecycle pipeline started");
     persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
@@ -756,13 +837,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!state) throw new Error("new lifecycle state could not be read");
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, created.paths, state, false, "spec", currentModelState(ctx));
     runtime.state.originalModel = currentModelState(ctx);
-    writeState(created.paths, runtime.state);
+    writeRuntimeState();
     const baseline = await workingTreeStatus(ctx);
     if (!ownsRun(state.runId, "defining")) return;
     runtime.state.baselinePaths = baseline?.paths;
     runtime.state.baselineStagedPaths = baseline?.stagedPaths;
-    writeState(created.paths, runtime.state);
-    appendJournal(created.paths, "Standalone DEFINE started");
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, "Standalone DEFINE started");
     persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
@@ -777,9 +858,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       notify(ctx, "No active lifecycle run is available for routing migration.", "error");
       return;
     }
-    const leaseOwner = randomUUID();
+    let leaseOwner: GraphCheckpointLease;
     try {
-      acquireRunLease(loaded.paths, leaseOwner);
+      leaseOwner = acquireRunLease(loaded.paths, randomUUID());
     } catch {
       notify(ctx, "Lifecycle run is executing in another Pi process; routing migration was not applied.", "warning");
       return;
@@ -802,8 +883,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         selection.routing?.phaseEntryKey === entryKey && !selection.routing.failureCategories.includes("policy-migrated"));
       if (saved?.routing) saved.routing.failureCategories.push("policy-migrated");
       latest.routingPolicyVersion = nextVersion;
-      writeState(loaded.paths, latest);
-      appendJournal(loaded.paths, `Routing policy explicitly migrated for unfinished phase to ${nextVersion}`);
+      writeState(loaded.paths, latest, { owner: leaseOwner });
+      appendJournal(loaded.paths, `Routing policy explicitly migrated for unfinished phase to ${nextVersion}`, { owner: leaseOwner });
       persistMirror(latest);
       notify(ctx, "Lifecycle routing policy migrated. Use /lifecycle resume to continue.", "info");
     } finally {
@@ -850,9 +931,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, true, undefined, currentModelState(ctx));
     if (!runtime.state.originalModel) {
       runtime.state.originalModel = currentModelState(ctx);
-      writeState(runtime.paths, runtime.state);
+      writeRuntimeState();
     }
-    appendJournal(runtime.paths, `Resumed at ${runtime.state.phase}`);
+    appendRuntimeJournal(runtime, `Resumed at ${runtime.state.phase}`);
     persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
@@ -885,9 +966,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     runtime = makeRuntime(config, resolved.provenance, ctx.cwd, loaded.paths, loaded.state, false, stage, currentModelState(ctx));
     if (!runtime.state.originalModel) {
       runtime.state.originalModel = currentModelState(ctx);
-      writeState(runtime.paths, runtime.state);
+      writeRuntimeState();
     }
-    appendJournal(runtime.paths, `Standalone ${stage.toUpperCase()} started`);
+    appendRuntimeJournal(runtime, `Standalone ${stage.toUpperCase()} started`);
     persistMirror(runtime.state);
     await runCurrentPhase(ctx);
   }
@@ -902,44 +983,443 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     standalone: StandaloneStage | undefined,
     invocationOriginal: LifecycleState["originalModel"],
   ): Runtime {
-    const leaseOwner = randomUUID();
-    acquireRunLease(paths, leaseOwner);
-    const active = currentRun(cwd, config.lifecycle.artifactsDir);
-    const freshState = readState(paths, { migrationLimits: executionLimitsFrom(config) });
-    if (active?.runId !== state.runId || active.paths.root !== paths.root || !freshState || freshState.runId !== state.runId) {
+    const leaseOwner = acquireRunLease(paths, randomUUID());
+    try {
+      ensureLifecycleGraphCheckpoint(paths, leaseOwner, { migrationLimits: executionLimitsFrom(config) });
+      const freshState = reconcileLifecycleCheckpoint(paths, {
+        owner: leaseOwner,
+        tempId: `resume-${randomUUID()}`,
+        migrationLimits: executionLimitsFrom(config),
+      });
+      const active = currentRun(cwd, config.lifecycle.artifactsDir);
+      if (active?.runId !== state.runId || active.paths.root !== paths.root || freshState.runId !== state.runId) {
+        throw new Error("Lifecycle state changed before execution lease acquisition; retry from the active run");
+      }
+      return {
+        config,
+        provenance,
+        cwd,
+        paths,
+        state: freshState,
+        automatic,
+        standalone,
+        toolsBeforeRun: pi.getActiveTools().filter((name) => !VERDICT_TOOLS.has(name)),
+        invocationOriginal,
+        attemptedModels: [],
+        leaseOwner,
+      };
+    } catch (error) {
       releaseRunLease(paths, leaseOwner);
-      throw new Error("Lifecycle state changed before execution lease acquisition; retry from the active run");
+      throw error;
     }
+  }
+
+  function durableGraphTimestamp(state: LifecycleState): string {
+    const graph = state.graphExecution;
+    if (!graph) throw new Error("lifecycle graph state is unavailable");
+    const floor = Date.parse(graph.lastAppliedEventTimestamp ?? graph.guard.startedAt);
+    return new Date(Math.max(Date.now(), floor)).toISOString();
+  }
+
+  function graphEventBase(state: LifecycleState): Pick<
+    GraphEvent,
+    "schemaVersion" | "sequence" | "eventId" | "runId" | "graphId" | "graphVersion" | "graphDigest" |
+    "planVersion" | "timestamp" | "artifactRefs"
+  > {
+    const graph = state.graphExecution;
+    if (!graph) throw new Error("lifecycle graph state is unavailable");
     return {
-      config,
-      provenance,
-      cwd,
-      paths,
-      state: freshState,
-      automatic,
-      standalone,
-      toolsBeforeRun: pi.getActiveTools().filter((name) => !VERDICT_TOOLS.has(name)),
-      invocationOriginal,
-      attemptedModels: [],
-      leaseOwner,
+      schemaVersion: 1,
+      sequence: graph.lastAppliedEventSequence + 1,
+      eventId: `pi-${graph.lastAppliedEventSequence + 1}-${randomUUID()}`,
+      runId: state.runId,
+      graphId: graph.graphId,
+      graphVersion: graph.graphVersion,
+      graphDigest: graph.graphDigest,
+      planVersion: graph.planVersion,
+      timestamp: durableGraphTimestamp(state),
+      artifactRefs: [],
     };
+  }
+
+  function requireExecutionGuard(ctx: ExtensionContext, probe: Omit<ExecutionGuardProbe, "now" | "unattended">): void {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    const decision = evaluateExecutionGuard(
+      COMPILED_LIFECYCLE_GRAPH,
+      runtime.state.graphExecution,
+      runtime.state.graphExecution.effectiveLimits,
+      { ...probe, now: durableGraphTimestamp(runtime.state), unattended: !ctx.hasUI },
+    );
+    if (!decision.allowed) throw new Error(`Lifecycle execution guard ${decision.code}: ${decision.reason}`);
+  }
+
+  function checkpointRuntimeEvent(event: Readonly<GraphEvent>, nextState?: LifecycleState): LifecycleState {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    runtime.state = checkpointLifecycleGraphEvent(runtime.paths, runtime.state, event, {
+      owner: runtime.leaseOwner,
+      tempId: `pi-${randomUUID()}`,
+      ...(nextState ? { nextState } : {}),
+    });
+    return runtime.state;
+  }
+
+  function ensureCurrentPhaseEntered(ctx: ExtensionContext): void {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase];
+    if (!node) throw new Error(`lifecycle graph does not contain phase ${runtime.state.phase}`);
+    const humanApproval = HUMAN_APPROVAL_PHASES.has(runtime.state.phase) && !runtime.state.yolo;
+    if (node.status === "waiting_human") {
+      if (!humanApproval) throw new Error(`Lifecycle phase ${runtime.state.phase} cannot wait for human input`);
+      requireExecutionGuard(ctx, { action: "human_wait", nodeId: runtime.state.phase });
+      return;
+    }
+    if (node.status === "running" || node.status === "executed") return;
+    if (node.status !== "ready") {
+      throw new Error(`Lifecycle phase ${runtime.state.phase} cannot enter from graph status ${node.status}`);
+    }
+    requireExecutionGuard(ctx, {
+      action: "node",
+      nodeId: runtime.state.phase,
+      nodeAttempts: 1,
+      concurrency: 1,
+    });
+    if (humanApproval) requireExecutionGuard(ctx, { action: "human_wait", nodeId: runtime.state.phase });
+    checkpointRuntimeEvent({
+      ...graphEventBase(runtime.state),
+      kind: "node-status",
+      nodeId: runtime.state.phase,
+      priorStatus: "ready",
+      nextStatus: humanApproval ? "waiting_human" : "running",
+      attempt: node.attempts + 1,
+    });
+  }
+
+  function phaseEffectRequestRef(state: LifecycleState, purpose: string, ordinal: number): string {
+    const node = state.graphExecution?.nodeStates[state.phase];
+    if (!node) throw new Error("lifecycle graph node is unavailable");
+    return createHash("sha256").update(JSON.stringify({
+      schemaVersion: 1,
+      runId: state.runId,
+      graphDigest: state.graphExecution!.graphDigest,
+      planVersion: state.graphExecution!.planVersion,
+      nodeId: state.phase,
+      visit: node.visits,
+      attempt: node.attempts,
+      ordinal,
+      purpose,
+    })).digest("hex");
+  }
+
+  function beginCurrentPhaseEffect(
+    purpose: string,
+    effectClass: SideEffectExecutionState["class"],
+    ctx: ExtensionContext,
+    checkpointRef?: GraphCheckpointRef,
+    routingDecisionId?: string,
+  ): void {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    if (node.status !== "running" && node.status !== "waiting_human") {
+      throw new Error(`Lifecycle phase ${runtime.state.phase} is not active`);
+    }
+    const ordinal = node.sideEffect?.status === "intent_recorded" || node.sideEffect?.status === "unknown"
+      ? node.sideEffect.ordinal
+      : node.sideEffectOrdinal + 1;
+    const requestRef = phaseEffectRequestRef(runtime.state, purpose, ordinal);
+    const exactCheckpointRef = checkpointRef ?? (requiresMutationCheckpoint(effectClass)
+      ? writeLifecycleEffectRequestCheckpoint(purpose, effectClass, ordinal, requestRef, routingDecisionId)
+      : undefined);
+    if (node.sideEffect?.status === "intent_recorded") {
+      if (node.sideEffect.requestRef === requestRef && node.sideEffect.class === effectClass &&
+          node.sideEffect.routingDecisionId === routingDecisionId &&
+          sameCheckpointReference(node.sideEffect.checkpointRef, exactCheckpointRef)) return;
+      throw new Error(`Lifecycle phase ${runtime.state.phase} has a conflicting unresolved side effect`);
+    }
+    if (node.sideEffect?.status === "unknown") {
+      throw new Error(`Lifecycle phase ${runtime.state.phase} has an unknown side effect requiring reconciliation`);
+    }
+    if (node.sideEffect?.status === "succeeded") {
+      if (node.sideEffect.requestRef === requestRef && node.sideEffect.class === effectClass &&
+          node.sideEffect.routingDecisionId === routingDecisionId &&
+          sameCheckpointReference(node.sideEffect.checkpointRef, exactCheckpointRef)) return;
+    }
+    if (effectClass === "model") {
+      if (!routingDecisionId) throw new Error("Lifecycle model effect requires its persisted routing decision");
+      requireExecutionGuard(ctx, {
+        action: "model",
+        nodeId: runtime.state.phase,
+        nodeAttempts: 0,
+        concurrency: 0,
+        modelCalls: 1,
+        providerCalls: 1,
+        sideEffectAttempts: 1,
+        estimatedCostUsd: "unknown",
+        observedCostUsd: "unknown",
+        inputTokens: "unknown",
+        outputTokens: "unknown",
+      });
+      runtime.lastUsage = undefined;
+    } else {
+      if (routingDecisionId !== undefined) throw new Error("Lifecycle non-model effect cannot carry a routing decision");
+      requireExecutionGuard(ctx, {
+        action: "side_effect",
+        nodeId: runtime.state.phase,
+        nodeAttempts: 0,
+        concurrency: 0,
+        sideEffectAttempts: 1,
+        sideEffectClass: effectClass,
+      });
+    }
+    checkpointRuntimeEvent({
+      ...graphEventBase(runtime.state),
+      kind: "side-effect-intent",
+      requestRef,
+      nodeId: runtime.state.phase,
+      priorStatus: node.status,
+      nextStatus: node.status,
+      attempt: node.attempts,
+      sideEffect: {
+        phase: "intent",
+        ordinal,
+        idempotencyKey: `pi-${runtime.state.phase}-${node.visits}-${node.attempts}-${ordinal}`,
+        class: effectClass,
+      },
+      ...(routingDecisionId ? { routingDecisionId } : {}),
+      ...(exactCheckpointRef ? { checkpointRef: exactCheckpointRef } : {}),
+      ...(effectClass === "model" ? { reservation: { modelCalls: 1, providerCalls: 1 } as const } : {}),
+    });
+  }
+
+  function requiresMutationCheckpoint(effectClass: SideEffectExecutionState["class"]): boolean {
+    return effectClass === "model" || effectClass === "write" || effectClass === "external" || effectClass === "irreversible";
+  }
+
+  function writeLifecycleEffectRequestCheckpoint(
+    purpose: string,
+    effectClass: SideEffectExecutionState["class"],
+    ordinal: number,
+    requestRef: string,
+    routingDecisionId?: string,
+  ): GraphCheckpointRef {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    const bytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-effect-request",
+      runId: runtime.state.runId,
+      graphDigest: runtime.state.graphExecution.graphDigest,
+      planVersion: runtime.state.graphExecution.planVersion,
+      nodeId: runtime.state.phase,
+      visit: node.visits,
+      attempt: node.attempts,
+      ordinal,
+      purpose,
+      effectClass,
+      requestRef,
+      ...(routingDecisionId ? { routingDecisionId } : {}),
+    })}\n`, "utf8");
+    const mutationId = createHash("sha256").update(bytes).digest("hex");
+    return writeGraphMutationArtifact(runtime.paths, { owner: runtime.leaseOwner, mutationId, bytes });
+  }
+
+  function sameCheckpointReference(left: GraphCheckpointRef | undefined, right: GraphCheckpointRef | undefined): boolean {
+    return left === undefined && right === undefined || left !== undefined && right !== undefined &&
+      left.path === right.path && left.sha256 === right.sha256 && left.sizeBytes === right.sizeBytes;
+  }
+
+  function sameArtifactReference(left: ArtifactReference | undefined, right: ArtifactReference | undefined): boolean {
+    return left !== undefined && right !== undefined && left.planVersion === right.planVersion && left.nodeId === right.nodeId &&
+      left.contract === right.contract && left.path === right.path && left.sha256 === right.sha256 && left.sizeBytes === right.sizeBytes;
+  }
+
+  function settleCurrentPhaseEffect(
+    outcome: "succeeded" | "failed" | "unknown",
+    resultRef?: ArtifactReference,
+  ): void {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    const effect = node.sideEffect;
+    if (effect?.status === outcome) {
+      if (outcome === "succeeded" && !sameArtifactReference(effect.resultRef, resultRef)) {
+        throw new Error("Lifecycle side-effect result conflicts with its persisted artifact");
+      }
+      return;
+    }
+    if (!effect || (effect.status !== "intent_recorded" && effect.status !== "unknown")) {
+      throw new Error(`Lifecycle phase ${runtime.state.phase} has no unresolved side effect to settle`);
+    }
+    if (outcome === "succeeded" && !resultRef) throw new Error("Successful lifecycle side effect requires a result artifact");
+    if (effect.status === "unknown" && outcome === "unknown") return;
+    const reconciliation = effect.status === "unknown";
+    const modelResult = effect.class === "model" && !reconciliation;
+    checkpointRuntimeEvent({
+      ...graphEventBase(runtime.state),
+      kind: "side-effect-result",
+      requestRef: effect.requestRef,
+      nodeId: runtime.state.phase,
+      priorStatus: node.status,
+      nextStatus: node.status,
+      attempt: node.attempts,
+      sideEffect: {
+        phase: "result",
+        ordinal: effect.ordinal,
+        idempotencyKey: effect.idempotencyKey,
+        class: effect.class,
+        outcome,
+        ...(reconciliation ? { reconciliation: true } : {}),
+        ...(resultRef ? { resultRef } : {}),
+      },
+      ...(effect.routingDecisionId ? { routingDecisionId: effect.routingDecisionId } : {}),
+      ...(effect.checkpointRef ? { checkpointRef: effect.checkpointRef } : {}),
+      ...(modelResult ? {
+        reservation: { modelCalls: -1, providerCalls: -1 } as const,
+        usage: {
+          estimatedCostUsd: "unknown" as const,
+          observedCostUsd: runtime.lastUsage?.observedUsd ?? "unknown",
+          inputTokens: runtime.lastUsage?.inputTokens ?? "unknown",
+          outputTokens: runtime.lastUsage?.outputTokens ?? "unknown",
+        },
+      } : {}),
+    });
+  }
+
+  function reconcileUnfinishedCurrentEffect(): void {
+    if (!runtime?.state.graphExecution) return;
+    const effect = runtime.state.graphExecution.nodeStates[runtime.state.phase]?.sideEffect;
+    if (effect?.status === "intent_recorded") settleCurrentPhaseEffect("failed");
+  }
+
+  function markUnfinishedCurrentEffectUnknown(): boolean {
+    if (!runtime?.state.graphExecution) return false;
+    const effect = runtime.state.graphExecution.nodeStates[runtime.state.phase]?.sideEffect;
+    if (effect?.status === "intent_recorded") {
+      settleCurrentPhaseEffect("unknown");
+      return true;
+    }
+    return effect?.status === "unknown";
+  }
+
+  async function recoverSucceededPhaseTransition(ctx: ExtensionContext): Promise<boolean> {
+    if (!runtime?.state.graphExecution) return false;
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    const contract = COMPILED_LIFECYCLE_GRAPH.nodesById.get(runtime.state.phase)!.outputContracts[0];
+    if (node.sideEffect?.status !== "succeeded" || !node.sideEffect.resultRef || node.sideEffect.resultRef.contract !== contract) {
+      return false;
+    }
+    const record = readLifecycleNodeResult(runtime.paths, node.sideEffect.resultRef);
+    const lifecycleEvent = record.payload.lifecycleEvent;
+    const journal = record.payload.journal;
+    if (!lifecycleEvent || typeof lifecycleEvent !== "object" || Array.isArray(lifecycleEvent) ||
+        typeof (lifecycleEvent as { type?: unknown }).type !== "string" || typeof journal !== "string") {
+      throw new Error("Persisted lifecycle transition result does not contain a valid transition receipt");
+    }
+    await transition(lifecycleEvent as LifecycleEvent, journal, ctx);
+    await continueAfterRecoveredTransition(ctx);
+    return true;
+  }
+
+  function recoverableArtifactRequest(artifact: "spec" | "plan"): string | undefined {
+    if (!runtime?.state.graphExecution) return undefined;
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    const effect = node.sideEffect;
+    if (!effect || (effect.status !== "intent_recorded" && effect.status !== "unknown") || !effect.checkpointRef) return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readGraphMutationArtifact(runtime.paths, effect.checkpointRef).toString("utf8"));
+    } catch (error) {
+      throw new Error(`Lifecycle ${artifact} request checkpoint is invalid: ${errorMessage(error)}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Lifecycle ${artifact} request checkpoint is invalid`);
+    const record = parsed as Record<string, unknown>;
+    const before = record.artifactBefore;
+    const route = record.route;
+    const submittedPlanVersion = artifact === "plan" ? latestBuildPlanVersion(runtime.paths) : undefined;
+    const selection = runtime.state.modelSelections.find((candidate) =>
+      candidate.routing?.decisionId === effect.routingDecisionId);
+    const path = artifact === "spec" ? runtime.paths.spec : runtime.paths.plan;
+    if (record.schemaVersion !== 1 || record.kind !== "lifecycle-phase-request" || record.runId !== runtime.state.runId ||
+        record.nodeId !== runtime.state.phase || record.planVersion !== runtime.state.graphExecution.planVersion ||
+        record.visit !== node.visits || record.attempt !== node.attempts || record.ordinal !== effect.ordinal ||
+        record.requestRef !== effect.requestRef || record.routingDecisionId !== effect.routingDecisionId ||
+        typeof record.promptSha256 !== "string" || !/^[a-f0-9]{64}$/.test(record.promptSha256) ||
+        !selection || !route || typeof route !== "object" || Array.isArray(route) ||
+        (route as Record<string, unknown>).provider !== selection.provider ||
+        (route as Record<string, unknown>).model !== selection.model ||
+        (route as Record<string, unknown>).thinking !== selection.thinking ||
+        (artifact === "plan" && (
+          !Number.isSafeInteger(record.expectedBuildPlanVersion) ||
+          (record.expectedBuildPlanVersion as number) < 1 ||
+          submittedPlanVersion !== record.expectedBuildPlanVersion
+        )) ||
+        !before || typeof before !== "object" || Array.isArray(before)) {
+      throw new Error(`Lifecycle ${artifact} request checkpoint does not match the active effect`);
+    }
+    const baseline = before as Record<string, unknown>;
+    if (baseline.path !== rel(path) || typeof baseline.sha256 !== "string" || typeof baseline.sizeBytes !== "number") {
+      throw new Error(`Lifecycle ${artifact} request checkpoint has invalid baseline identity`);
+    }
+    const current = boundedArtifactIdentity(path);
+    if (current.sizeBytes === 0 || current.sha256 === baseline.sha256 && current.sizeBytes === baseline.sizeBytes) return undefined;
+    if (artifact === "plan") runtime.pendingBuildPlanVersion = submittedPlanVersion;
+    return effect.requestRef;
+  }
+
+  async function continueAfterRecoveredTransition(ctx: ExtensionContext): Promise<void> {
+    if (!runtime) return;
+    if (runtime.state.phase === "awaiting_spec_approval") await requestArtifactApproval(ctx, "spec");
+    else if (runtime.state.phase === "awaiting_plan_approval") await requestArtifactApproval(ctx, "plan");
+    else if (runtime.state.phase === "awaiting_ship_approval") await requestShipApproval(ctx);
+    else if (runtime.state.phase === "finalizing") await finalizeRun(ctx);
+    else if (runtime.state.phase === "done" || runtime.state.phase === "failed") await finishRun(ctx);
+    else await continueOrPause(ctx, nextStandaloneForPhase(runtime.state.phase));
   }
 
   async function runCurrentPhase(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     assertRunPathsSafe(runtime.paths);
+    reservePlanNamespaceIfNeeded(ctx);
+    ensureCurrentPhaseEntered(ctx);
+    if (await recoverSucceededPhaseTransition(ctx)) return;
+    const artifact = runtime.state.phase === "defining" ? "spec" : runtime.state.phase === "planning" ? "plan" : undefined;
+    const artifactRequest = artifact ? recoverableArtifactRequest(artifact) : undefined;
+    if (artifact && artifactRequest) {
+      if (artifact === "plan" && runtime.pendingBuildPlanVersion !== undefined) {
+        appendRuntimeJournal(runtime, `Recovered submitted BUILD plan v${runtime.pendingBuildPlanVersion} before PLAN transition`);
+      }
+      runtime.trustedRecoveryRequestRef = artifactRequest;
+      try {
+        await artifactStageEnded(ctx, artifact);
+      } finally {
+        if (runtime) runtime.trustedRecoveryRequestRef = undefined;
+      }
+      return;
+    }
     const persistedVerdict = runtime.state.pendingCheckerVerdict;
     runtime.pendingVerdict = persistedVerdict?.phase === runtime.state.phase
       ? { kind: persistedVerdict.kind, verdict: persistedVerdict.verdict, reasons: persistedVerdict.reasons, requiredFixes: persistedVerdict.requiredFixes }
       : undefined;
+    const durableDebug = runtime.state.phase === "debugging" &&
+      runtime.state.debugDiagnosisVerdictIndex === latestRejectionIndex() && isNonEmpty(runtime.paths.debug);
+    const canReconcileDurably = runtime.pendingVerdict !== undefined || durableDebug || runtime.state.phase === "finalizing";
+    if (!canReconcileDurably && markUnfinishedCurrentEffectUnknown()) {
+      await interruptRun(
+        ctx,
+        `Lifecycle ${runtime.state.phase} has an ambiguous persisted side effect. It was not repeated; use /lifecycle-stop to cancel while preserving the uncertainty.`,
+      );
+      return;
+    }
     runtime.pendingDiagnosis = undefined;
-    runtime.remindedPhase = undefined;
     switch (runtime.state.phase) {
       case "defining":
         if (!(await enterRoutedStage("define", "spec", ctx))) return;
         activateArtifactTools();
         updateUi(ctx);
-        sendPrompt(specPrompt(runtime.state.task, rel(runtime.paths.spec), undefined, runtime.specRevisionFeedback));
+        sendPhasePrompt(specPrompt(
+          runtime.state.task,
+          rel(runtime.paths.spec),
+          undefined,
+          runtime.state.revisionFeedback?.artifact === "spec" ? runtime.state.revisionFeedback.feedback : undefined,
+        ), ctx);
         break;
       case "awaiting_spec_approval":
         await requestArtifactApproval(ctx, "spec");
@@ -954,7 +1434,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           if (runtime.state.planFingerprint !== convergenceFingerprint(latestMarkdown)) {
             runtime.pendingBuildPlanVersion = latest.plan.planVersion;
             writeFileSync(runtime.paths.plan, latestMarkdown);
-            appendJournal(runtime.paths, `Recovered submitted BUILD plan v${latest.plan.planVersion} before PLAN transition`);
+            appendRuntimeJournal(runtime, `Recovered submitted BUILD plan v${latest.plan.planVersion} before PLAN transition`);
             await artifactStageEnded(ctx, "plan");
             break;
           }
@@ -963,13 +1443,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         runtime.pendingBuildPlanVersion = buildPlanVersionForSubmission(runtime.paths);
         activatePlanningTools();
         updateUi(ctx);
-        sendPrompt(taskPlanPrompt(
+        sendPhasePrompt(taskPlanPrompt(
           spec,
           rel(runtime.paths.plan),
-          runtime.planRevisionFeedback ?? replanFeedback(),
+          runtime.state.revisionFeedback?.artifact === "plan" ? runtime.state.revisionFeedback.feedback : replanFeedback(),
           runtime.pendingBuildPlanVersion,
           runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined,
-        ));
+        ), ctx);
         break;
       }
       case "awaiting_plan_approval":
@@ -988,7 +1468,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         if (!(await enterRoutedStage("verify", "verifier", ctx))) return;
         activateReadOnlyTools("verify_verdict");
         updateUi(ctx);
-        sendPrompt(verifyPrompt(spec, plan, runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined));
+        sendPhasePrompt(verifyPrompt(spec, plan, runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined), ctx);
         break;
       }
       case "reviewing": {
@@ -1001,7 +1481,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         if (!(await enterRoutedStage("review", "reviewer", ctx))) return;
         activateReadOnlyTools("review_verdict");
         updateUi(ctx);
-        sendPrompt(reviewPrompt(spec, plan));
+        sendPhasePrompt(reviewPrompt(spec, plan), ctx);
         break;
       }
       case "debugging": {
@@ -1017,18 +1497,18 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         const spec = readRequired(runtime.paths.spec, "spec");
         const plan = readRequired(runtime.paths.plan, "plan");
         runtime.state.debugDiagnosisVerdictIndex = undefined;
-        writeState(runtime.paths, runtime.state);
+        writeRuntimeState();
         assertRunPathsSafe(runtime.paths);
         writeFileSync(runtime.paths.debug, "");
         if (!(await enterRoutedStage("debug", "debugger", ctx))) return;
         activateReadOnlyTools("debug_diagnosis");
         updateUi(ctx);
-        sendPrompt(debugPrompt(
+        sendPhasePrompt(debugPrompt(
           spec,
           plan,
           latestRejection(),
           rel(runtime.paths.debug),
-        ));
+        ), ctx);
         break;
       }
       case "shipping": {
@@ -1041,7 +1521,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         if (!(await enterRoutedStage("ship", "shipper", ctx))) return;
         activateReadOnlyTools("ship_decision");
         updateUi(ctx);
-        sendPrompt(shipPrompt(spec, plan, runtime.state.verdicts));
+        sendPhasePrompt(shipPrompt(spec, plan, runtime.state.verdicts), ctx);
         break;
       }
       case "awaiting_ship_approval":
@@ -1062,6 +1542,31 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
   }
 
+  function reservePlanNamespaceIfNeeded(ctx: ExtensionContext): void {
+    if (!runtime?.state.graphExecution || runtime.state.phase !== "planning") return;
+    const graphState = runtime.state.graphExecution;
+    const node = graphState.nodeStates.planning!;
+    if (node.status !== "ready" || node.visits <= graphState.planVersion) return;
+    requireExecutionGuard(ctx, { action: "plan_version" });
+    const activationRef = writeLifecyclePlanVersionIntent(runtime.paths, {
+      owner: runtime.leaseOwner,
+      graphState,
+      nodeId: "planning",
+    });
+    checkpointRuntimeEvent({
+      ...graphEventBase(runtime.state),
+      kind: "plan-version-reserved",
+      priorPlanVersion: graphState.planVersion,
+      nextPlanVersion: graphState.planVersion + 1,
+      nodeId: "planning",
+      priorStatus: "ready",
+      nextStatus: "ready",
+      attempt: node.attempts,
+      activationRef,
+    });
+    appendRuntimeJournal(runtime, `Reserved scheduler plan namespace v${runtime.state.graphExecution!.planVersion} before re-PLAN provider spend`);
+  }
+
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     const active = runtime;
@@ -1074,16 +1579,34 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     const plan = readRequired(active.paths.plan, "plan");
     const compiled = ensureImmutableBuildPlanForExecution(plan);
+    const graphOwner = active.buildLease ??= acquireBuildGraphExecutionLease(
+      active.paths,
+      active.leaseOwner,
+      {
+        now: new Date().toISOString(),
+        pid: process.pid,
+      },
+    );
     const buildState = initializeBuildGraphExecution(active.paths, compiled, {
       owner: active.leaseOwner,
+      graphOwner,
       now: new Date().toISOString(),
       pid: process.pid,
       limits: executionLimitsFrom(active.config),
     });
-    appendJournal(
-      active.paths,
+    appendRuntimeJournal(
+      active,
       `BUILD DAG checkpoint ready for immutable plan v${compiled.plan.planVersion} (${compiled.hash}); revision ${buildState.revision}`,
     );
+    const cancelledIntegration = compiled.plan.nodes.find((node) =>
+      node.handler === "integrate" && buildState.nodeStates[node.id]?.status === "cancelled");
+    if (cancelledIntegration) {
+      await stopRun(
+        ctx,
+        `BUILD candidate integration ${cancelledIntegration.id} was durably declined. Candidate worktrees and branches remain preserved.`,
+      );
+      return;
+    }
     const isolatedWriters = compiled.plan.nodes.filter((node) =>
       node.handler === "implement" && node.workspace === "isolated-worktree");
     const repositoryRoot = realpathSync(active.cwd);
@@ -1129,11 +1652,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
           confirmedByUser: true,
         }, {
           owner: active.leaseOwner,
+          graphOwner,
           repositoryRoot,
           git,
           now: () => new Date().toISOString(),
         });
-        appendJournal(active.paths, `BUILD human integration declined for ${review.candidates.map(({ nodeId }) => nodeId).join(", ")}`);
+        appendRuntimeJournal(active, `BUILD human integration declined for ${review.candidates.map(({ nodeId }) => nodeId).join(", ")}`);
         await stopRun(ctx, "BUILD candidate integration was explicitly declined. Candidate worktrees and branches were preserved; recording the decline performed no merge, commit, checkout, cleanup, push, or publication action.");
         return;
       }
@@ -1166,12 +1690,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         confirmedByUser: true,
       }, {
         owner: active.leaseOwner,
+        graphOwner,
         repositoryRoot,
         git,
         now: () => new Date().toISOString(),
       });
-      appendJournal(
-        active.paths,
+      appendRuntimeJournal(
+        active,
         `BUILD human integration recorded for ${completed.decision.selectedCandidateNodeIds.join(", ")}; main HEAD ${completed.decision.mainWorkspaceHeadBefore} -> ${completed.decision.mainWorkspaceHeadAfter}`,
       );
       resumedHumanIntegration = true;
@@ -1232,6 +1757,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       compiled,
       paths: active.paths,
       owner: active.leaseOwner,
+      graphOwner,
       repositoryRoot,
       candidateRoot,
       protectedWorkspacePaths: [active.config.lifecycle.artifactsDir],
@@ -1250,6 +1776,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         trustRepositoryCheckout,
       },
       maxActionConcurrency: Math.max(1, Math.min(limits.maxModelConcurrency, limits.maxConcurrency)),
+      routingDecisionId: selection.routing!.decisionId,
       budgetForNode: () => ({
         estimatedCostUsd: "unknown",
         observedCostUsd: 0,
@@ -1276,7 +1803,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
     });
     if (!runtime || runtime !== active || !ownsRun(active.state.runId, "building")) return;
-    appendJournal(active.paths, `BUILD coordinator ${result.status}: ${result.reason ?? "durable graph complete"}`);
+    appendRuntimeJournal(active, `BUILD coordinator ${result.status}: ${result.reason ?? "durable graph complete"}`);
     if (result.status === "waiting-human") {
       const review = prepareBuildHumanIntegrationReview(active.paths, compiled, result.state, {
         owner: active.leaseOwner,
@@ -1362,7 +1889,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       writableRoots,
     );
     writeImmutableBuildPlan(runtime.paths, compiled, { owner: runtime.leaseOwner });
-    appendJournal(runtime.paths, `Migrated approved prose-only plan to deterministic sequential BUILD v${compiled.plan.planVersion}: ${compiled.hash}`);
+    appendRuntimeJournal(runtime, `Migrated approved prose-only plan to deterministic sequential BUILD v${compiled.plan.planVersion}: ${compiled.hash}`);
     return compiled;
   }
 
@@ -1379,8 +1906,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     if (!runtime.state.routingPolicyVersion) {
       runtime.state.routingPolicyVersion = runPolicyVersion;
-      writeState(runtime.paths, runtime.state);
-      appendJournal(runtime.paths, `Routing policy frozen for run: ${runPolicyVersion}`);
+      writeRuntimeState();
+      appendRuntimeJournal(runtime, `Routing policy frozen for run: ${runPolicyVersion}`);
     }
     const available = ctx.modelRegistry.getAvailable();
     const expectedRunId = runtime.state.runId;
@@ -1422,8 +1949,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       if (!ownsRun(expectedRunId, expectedPhase)) return false;
       pi.setThinkingLevel(saved.thinking);
       runtime.state.modelRestored = false;
-      writeState(runtime.paths, runtime.state);
-      appendJournal(runtime.paths, `Model ${stage}: reused saved decision ${saved.routing!.decisionId} (${saved.provider}/${saved.model})`);
+      writeRuntimeState();
+      appendRuntimeJournal(runtime, `Model ${stage}: reused saved decision ${saved.routing!.decisionId} (${saved.provider}/${saved.model})`);
       return true;
     }
 
@@ -1506,10 +2033,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         failureCategories: attempts.filter((attempt) => attempt.outcome !== "selected").map((attempt) => attempt.outcome),
       },
     });
-    writeState(runtime.paths, runtime.state);
+    writeRuntimeState();
     persistRoutingTrace(stage, plan, attempts, decisionId);
     persistRoutingEvidence(stage, candidate, plan, decisionId);
-    appendJournal(runtime.paths, `Model ${stage}: ${candidate.provider}/${candidate.model} (${candidate.thinking}) — ${reason}; ${separation}; ${plan.engine}`);
+    appendRuntimeJournal(runtime, `Model ${stage}: ${candidate.provider}/${candidate.model} (${candidate.thinking}) — ${reason}; ${separation}; ${plan.engine}`);
     persistMirror(runtime.state);
   }
 
@@ -1527,7 +2054,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       recordedAt: new Date().toISOString(),
       plan,
       attempts,
-    });
+    }, { owner: runtime.leaseOwner });
   }
 
   async function enforceCandidateBudget(
@@ -1741,8 +2268,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (runtime !== active || !ownsRun(runId, "building")) return;
     const evidence = `${diff.code}:${diff.stdout}\n${diff.stderr}\n${untracked.code}:${untracked.stdout}\n${untracked.stderr}`;
     active.state.buildEvidenceFingerprints.push(convergenceFingerprint(evidence));
-    writeState(active.paths, active.state);
-    appendJournal(active.paths, `BUILD convergence fingerprint recorded for pass ${active.state.buildIterations + 1}`);
+    writeState(active.paths, active.state, { owner: active.leaseOwner });
+    appendRuntimeJournal(active, `BUILD convergence fingerprint recorded for pass ${active.state.buildIterations + 1}`);
   }
 
   function convergenceBreakerReason(state: LifecycleState, config: OrchestratorConfig): string | undefined {
@@ -1819,7 +2346,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         },
       },
     });
-    appendJournal(runtime.paths, `${stage.toUpperCase()} downstream outcome reversed: ${truncate(reason, 120)}`);
+    appendRuntimeJournal(runtime, `${stage.toUpperCase()} downstream outcome reversed: ${truncate(reason, 120)}`);
   }
 
   function isBlockedBuildCommand(command: string, artifactsDir: string, artifactsRoot: string): boolean {
@@ -1856,8 +2383,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const changedPaths = status?.paths ?? runtime.state.baselinePaths ?? [];
     return {
       task: runtime.state.task,
-      spec: existsSync(runtime.paths.spec) ? readFileSync(runtime.paths.spec, "utf8").slice(0, 256_000) : undefined,
-      plan: existsSync(runtime.paths.plan) ? readFileSync(runtime.paths.plan, "utf8").slice(0, 256_000) : undefined,
+      spec: readLifecycleArtifactText(runtime.paths.spec)?.slice(0, 256_000),
+      plan: readLifecycleArtifactText(runtime.paths.plan)?.slice(0, 256_000),
       changedPaths,
       languages: [...new Set(changedPaths.map(languageForPath).filter((value): value is string => Boolean(value)))],
       testCommand: detectTestCommand(runtime.cwd),
@@ -1873,31 +2400,36 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function artifactStageEnded(ctx: ExtensionContext, artifact: "spec" | "plan"): Promise<void> {
     if (!runtime) return;
     const path = artifact === "spec" ? runtime.paths.spec : runtime.paths.plan;
+    const artifactText = readLifecycleArtifactText(path);
+    let structuredPlanSubmitted = true;
     if (artifact === "plan") {
       const latestVersion = latestBuildPlanVersion(runtime.paths);
       const expectedVersion = runtime.pendingBuildPlanVersion;
       const expectedMarkdown = latestVersion === undefined
         ? undefined
         : readFileSync(join(runtime.paths.root, "build", "plan-versions", String(latestVersion), "plan.md"), "utf8");
-      const submitted = latestVersion !== undefined && latestVersion === expectedVersion && expectedMarkdown !== undefined &&
+      structuredPlanSubmitted = latestVersion !== undefined && latestVersion === expectedVersion && expectedMarkdown !== undefined &&
         existsSync(path) && readFileSync(path, "utf8") === expectedMarkdown;
-      if (!submitted) {
-        if (runtime.remindedPhase !== runtime.state.phase) {
-          runtime.remindedPhase = runtime.state.phase;
-          sendPrompt(`Finish PLAN by calling submit_build_plan exactly once with planVersion ${String(expectedVersion ?? "from the planning input")}. Do not write plan files directly or perform another stage.`);
-          return;
-        }
-        await interruptRun(ctx, "PLAN stopped because submit_build_plan remained missing after one reminder.");
-        return;
-      }
     }
-    if (!isNonEmpty(path)) {
-      if (runtime.remindedPhase !== runtime.state.phase) {
-        runtime.remindedPhase = runtime.state.phase;
-        sendPrompt(`Write the required ${artifact} artifact to exactly ${rel(path)} before finishing. Do not perform another stage.`);
+    if (!artifactText?.trim() || !structuredPlanSubmitted) {
+      reconcileUnfinishedCurrentEffect();
+      if (runtime.state.reminder?.phase !== runtime.state.phase || runtime.state.reminder.kind !== "artifact") {
+        runtime.state.reminder = { phase: runtime.state.phase, kind: "artifact", recordedAt: new Date().toISOString() };
+        writeRuntimeState();
+        sendPhasePrompt(
+          artifact === "plan"
+            ? `Finish PLAN by calling submit_build_plan exactly once with planVersion ${String(runtime.pendingBuildPlanVersion ?? "from the planning input")}. Do not write plan files directly or perform another stage.`
+            : `Write the required ${artifact} artifact to exactly ${rel(path)} before finishing. Do not perform another stage.`,
+          ctx,
+        );
         return;
       }
-      await interruptRun(ctx, `${artifact.toUpperCase()} stopped because ${rel(path)} remained empty after a reminder.`);
+      await interruptRun(
+        ctx,
+        artifact === "plan"
+          ? "PLAN stopped because submit_build_plan remained missing after one reminder."
+          : `${artifact.toUpperCase()} stopped because ${rel(path)} remained empty after a reminder.`,
+      );
       return;
     }
 
@@ -1906,7 +2438,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       verdict: "unknown",
     });
     if (artifact === "plan") {
-      const nextPlanFingerprint = convergenceFingerprint(readFileSync(path, "utf8"));
+      const nextPlanFingerprint = convergenceFingerprint(artifactText);
       const latestVersion = latestBuildPlanVersion(runtime.paths);
       const structuredPlanChanged = latestVersion !== undefined && latestVersion > 1
         ? buildPlanContentFingerprint(readImmutableBuildPlan(runtime.paths, latestVersion - 1)) !==
@@ -1920,6 +2452,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       runtime.state.planFingerprint = nextPlanFingerprint;
     }
+    runtime.state.reminder = undefined;
+    if (runtime.state.revisionFeedback?.artifact === artifact) runtime.state.revisionFeedback = undefined;
+    writeRuntimeState();
     await transition(
       artifact === "spec"
         ? { type: "spec_produced", specPath: rel(path) }
@@ -1942,6 +2477,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       await interruptRun(ctx, `${artifact} approval requires interactive mode. Resume with --yolo only by starting a new yolo run.`);
       return;
     }
+    beginCurrentPhaseEffect(`human:${artifact}-approval`, "external", ctx);
     const choice = await ctx.ui.select(`${artifact.toUpperCase()} ready`, ["Approve", "Revise", "Cancel"]);
     if (!ownsRun(runId, expected)) return;
     if (choice === "Approve") {
@@ -1956,8 +2492,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         await interruptRun(ctx, `${artifact.toUpperCase()} revision cancelled.`);
         return;
       }
-      if (artifact === "spec") runtime.specRevisionFeedback = feedback.trim();
-      else runtime.planRevisionFeedback = feedback.trim();
+      runtime.state.revisionFeedback = {
+        artifact,
+        feedback: feedback.trim(),
+        recordedAt: new Date().toISOString(),
+      };
+      runtime.state.reminder = undefined;
+      writeRuntimeState();
       persistHumanOverride(artifact === "spec" ? "define" : "plan");
       await transition({ type: artifact === "spec" ? "spec_rejected_by_user" : "plan_rejected_by_user" }, `${artifact.toUpperCase()} revision requested`, ctx);
       await runCurrentPhase(ctx);
@@ -1970,10 +2511,12 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const structuredToolCompliance = Boolean(runtime.pendingVerdict && runtime.pendingVerdict.kind === stage);
     if (!runtime.pendingVerdict || runtime.pendingVerdict.kind !== stage) {
-      if (runtime.remindedPhase !== runtime.state.phase) {
-        runtime.remindedPhase = runtime.state.phase;
+      reconcileUnfinishedCurrentEffect();
+      if (runtime.state.reminder?.phase !== runtime.state.phase || runtime.state.reminder.kind !== "verdict") {
+        runtime.state.reminder = { phase: runtime.state.phase, kind: "verdict", recordedAt: new Date().toISOString() };
+        writeRuntimeState();
         const tool = stage === "verify" ? "verify_verdict" : stage === "review" ? "review_verdict" : "ship_decision";
-        sendPrompt(`Finish ${stage.toUpperCase()} by calling ${tool} exactly once. Do not edit files.`);
+        sendPhasePrompt(`Finish ${stage.toUpperCase()} by calling ${tool} exactly once. Do not edit files.`, ctx);
         return;
       }
       runtime.pendingVerdict = {
@@ -1986,9 +2529,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const verdict = runtime.pendingVerdict;
     if (!verdict) throw new Error(`${stage} verdict was not available after recovery`);
     runtime.pendingVerdict = undefined;
+    runtime.state.reminder = undefined;
     if (verdict.verdict === "reject") {
       runtime.state.rejectionFingerprints.push(convergenceFingerprint(`${verdict.reasons}\n${verdict.requiredFixes ?? ""}`));
-      writeState(runtime.paths, runtime.state);
+      writeRuntimeState();
     }
     persistRoutingStageOutcome(stage, { structuredToolCompliance, verdict: verdict.verdict });
     if (verdict.verdict === "reject" && stage === "review") persistDownstreamReversal("verify", verdict.reasons);
@@ -2006,7 +2550,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
     if (!runtime) return;
     runtime.state.pendingCheckerVerdict = undefined;
-    writeState(runtime.paths, runtime.state);
+    writeRuntimeState();
     if (runtime.state.phase === "awaiting_ship_approval") {
       await requestShipApproval(ctx);
     } else if (runtime.state.phase === "finalizing") {
@@ -2022,9 +2566,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const structuredToolCompliance = Boolean(runtime.pendingDiagnosis && isNonEmpty(runtime.paths.debug));
     if (!runtime.pendingDiagnosis || !isNonEmpty(runtime.paths.debug)) {
-      if (runtime.remindedPhase !== "debugging") {
-        runtime.remindedPhase = "debugging";
-        sendPrompt("Finish DEBUG by calling debug_diagnosis exactly once. Do not edit source files.");
+      reconcileUnfinishedCurrentEffect();
+      if (runtime.state.reminder?.phase !== "debugging" || runtime.state.reminder.kind !== "debug") {
+        runtime.state.reminder = { phase: "debugging", kind: "debug", recordedAt: new Date().toISOString() };
+        writeRuntimeState();
+        sendPhasePrompt("Finish DEBUG by calling debug_diagnosis exactly once. Do not edit source files.", ctx);
         return;
       }
       const rejection = latestRejection();
@@ -2038,10 +2584,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       };
       runtime.pendingDiagnosis = synthesized;
       runtime.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
-      writeState(runtime.paths, runtime.state);
+      runtime.state.reminder = undefined;
+      writeRuntimeState();
       assertRunPathsSafe(runtime.paths);
       writeFileSync(runtime.paths.debug, formatDiagnosis(synthesized));
-      appendJournal(runtime.paths, "Synthesized DEBUG diagnosis after missing structured output");
+      appendRuntimeJournal(runtime, "Synthesized DEBUG diagnosis after missing structured output");
     }
     runtime.pendingDiagnosis = undefined;
     persistRoutingStageOutcome("debug", { structuredToolCompliance, verdict: "unknown" });
@@ -2054,6 +2601,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function requestShipApproval(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
     if (runtime.state.yolo) {
+      beginCurrentPhaseEffect("human:ship-approval-yolo", "external", ctx);
       await transition({ type: "ship_confirmed" }, "SHIP automatically confirmed under --yolo (publication policy still applies)", ctx);
       await finalizeRun(ctx);
       return;
@@ -2063,6 +2611,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       await interruptRun(ctx, "SHIP confirmation requires interactive mode; the working tree was left unchanged.");
       return;
     }
+    beginCurrentPhaseEffect("human:ship-approval", "external", ctx);
     const confirmed = await ctx.ui.confirm("SHIP report is GO", "Proceed to configured commit/PR finalization?");
     if (!ownsRun(runId, "awaiting_ship_approval")) return;
     await transition({ type: confirmed ? "ship_confirmed" : "ship_declined" }, confirmed ? "SHIP confirmed" : "SHIP declined", ctx);
@@ -2073,6 +2622,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function finalizeRun(ctx: ExtensionContext): Promise<void> {
     if (!runtime || runtime.state.phase !== "finalizing") return;
+    ensureCurrentPhaseEntered(ctx);
     const commitOutcome = await maybeCommit(ctx);
     if (commitOutcome === "failed") {
       await interruptRun(ctx, "Finalization paused after a Git failure. Correct the problem and run /lifecycle resume.");
@@ -2089,15 +2639,92 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     await finishRun(ctx);
   }
 
+  function finalizationEffectPurpose(kind: "commit" | "pull-request", identity: Record<string, string>): string {
+    return `finalization:${kind}:${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+  }
+
+  function currentEffectMatchesPurpose(purpose: string): boolean {
+    if (!runtime?.state.graphExecution) return false;
+    const effect = runtime.state.graphExecution.nodeStates.finalizing?.sideEffect;
+    return Boolean(effect && effect.requestRef === phaseEffectRequestRef(runtime.state, purpose, effect.ordinal));
+  }
+
+  function recordFinalizationEffectResult(
+    kind: "commit" | "pull-request",
+    purpose: string,
+    receipt: Record<string, unknown>,
+  ): void {
+    if (!runtime?.state.graphExecution || runtime.state.phase !== "finalizing") throw new Error("finalization runtime is unavailable");
+    const node = runtime.state.graphExecution.nodeStates.finalizing!;
+    if (node.sideEffect?.status === "succeeded" && node.sideEffect.resultRef?.contract === `${kind}-effect`) {
+      const existing = readLifecycleNodeResult(runtime.paths, node.sideEffect.resultRef, { verifyLiveArtifact: false });
+      if (JSON.stringify(existing.payload.receipt) !== JSON.stringify(receipt)) {
+        throw new Error(`Persisted ${kind} receipt conflicts with reconciled external state`);
+      }
+      return;
+    }
+    if (!currentEffectMatchesPurpose(purpose) ||
+        (node.sideEffect?.status !== "intent_recorded" && node.sideEffect?.status !== "unknown")) {
+      throw new Error(`Finalization ${kind} result has no matching durable intent`);
+    }
+    const resultRef = writeLifecycleNodeResult(runtime.paths, {
+      owner: runtime.leaseOwner,
+      graphState: runtime.state.graphExecution,
+      nodeId: "finalizing",
+      contract: `${kind}-effect`,
+      nextState: runtime.state,
+      payload: { receipt },
+    });
+    settleCurrentPhaseEffect("succeeded", resultRef);
+  }
+
+  function settleFinalizationEffect(
+    purpose: string,
+    outcome: "failed" | "unknown",
+  ): void {
+    if (!runtime?.state.graphExecution || !currentEffectMatchesPurpose(purpose)) return;
+    const effect = runtime.state.graphExecution.nodeStates.finalizing?.sideEffect;
+    if (effect?.status === "intent_recorded" || effect?.status === "unknown") settleCurrentPhaseEffect(outcome);
+  }
+
   async function maybeCommit(ctx: ExtensionContext): Promise<"committed" | "skipped" | "failed"> {
     if (!runtime) return "failed";
     const runId = runtime.state.runId;
-    if (runtime.state.finalization?.commitSha) return "committed";
+    if (runtime.state.finalization?.commitSha &&
+        (!runtime.state.finalization.commitBaseSha || !runtime.state.finalization.commitMessage)) {
+      const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
+      if (!ownsRun(runId, "finalizing")) return "failed";
+      if (head.code !== 0 || head.stdout.trim() !== runtime.state.finalization.commitSha) {
+        notify(ctx, "Saved commit authority does not match HEAD; explicit finalization recovery is required.", "error");
+        return "failed";
+      }
+      appendRuntimeJournal(runtime, `Verified legacy committed SHA ${runtime.state.finalization.commitSha} against HEAD`);
+      return "committed";
+    }
+    if (runtime.state.finalization?.commitSha && runtime.state.finalization.commitBaseSha && runtime.state.finalization.commitMessage) {
+      const purpose = finalizationEffectPurpose("commit", {
+        baseSha: runtime.state.finalization.commitBaseSha,
+        message: runtime.state.finalization.commitMessage,
+      });
+      if (currentEffectMatchesPurpose(purpose)) {
+        recordFinalizationEffectResult("commit", purpose, {
+          baseSha: runtime.state.finalization.commitBaseSha,
+          commitSha: runtime.state.finalization.commitSha,
+          message: runtime.state.finalization.commitMessage,
+        });
+      }
+      return "committed";
+    }
     if (runtime.config.ship.commit === "never") return "skipped";
     const checkpointed = Boolean(runtime.state.finalization?.commitBaseSha && runtime.state.finalization.commitMessage);
     if (checkpointed) {
       const recovered = await reconcilePendingCommit(ctx);
       if (recovered !== "pending") return recovered;
+      const purpose = finalizationEffectPurpose("commit", {
+        baseSha: runtime.state.finalization!.commitBaseSha!,
+        message: runtime.state.finalization!.commitMessage!,
+      });
+      if (currentEffectMatchesPurpose(purpose)) settleFinalizationEffect(purpose, "failed");
     }
     if (!runtime.state.baselinePaths || !runtime.state.baselineStagedPaths) {
       notify(ctx, "Cannot safely attribute files for this older run; commit skipped.", "error");
@@ -2141,14 +2768,20 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       const message = `Implement ${truncate(runtime.state.task.replace(/\s+/g, " "), 60)}`;
       runtime.state.finalization = { ...runtime.state.finalization, commitBaseSha: base.stdout.trim(), commitMessage: message };
-      writeState(runtime.paths, runtime.state);
-      appendJournal(runtime.paths, `Commit intent checkpointed at ${base.stdout.trim()} for: ${files.join(", ")}`);
+      writeRuntimeState();
+      appendRuntimeJournal(runtime, `Commit intent checkpointed at ${base.stdout.trim()} for: ${files.join(", ")}`);
       persistMirror(runtime.state);
     }
+    const purpose = finalizationEffectPurpose("commit", {
+      baseSha: runtime.state.finalization!.commitBaseSha!,
+      message: runtime.state.finalization!.commitMessage!,
+    });
+    beginCurrentPhaseEffect(purpose, "external", ctx);
     for (const file of files) {
       const result = await pi.exec("git", ["add", "--", file], { timeout: 10_000, signal: ctx.signal });
       if (!ownsRun(runId, "finalizing")) return "failed";
       if (result.code !== 0) {
+        settleFinalizationEffect(purpose, "failed");
         notify(ctx, `git add failed for ${file}: ${result.stderr || result.stdout}`, "error");
         return "failed";
       }
@@ -2156,6 +2789,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const staged = await workingTreeStatus(ctx);
     if (!ownsRun(runId, "finalizing")) return "failed";
     if (!staged || !sameStringSet(files, staged.stagedPaths)) {
+      settleFinalizationEffect(purpose, "failed");
       notify(ctx, "Refusing to commit because the staged index does not exactly match the confirmed lifecycle manifest.", "error");
       return "failed";
     }
@@ -2163,8 +2797,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const commit = await pi.exec("git", ["commit", "-m", message], { timeout: 30_000, signal: ctx.signal });
     if (!ownsRun(runId, "finalizing")) return "failed";
     if (commit.code !== 0) {
+      const recovered = await reconcilePendingCommit(ctx);
+      if (recovered === "pending") settleFinalizationEffect(purpose, "failed");
+      else if (recovered === "failed") settleFinalizationEffect(purpose, "unknown");
       notify(ctx, `git commit failed: ${commit.stderr || commit.stdout}`, "error");
-      return "failed";
+      return recovered === "committed" ? "committed" : "failed";
     }
     const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000, signal: ctx.signal });
     if (!ownsRun(runId, "finalizing")) return "failed";
@@ -2173,8 +2810,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return "failed";
     }
     runtime.state.finalization = { ...runtime.state.finalization, commitSha: head.stdout.trim() };
-    writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `Committed ${head.stdout.trim()}: ${message}`);
+    writeRuntimeState();
+    recordFinalizationEffectResult("commit", purpose, {
+      baseSha: runtime.state.finalization.commitBaseSha!,
+      commitSha: head.stdout.trim(),
+      message,
+    });
+    appendRuntimeJournal(runtime, `Committed ${head.stdout.trim()}: ${message}`);
     persistMirror(runtime.state);
     return "committed";
   }
@@ -2199,8 +2841,19 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return "failed";
     }
     runtime.state.finalization = { ...runtime.state.finalization, commitSha: currentHead };
-    writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `Recovered committed SHA ${currentHead} from saved finalization intent`);
+    writeRuntimeState();
+    const purpose = finalizationEffectPurpose("commit", {
+      baseSha: runtime.state.finalization.commitBaseSha!,
+      message: runtime.state.finalization.commitMessage!,
+    });
+    if (currentEffectMatchesPurpose(purpose)) {
+      recordFinalizationEffectResult("commit", purpose, {
+        baseSha: runtime.state.finalization.commitBaseSha!,
+        commitSha: currentHead,
+        message: runtime.state.finalization.commitMessage!,
+      });
+    }
+    appendRuntimeJournal(runtime, `Recovered committed SHA ${currentHead} from saved finalization intent`);
     persistMirror(runtime.state);
     return "committed";
   }
@@ -2214,7 +2867,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function maybeOpenPr(ctx: ExtensionContext): Promise<"opened" | "skipped" | "failed"> {
     if (!runtime) return "failed";
     const runId = runtime.state.runId;
-    if (runtime.state.finalization?.prUrl) return "opened";
+    if (runtime.state.finalization?.prUrl && runtime.state.finalization.prHead) {
+      const purpose = finalizationEffectPurpose("pull-request", { head: runtime.state.finalization.prHead });
+      if (currentEffectMatchesPurpose(purpose)) {
+        recordFinalizationEffectResult("pull-request", purpose, {
+          head: runtime.state.finalization.prHead,
+          url: runtime.state.finalization.prUrl,
+        });
+      }
+      return "opened";
+    }
     if (runtime.config.ship.openPr === "never") return "skipped";
     const checkpointedHead = runtime.state.finalization?.prHead;
     if (checkpointedHead) {
@@ -2222,10 +2884,20 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       if (!ownsRun(runId, "finalizing")) return "failed";
       if (existing.code === 0 && existing.stdout.trim()) {
         runtime.state.finalization = { ...runtime.state.finalization, prUrl: existing.stdout.trim() };
-        writeState(runtime.paths, runtime.state);
-        appendJournal(runtime.paths, `Recovered pull request: ${existing.stdout.trim()}`);
+        writeRuntimeState();
+        const purpose = finalizationEffectPurpose("pull-request", { head: checkpointedHead });
+        if (currentEffectMatchesPurpose(purpose)) {
+          recordFinalizationEffectResult("pull-request", purpose, { head: checkpointedHead, url: existing.stdout.trim() });
+        }
+        appendRuntimeJournal(runtime, `Recovered pull request: ${existing.stdout.trim()}`);
         persistMirror(runtime.state);
         return "opened";
+      }
+      const purpose = finalizationEffectPurpose("pull-request", { head: checkpointedHead });
+      if (currentEffectMatchesPurpose(purpose)) {
+        settleFinalizationEffect(purpose, "unknown");
+        notify(ctx, "Could not prove whether the checkpointed pull-request creation succeeded; retry was blocked.", "error");
+        return "failed";
       }
     }
     const confirmed = ctx.hasUI && await ctx.ui.confirm("Open pull request", "Run gh pr create --fill now?");
@@ -2242,19 +2914,23 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return "failed";
     }
     runtime.state.finalization = { ...runtime.state.finalization, prHead: branch.stdout.trim() };
-    writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `Pull-request intent checkpointed for ${branch.stdout.trim()}`);
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, `Pull-request intent checkpointed for ${branch.stdout.trim()}`);
     persistMirror(runtime.state);
+    const purpose = finalizationEffectPurpose("pull-request", { head: branch.stdout.trim() });
+    beginCurrentPhaseEffect(purpose, "external", ctx);
     const result = await pi.exec("gh", ["pr", "create", "--fill", "--head", branch.stdout.trim()], { timeout: 60_000, signal: ctx.signal });
     if (!ownsRun(runId, "finalizing")) return "failed";
     if (result.code !== 0) {
+      settleFinalizationEffect(purpose, "unknown");
       notify(ctx, `gh pr create failed: ${result.stderr || result.stdout}`, "error");
       return "failed";
     }
     const prUrl = result.stdout.trim();
     runtime.state.finalization = { ...runtime.state.finalization, prUrl };
-    writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `Opened pull request: ${prUrl}`);
+    writeRuntimeState();
+    recordFinalizationEffectResult("pull-request", purpose, { head: branch.stdout.trim(), url: prUrl });
+    appendRuntimeJournal(runtime, `Opened pull request: ${prUrl}`);
     persistMirror(runtime.state);
     return "opened";
   }
@@ -2291,14 +2967,17 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function pauseStandalone(ctx: ExtensionContext, message: string): Promise<void> {
     if (!runtime) return;
     const state = runtime.state;
-    restoreTools();
-    const restored = await restoreRuntimeModel(ctx);
-    clearUi(ctx);
-    notify(ctx, restored ? message : `${message} Original-model restoration is still pending; use /lifecycle resume to retry.`, restored ? "info" : "warning");
-    persistMirror(state);
-    releaseRuntimeLease();
-    runtime = undefined;
-    deactivateVerdictTools();
+    try {
+      restoreTools();
+      const restored = await restoreRuntimeModel(ctx);
+      clearUi(ctx);
+      notify(ctx, restored ? message : `${message} Original-model restoration is still pending; use /lifecycle resume to retry.`, restored ? "info" : "warning");
+      persistMirror(state);
+    } finally {
+      releaseRuntimeLease();
+      runtime = undefined;
+      deactivateVerdictTools();
+    }
   }
 
   async function finishRun(ctx: ExtensionContext): Promise<void> {
@@ -2314,25 +2993,29 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         finalRunStatus: finished.phase === "failed" ? "failed" : "done",
       });
     }
-    restoreTools();
-    const restored = await restoreRuntimeModel(ctx);
-    if (restored) {
-      releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
-    } else {
-      appendJournal(runtime.paths, "Run finished but original-model restoration is pending; current ownership retained");
+    try {
+      restoreTools();
+      const restored = await restoreRuntimeModel(ctx);
+      if (restored) {
+        releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, finished.runId);
+      } else {
+        appendRuntimeJournal(runtime, "Run finished but original-model restoration is pending; current ownership retained");
+      }
+      clearUi(ctx);
+      pi.sendMessage({ customType: ENTRY_TYPE, content: summary, display: true, details: finished }, { triggerTurn: false });
+      persistMirror(finished);
+      if (!restored) notify(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /lifecycle resume.", "warning");
+    } finally {
+      releaseRuntimeLease();
+      runtime = undefined;
+      deactivateVerdictTools();
     }
-    clearUi(ctx);
-    pi.sendMessage({ customType: ENTRY_TYPE, content: summary, display: true, details: finished }, { triggerTurn: false });
-    persistMirror(finished);
-    if (!restored) notify(ctx, "Run finished, but original-model restoration is pending. Fix model availability and use /lifecycle resume.", "warning");
-    releaseRuntimeLease();
-    runtime = undefined;
-    deactivateVerdictTools();
   }
 
   async function stopRun(ctx: ExtensionContext, message: string): Promise<void> {
     if (stopping) return;
     stopping = true;
+    let cleanupError: unknown;
     try {
       if (!runtime) {
         const loaded = loadCurrent(ctx.cwd);
@@ -2345,20 +3028,51 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       }
       const stopped = runtime.state;
       if (!ctx.isIdle()) ctx.abort();
-      await transition({ type: "cancelled" }, "Lifecycle cancelled", ctx);
-      restoreTools();
-      const restored = await restoreRuntimeModel(ctx);
-      if (restored) {
-        releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
-      } else {
-        appendJournal(runtime.paths, "Lifecycle cancelled but original-model restoration is pending; current ownership retained");
+      try {
+        await transition({ type: "cancelled" }, "Lifecycle cancelled", ctx);
+      } catch (error) {
+        cleanupError = error;
       }
-      clearUi(ctx);
-      pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: stopped }, { triggerTurn: false });
-      if (!restored) notify(ctx, "Original-model restoration is pending. Fix model availability and run /lifecycle-stop again.", "warning");
-      releaseRuntimeLease();
-      runtime = undefined;
-      deactivateVerdictTools();
+      try {
+        try {
+          restoreTools();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        let restored = false;
+        try {
+          restored = await restoreRuntimeModel(ctx);
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        if (!cleanupError && restored) {
+          releaseRun(runtime.cwd, runtime.config.lifecycle.artifactsDir, stopped.runId);
+        } else if (!cleanupError) {
+          appendRuntimeJournal(runtime, "Lifecycle cancelled but original-model restoration is pending; current ownership retained");
+        }
+        try {
+          clearUi(ctx);
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        if (!cleanupError) {
+          pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: stopped }, { triggerTurn: false });
+          if (!restored) notify(ctx, "Original-model restoration is pending. Fix model availability and run /lifecycle-stop again.", "warning");
+        }
+      } finally {
+        try {
+          releaseRuntimeLease();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        runtime = undefined;
+        try {
+          deactivateVerdictTools();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+      }
+      if (cleanupError) throw cleanupError;
     } finally {
       stopping = false;
     }
@@ -2367,16 +3081,26 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   async function interruptRun(ctx: ExtensionContext, message: string): Promise<void> {
     if (!runtime) return;
     const state = runtime.state;
-    if (!ctx.isIdle()) ctx.abort();
-    restoreTools();
-    await restoreRuntimeModel(ctx);
-    clearUi(ctx);
-    appendJournal(runtime.paths, message);
-    persistMirror(state);
-    pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: state }, { triggerTurn: false });
-    releaseRuntimeLease();
-    runtime = undefined;
-    deactivateVerdictTools();
+    try {
+      if (!ctx.isIdle()) ctx.abort();
+      let checkpointError: unknown;
+      try {
+        markUnfinishedCurrentEffectUnknown();
+      } catch (error) {
+        checkpointError = error;
+      }
+      restoreTools();
+      await restoreRuntimeModel(ctx);
+      if (checkpointError) throw checkpointError;
+      clearUi(ctx);
+      appendRuntimeJournal(runtime, message);
+      persistMirror(state);
+      pi.sendMessage({ customType: ENTRY_TYPE, content: message, display: true, details: state }, { triggerTurn: false });
+    } finally {
+      releaseRuntimeLease();
+      runtime = undefined;
+      deactivateVerdictTools();
+    }
   }
 
   async function transition(event: LifecycleEvent, journal: string, ctx: ExtensionContext): Promise<void> {
@@ -2392,18 +3116,157 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       event,
       reduce: (state, selectedEvent) => nextStage(state, selectedEvent, loopConfigFrom(currentRuntime.config)),
       ownsState: (candidate) => ownsRun(candidate.runId, candidate.phase),
-      onTrace: (trace) => appendJournal(
-        currentRuntime.paths,
+      onTrace: (trace) => appendRuntimeJournal(
+        currentRuntime,
         `graph ${trace.engine}: ${trace.nodeId} --${trace.edge}--> ${trace.nextNodeId} (step ${trace.step})`,
       ),
       onShadowMismatch: (message) => notify(ctx, message, "warning"),
     });
     if (next.phase === before && JSON.stringify(next) === JSON.stringify(runtime.state)) return;
-    runtime.state = next;
-    writeState(runtime.paths, next);
-    appendJournal(runtime.paths, `${before} -> ${next.phase}: ${journal}`);
-    persistMirror(next);
+    next.reminder = undefined;
+    const edge = exactLifecycleEdge(before, next.phase, event);
+    const chosenEdge = graphEventEdge(edge);
+    const definition = COMPILED_LIFECYCLE_GRAPH.nodesById.get(before)!;
+    const contract = definition.outputContracts[0];
+    if (!contract) throw new Error(`Lifecycle phase ${before} does not declare a transition output contract`);
+    const resultRef = transitionResultReference(event, journal, next, contract, ctx);
+    requireExecutionGuard(ctx, {
+      action: "transition",
+      nodeId: before,
+      additionalReady: event.type === "cancelled" || COMPILED_LIFECYCLE_GRAPH.nodesById.get(next.phase)!.terminal === true ? 0 : 1,
+      edge: chosenEdge,
+      ...(event.type === "cancelled" ? { terminalStop: "cancelled" as const } :
+        next.phase === "failed" ? { terminalStop: "failed" as const } : {}),
+    });
+    next.envelopeRevision = runtime.state.envelopeRevision;
+    next.previousEnvelopeHash = runtime.state.previousEnvelopeHash;
+    next.envelopeHash = runtime.state.envelopeHash;
+    next.graphExecution = runtime.state.graphExecution ? structuredClone(runtime.state.graphExecution) : undefined;
+    const currentNode = runtime.state.graphExecution!.nodeStates[before]!;
+    const nextStatus = event.type === "cancelled" ? "cancelled" : next.phase === "failed" ? "failed" : "blocked";
+    checkpointRuntimeEvent({
+      ...graphEventBase(runtime.state),
+      kind: "node-status",
+      nodeId: before,
+      priorStatus: currentNode.status,
+      nextStatus,
+      attempt: currentNode.attempts,
+      chosenEdge,
+      artifactRefs: nextStatus === "blocked" ? [resultRef] : [],
+      ...(nextStatus === "blocked" ? {
+        validatorResult: { status: "passed" as const, contracts: [contract] },
+      } : {}),
+    }, next);
+    appendRuntimeJournal(runtime, `${before} -> ${runtime.state.phase}: ${journal}`);
+    persistMirror(runtime.state);
     updateUi(ctx);
+  }
+
+  function exactLifecycleEdge(
+    from: LifecyclePhase,
+    to: LifecyclePhase,
+    event: LifecycleEvent,
+  ): GraphEdgeDefinition {
+    const matches = (COMPILED_LIFECYCLE_GRAPH.outgoingByNode.get(from) ?? [])
+      .filter((candidate) => candidate.to === to && candidate.event === event.type);
+    if (matches.length !== 1) {
+      throw new Error(`Lifecycle transition ${from} --${event.type}--> ${to} matched ${matches.length} compiled edges`);
+    }
+    return matches[0]!;
+  }
+
+  function graphEventEdge(edge: Readonly<GraphEdgeDefinition>): NonNullable<GraphEvent["chosenEdge"]> {
+    return {
+      from: edge.from,
+      to: edge.to,
+      event: edge.event,
+      ...(edge.guard ? { guard: edge.guard } : {}),
+      ...(edge.boundedBy ? { boundedBy: edge.boundedBy } : {}),
+    };
+  }
+
+  function transitionResultReference(
+    event: LifecycleEvent,
+    journal: string,
+    next: LifecycleState,
+    contract: string,
+    ctx: ExtensionContext,
+  ): ArtifactReference {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    if (event.type === "cancelled") {
+      if (node.sideEffect?.status === "intent_recorded") settleCurrentPhaseEffect("unknown");
+      return writeLifecycleNodeResult(runtime.paths, {
+        owner: runtime.leaseOwner,
+        graphState: runtime.state.graphExecution!,
+        nodeId: runtime.state.phase,
+        contract,
+        nextState: next,
+        payload: { lifecycleEvent: structuredClone(event), journal },
+      });
+    }
+    if (node.sideEffect?.status === "unknown" && !hasTrustedTransitionEvidence(event)) {
+      throw new Error(`Lifecycle phase ${runtime.state.phase} has an ambiguous side effect requiring /lifecycle-stop`);
+    }
+    if (node.sideEffect?.status === "succeeded" && node.sideEffect.resultRef?.contract === contract) {
+      const record = readLifecycleNodeResult(runtime.paths, node.sideEffect.resultRef, { verifyLiveArtifact: false });
+      assertTransitionResultMatches(record.nextState, record.payload, event, journal, next);
+      return node.sideEffect.resultRef;
+    }
+    if (node.sideEffect?.status !== "intent_recorded" && node.sideEffect?.status !== "unknown") {
+      const declared = COMPILED_LIFECYCLE_GRAPH.nodesById.get(runtime.state.phase)!.sideEffect;
+      const effectClass: SideEffectExecutionState["class"] = declared === "write" || declared === "external" || declared === "irreversible"
+        ? declared
+        : "tool";
+      beginCurrentPhaseEffect(`transition:${event.type}:${next.phase}`, effectClass, ctx);
+    }
+    const resultRef = writeLifecycleNodeResult(runtime.paths, {
+      owner: runtime.leaseOwner,
+      graphState: runtime.state.graphExecution!,
+      nodeId: runtime.state.phase,
+      contract,
+      nextState: next,
+      payload: { lifecycleEvent: structuredClone(event), journal },
+    });
+    settleCurrentPhaseEffect("succeeded", resultRef);
+    return resultRef;
+  }
+
+  function hasTrustedTransitionEvidence(event: LifecycleEvent): boolean {
+    if (!runtime) return false;
+    if (event.type === "verdict") {
+      return runtime.state.pendingCheckerVerdict?.phase === runtime.state.phase &&
+        runtime.state.pendingCheckerVerdict.kind === event.stage &&
+        runtime.state.pendingCheckerVerdict.verdict === event.verdict;
+    }
+    if (event.type === "debug_produced") {
+      return runtime.state.phase === "debugging" && runtime.state.debugDiagnosisVerdictIndex === latestRejectionIndex() &&
+        isNonEmpty(runtime.paths.debug);
+    }
+    if (event.type === "finalize_complete") return runtime.state.phase === "finalizing";
+    if ((event.type === "spec_produced" || event.type === "plan_produced") && runtime.trustedRecoveryRequestRef) {
+      return runtime.state.graphExecution?.nodeStates[runtime.state.phase]?.sideEffect?.requestRef === runtime.trustedRecoveryRequestRef;
+    }
+    return false;
+  }
+
+  function assertTransitionResultMatches(
+    recordedNext: LifecycleState,
+    payload: Record<string, unknown>,
+    event: LifecycleEvent,
+    journal: string,
+    next: LifecycleState,
+  ): void {
+    const expectedNext = structuredClone(next);
+    expectedNext.version = 1;
+    delete expectedNext.graphExecution;
+    delete expectedNext.envelopeRevision;
+    delete expectedNext.previousEnvelopeHash;
+    delete expectedNext.envelopeHash;
+    if (JSON.stringify(recordedNext) !== JSON.stringify(expectedNext) ||
+        JSON.stringify(payload.lifecycleEvent) !== JSON.stringify(event) || payload.journal !== journal) {
+      throw new Error("Persisted lifecycle transition result conflicts with the requested transition");
+    }
   }
 
   function activateArtifactTools(): void {
@@ -2449,9 +3312,21 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function releaseRuntimeLease(): void {
     if (runtime) {
-      releaseBuildGraphExecution(runtime.paths, runtime.leaseOwner);
-      releaseRunLease(runtime.paths, runtime.leaseOwner);
+      try {
+        if (runtime.buildLease) releaseBuildGraphExecution(runtime.paths, runtime.buildLease);
+      } finally {
+        releaseRunLease(runtime.paths, runtime.leaseOwner);
+      }
     }
+  }
+
+  function writeRuntimeState(state?: LifecycleState): void {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    writeState(runtime.paths, state ?? runtime.state, { owner: runtime.leaseOwner });
+  }
+
+  function appendRuntimeJournal(active: Runtime, line: string): void {
+    appendJournal(active.paths, line, { owner: active.leaseOwner });
   }
 
   function recordProviderFailure(): void {
@@ -2463,8 +3338,8 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     persistRoutingStageOutcome(stage, { structuredToolCompliance: false, verdict: "unknown" });
     selection.routing.failureCategories.push("provider-error");
     selection.routing.fallbackCount += 1;
-    writeState(runtime.paths, runtime.state);
-    appendJournal(runtime.paths, `Model ${stage}: ${selection.provider}/${selection.model} failed during provider execution; fallback required`);
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, `Model ${stage}: ${selection.provider}/${selection.model} failed during provider execution; fallback required`);
     persistMirror(runtime.state);
   }
 
@@ -2485,7 +3360,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime || runtime.state.consecutiveRejections !== 0) return undefined;
     const rejection = [...runtime.state.verdicts].reverse().find((verdict) => verdict.verdict === "reject");
     if (!rejection) return undefined;
-    const diagnosis = isNonEmpty(runtime.paths.debug) ? readFileSync(runtime.paths.debug, "utf8").trim() : undefined;
+    const diagnosis = readLifecycleArtifactText(runtime.paths.debug)?.trim() || undefined;
     return [`Checker rejection: ${rejection.reasons}`, rejection.requiredFixes, diagnosis].filter(Boolean).join("\n\n");
   }
 
@@ -2564,7 +3439,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   }
 
   function persistRestoredState(state: LifecycleState): void {
-    if (runtime?.state.runId === state.runId) writeState(runtime.paths, state);
+    if (runtime?.state.runId === state.runId) writeRuntimeState(state);
   }
 
   function persistMirror(state: LifecycleState): void {
@@ -2573,6 +3448,102 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   function sendPrompt(prompt: string): void {
     pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  }
+
+  function sendPhasePrompt(prompt: string, ctx: ExtensionContext): void {
+    if (!runtime) return;
+    const purpose = `model:${runtime.state.phase}`;
+    const selection = activePhaseRoutingSelection();
+    const checkpointRef = writePhaseRequestCheckpoint(purpose, prompt, selection);
+    beginCurrentPhaseEffect(purpose, "model", ctx, checkpointRef, selection.routing!.decisionId);
+    sendPrompt(prompt);
+  }
+
+  function activePhaseRoutingSelection(): LifecycleState["modelSelections"][number] {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    const stage = routingStageForPhase(runtime.state.phase);
+    if (!stage) throw new Error(`Lifecycle phase ${runtime.state.phase} has no model routing stage`);
+    const phaseEntryKey = currentPhaseEntryKey(runtime.state);
+    const selection = [...runtime.state.modelSelections].reverse().find((candidate) =>
+      candidate.stage === stage && candidate.routing?.phaseEntryKey === phaseEntryKey &&
+      !candidate.routing.failureCategories.includes("policy-migrated"));
+    if (!selection?.routing) throw new Error(`Lifecycle phase ${runtime.state.phase} has no persisted routing decision`);
+    return selection;
+  }
+
+  function writePhaseRequestCheckpoint(
+    purpose: string,
+    prompt: string,
+    selection: LifecycleState["modelSelections"][number],
+  ): GraphCheckpointRef {
+    if (!runtime?.state.graphExecution) throw new Error("lifecycle graph state is unavailable");
+    if (!selection.routing) throw new Error("lifecycle routing decision is unavailable");
+    const node = runtime.state.graphExecution.nodeStates[runtime.state.phase]!;
+    const ordinal = node.sideEffect?.status === "intent_recorded" || node.sideEffect?.status === "unknown"
+      ? node.sideEffect.ordinal
+      : node.sideEffectOrdinal + 1;
+    const requestRef = phaseEffectRequestRef(runtime.state, purpose, ordinal);
+    const artifactPath = runtime.state.phase === "defining"
+      ? runtime.paths.spec
+      : runtime.state.phase === "planning" ? runtime.paths.plan : undefined;
+    const artifact = artifactPath ? boundedArtifactIdentity(artifactPath) : undefined;
+    const record = {
+      schemaVersion: 1,
+      kind: "lifecycle-phase-request",
+      runId: runtime.state.runId,
+      nodeId: runtime.state.phase,
+      planVersion: runtime.state.graphExecution.planVersion,
+      visit: node.visits,
+      attempt: node.attempts,
+      ordinal,
+      purpose,
+      requestRef,
+      promptSha256: createHash("sha256").update(prompt, "utf8").digest("hex"),
+      routingDecisionId: selection.routing.decisionId,
+      ...(runtime.state.phase === "planning" ? {
+        expectedBuildPlanVersion: runtime.pendingBuildPlanVersion,
+      } : {}),
+      route: {
+        provider: boundedRequestIdentity(selection.provider, "provider"),
+        model: boundedRequestIdentity(selection.model, "model"),
+        thinking: selection.thinking,
+      },
+      ...(artifactPath && artifact ? {
+        artifactBefore: { path: rel(artifactPath), sha256: artifact.sha256, sizeBytes: artifact.sizeBytes },
+      } : {}),
+    };
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+    const mutationId = createHash("sha256").update(bytes).digest("hex");
+    return writeGraphMutationArtifact(runtime.paths, { owner: runtime.leaseOwner, mutationId, bytes });
+  }
+
+  function boundedRequestIdentity(value: string, label: string): string {
+    if (value.length === 0 || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) {
+      throw new Error(`Lifecycle request ${label} identity is invalid`);
+    }
+    return value;
+  }
+
+  function boundedArtifactIdentity(path: string): { sha256: string; sizeBytes: number } {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    const bytes = readLifecycleArtifactBounded(runtime.paths, path);
+    if (!bytes) throw new Error(`Lifecycle artifact is missing: ${rel(path)}`);
+    return { sha256: createHash("sha256").update(bytes).digest("hex"), sizeBytes: bytes.byteLength };
+  }
+
+  function readLifecycleArtifactText(path: string): string | undefined {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    return readLifecycleArtifactBounded(runtime.paths, path)?.toString("utf8");
+  }
+
+  function readRequired(path: string, label: string): string {
+    const value = readLifecycleArtifactText(path);
+    if (!value?.trim()) throw new Error(`${label} artifact is missing or empty: ${path}`);
+    return value;
+  }
+
+  function isNonEmpty(path: string): boolean {
+    return Boolean(readLifecycleArtifactText(path)?.trim());
   }
 
   function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
@@ -2636,15 +3607,6 @@ function parseTaskArgs(args: string): { yolo: boolean; task: string } {
     parts.shift();
   }
   return { yolo, task: parts.join(" ").trim() };
-}
-
-function readRequired(path: string, label: string): string {
-  if (!isNonEmpty(path)) throw new Error(`${label} artifact is missing or empty: ${path}`);
-  return readFileSync(path, "utf8");
-}
-
-function isNonEmpty(path: string): boolean {
-  return existsSync(path) && readFileSync(path, "utf8").trim().length > 0;
 }
 
 function isActivePhase(phase: LifecyclePhase): boolean {

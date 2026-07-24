@@ -271,20 +271,91 @@ function executeNode(
     statusEvent(state, nodeId, "running"),
     compiled.schedulerMetadata,
   );
+  const settled = settleTestNodeEffect(compiled, running, nodeId);
   const artifactRefs = compiled.plan.nodes.find(({ id }) => id === nodeId)!.outputContracts.map(({ id }) => ({
-    planVersion: running.planVersion,
+    planVersion: settled.planVersion,
     nodeId,
     contract: id,
-    path: `nodes/${running.planVersion}/${nodeId}/${id}.json`,
+    path: `nodes/${settled.planVersion}/${nodeId}/${id}.json`,
     sha256: "a".repeat(64),
     sizeBytes: 1,
   }));
   return applySchedulerEvent(
     compiled.graph,
-    running,
-    statusEvent(running, nodeId, "executed", artifactRefs),
+    settled,
+    statusEvent(settled, nodeId, "executed", artifactRefs),
     compiled.schedulerMetadata,
   );
+}
+
+function settleTestNodeEffect(
+  compiled: ReturnType<typeof compileBuildPlan>,
+  state: GraphExecutionState,
+  nodeId: string,
+): GraphExecutionState {
+  const node = state.nodeStates[nodeId]!;
+  const requestRef = createHash("sha256")
+    .update(`test-effect\0${state.runId}\0${nodeId}\0${node.attempts}`)
+    .digest("hex");
+  const intent = applySchedulerEvent(compiled.graph, state, {
+    schemaVersion: 1,
+    kind: "side-effect-intent",
+    sequence: state.lastAppliedEventSequence + 1,
+    eventId: `test-intent-${nodeId}-${state.lastAppliedEventSequence + 1}`,
+    requestRef,
+    runId: state.runId,
+    graphId: state.graphId,
+    graphVersion: state.graphVersion,
+    graphDigest: state.graphDigest,
+    planVersion: state.planVersion,
+    nodeId,
+    priorStatus: node.status,
+    nextStatus: node.status,
+    attempt: node.attempts,
+    timestamp: now,
+    artifactRefs: [],
+    sideEffect: {
+      phase: "intent",
+      ordinal: node.sideEffectOrdinal + 1,
+      idempotencyKey: requestRef,
+      class: "tool",
+    },
+  }, compiled.schedulerMetadata);
+  const pending = intent.nodeStates[nodeId]!.sideEffect!;
+  const resultRef: ArtifactReference = {
+    planVersion: intent.planVersion,
+    nodeId,
+    contract: "test-effect",
+    path: `nodes/${intent.planVersion}/${nodeId}/test-effect.json`,
+    sha256: "e".repeat(64),
+    sizeBytes: 1,
+  };
+  return applySchedulerEvent(compiled.graph, intent, {
+    schemaVersion: 1,
+    kind: "side-effect-result",
+    sequence: intent.lastAppliedEventSequence + 1,
+    eventId: `test-result-${nodeId}-${intent.lastAppliedEventSequence + 1}`,
+    requestRef,
+    runId: intent.runId,
+    graphId: intent.graphId,
+    graphVersion: intent.graphVersion,
+    graphDigest: intent.graphDigest,
+    planVersion: intent.planVersion,
+    nodeId,
+    priorStatus: intent.nodeStates[nodeId]!.status,
+    nextStatus: intent.nodeStates[nodeId]!.status,
+    attempt: intent.nodeStates[nodeId]!.attempts,
+    timestamp: now,
+    artifactRefs: [],
+    sideEffect: {
+      phase: "result",
+      ordinal: pending.ordinal,
+      idempotencyKey: pending.idempotencyKey,
+      class: pending.class,
+      outcome: "succeeded",
+      resultRef,
+    },
+  }, compiled.schedulerMetadata);
 }
 
 describe("BUILD execution identities", () => {
@@ -525,6 +596,7 @@ describe("human integration", () => {
     state = applySchedulerEvent(compiled.graph, state, waitingEvent, compiled.schedulerMetadata);
     expect(state.nodeStates.integrate?.status).toBe("waiting_human");
     const integrationAction = createBuildHumanIntegrationAction(compiled, state, "integrate");
+    state = settleTestNodeEffect(compiled, state, "integrate");
     expect(integrationAction).toMatchObject({
       kind: "record-human-integration",
       purpose: "human-integration",
@@ -558,11 +630,12 @@ describe("human integration", () => {
     expect(() => createBuildHumanIntegrationResultEvent(compiled, state, decision, {
       ...evidence,
       path: "../forged.json",
-    }, receipt, integrationCheckpoint, "integration-result-forged")).toThrow(/evidence identity/i);
+    }, evidence, receipt, integrationCheckpoint, "integration-result-forged")).toThrow(/evidence identity/i);
     expect(() => createBuildHumanIntegrationResultEvent(
       compiled,
       state,
       decision,
+      evidence,
       evidence,
       { ...receipt, confirmationRef: "f".repeat(64) },
       integrationCheckpoint,
@@ -573,6 +646,7 @@ describe("human integration", () => {
       state,
       decision,
       evidence,
+      evidence,
       receipt,
       { ...integrationCheckpoint, status: "intent-recorded", resultRef: undefined },
       "integration-result-unsettled",
@@ -582,6 +656,7 @@ describe("human integration", () => {
       compiled,
       state,
       decision,
+      evidence,
       evidence,
       receipt,
       integrationCheckpoint,
@@ -620,6 +695,8 @@ describe("human integration", () => {
       unattended: false,
       eventId: "wait-decline",
     }), compiled.schedulerMetadata);
+    const integrationAction = createBuildHumanIntegrationAction(compiled, state, "integrate");
+    state = settleTestNodeEffect(compiled, state, "integrate");
     const decision = {
       schemaVersion: 1,
       runId: state.runId,
@@ -635,11 +712,12 @@ describe("human integration", () => {
       recordedAt: now,
     } as const;
     const receipt = trustedIntegrationReceipt(decision);
-    const integrationCheckpoint = succeededCheckpoint(createBuildHumanIntegrationAction(compiled, state, "integrate"), receipt);
+    const integrationCheckpoint = succeededCheckpoint(integrationAction, receipt);
     const declined = createBuildHumanIntegrationResultEvent(
       compiled,
       state,
       decision,
+      undefined,
       undefined,
       receipt,
       integrationCheckpoint,

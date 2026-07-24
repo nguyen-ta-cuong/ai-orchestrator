@@ -18,7 +18,7 @@ import {
 import { acquireRunLease, createRun } from "../src/lifecycle/artifacts.js";
 
 const tempDirs: string[] = [];
-const owner = "build-owner";
+const ownerToken = "build-owner";
 const now = "2026-07-22T00:00:00.000Z";
 
 afterEach(() => {
@@ -29,7 +29,7 @@ function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "build-execution-lifecycle-"));
   tempDirs.push(cwd);
   const run = createRun(cwd, ".ai-orchestrator/runs", "durable build action");
-  acquireRunLease(run.paths, owner);
+  const owner = acquireRunLease(run.paths, ownerToken);
   const identity = buildEffectIdentity({
     runId: run.runId,
     planVersion: 1,
@@ -42,7 +42,7 @@ function fixture() {
     workspace: { kind: "shared" },
   });
   const action: BuildRunningAction = { ...identity, kind: "invoke-worker" };
-  return { run, action };
+  return { run, action, owner };
 }
 
 function executor(): BuildActionExecutor & {
@@ -65,7 +65,7 @@ function executor(): BuildActionExecutor & {
 
 describe("durable BUILD action coordinator", () => {
   it("persists intent before invocation, receipt before result, and replays exact completion without recalling", async () => {
-    const { run, action } = fixture();
+    const { run, action, owner } = fixture();
     const adapter = executor();
 
     const completed = await executeDurableBuildAction(run.paths, action, adapter, { owner, recordedAt: now });
@@ -81,7 +81,7 @@ describe("durable BUILD action coordinator", () => {
   });
 
   it("reconciles an unresolved durable intent without invoking the effect again", async () => {
-    const { run, action } = fixture();
+    const { run, action, owner } = fixture();
     const adapter = executor();
     const intent = {
       ...action,
@@ -99,7 +99,7 @@ describe("durable BUILD action coordinator", () => {
   });
 
   it("leaves an unresolved intent durable when reconciliation has no proof", async () => {
-    const { run, action } = fixture();
+    const { run, action, owner } = fixture();
     const adapter = executor();
     adapter.execute.mockRejectedValueOnce(new Error("worker transport lost"));
     await expect(executeDurableBuildAction(run.paths, action, adapter, { owner, recordedAt: now }))
@@ -117,7 +117,7 @@ describe("durable BUILD action coordinator", () => {
   });
 
   it("reconciles an explicit unknown checkpoint instead of treating it as terminal", async () => {
-    const { run, action } = fixture();
+    const { run, action, owner } = fixture();
     const adapter = executor();
     const { kind: _kind, ...effect } = action;
     const intent = {
@@ -142,7 +142,7 @@ describe("durable BUILD action coordinator", () => {
   });
 
   it("records a known failure without a fabricated receipt and rejects forged action identities", async () => {
-    const { run, action } = fixture();
+    const { run, action, owner } = fixture();
     const adapter = executor();
     adapter.execute.mockResolvedValueOnce({ outcome: "failed", recordedAt: now });
     const failed = await executeDurableBuildAction(run.paths, action, adapter, { owner, recordedAt: now });
@@ -156,7 +156,7 @@ describe("durable BUILD action coordinator", () => {
   });
 
   it("never turns a synthetic reconciliation request into a first invocation", async () => {
-    const { run, action } = fixture();
+    const { run, action, owner } = fixture();
     const adapter = executor();
 
     await expect(executeDurableBuildAction(run.paths, { ...action, kind: "reconcile-unknown" }, adapter, {

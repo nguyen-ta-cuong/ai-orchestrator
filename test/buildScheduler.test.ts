@@ -226,6 +226,9 @@ function sideEffectEvent(
   phase: "intent" | "result",
   idempotencyKey: string,
 ): GraphEvent {
+  const ordinal = phase === "intent"
+    ? state.nodeStates[nodeId]!.sideEffectOrdinal + 1
+    : state.nodeStates[nodeId]!.sideEffect!.ordinal;
   return {
     schemaVersion: 1,
     kind: phase === "intent" ? "side-effect-intent" : "side-effect-result",
@@ -244,8 +247,8 @@ function sideEffectEvent(
     timestamp: now,
     artifactRefs: [],
     sideEffect: phase === "intent"
-      ? { phase, idempotencyKey, class: "write" }
-      : { phase, idempotencyKey, class: "write", outcome: "failed" },
+      ? { phase, ordinal, idempotencyKey, class: "tool" }
+      : { phase, ordinal, idempotencyKey, class: "tool", outcome: "failed" },
   };
 }
 
@@ -284,9 +287,79 @@ function execute(
   nodeId: string,
 ): GraphExecutionState {
   const running = start(compiled, state, nodeId);
+  const settled = settleTestEffect(compiled, running, nodeId);
   const refs = compiled.plan.nodes.find((candidate) => candidate.id === nodeId)!.outputContracts
-    .map(({ id }) => artifact(running, nodeId, id));
-  return applySchedulerEvent(compiled.graph, running, event(running, nodeId, "executed", refs), compiled.schedulerMetadata);
+    .map(({ id }) => artifact(settled, nodeId, id));
+  return applySchedulerEvent(compiled.graph, settled, event(settled, nodeId, "executed", refs), compiled.schedulerMetadata);
+}
+
+function settleTestEffect(
+  compiled: ReturnType<typeof compileBuildPlan>,
+  state: GraphExecutionState,
+  nodeId: string,
+): GraphExecutionState {
+  const node = state.nodeStates[nodeId]!;
+  const requestRef = createHash("sha256")
+    .update(`scheduler-test-effect\0${state.runId}\0${nodeId}\0${node.attempts}`)
+    .digest("hex");
+  const intent = applySchedulerEvent(compiled.graph, state, {
+    schemaVersion: 1,
+    kind: "side-effect-intent",
+    sequence: state.lastAppliedEventSequence + 1,
+    eventId: `effect-intent-${nodeId}-${state.lastAppliedEventSequence + 1}`,
+    requestRef,
+    runId: state.runId,
+    graphId: state.graphId,
+    graphVersion: state.graphVersion,
+    graphDigest: state.graphDigest,
+    planVersion: state.planVersion,
+    nodeId,
+    priorStatus: node.status,
+    nextStatus: node.status,
+    attempt: node.attempts,
+    timestamp: now,
+    artifactRefs: [],
+    sideEffect: {
+      phase: "intent",
+      ordinal: node.sideEffectOrdinal + 1,
+      idempotencyKey: requestRef,
+      class: "tool",
+    },
+  }, compiled.schedulerMetadata);
+  const pending = intent.nodeStates[nodeId]!.sideEffect!;
+  return applySchedulerEvent(compiled.graph, intent, {
+    schemaVersion: 1,
+    kind: "side-effect-result",
+    sequence: intent.lastAppliedEventSequence + 1,
+    eventId: `effect-result-${nodeId}-${intent.lastAppliedEventSequence + 1}`,
+    requestRef,
+    runId: intent.runId,
+    graphId: intent.graphId,
+    graphVersion: intent.graphVersion,
+    graphDigest: intent.graphDigest,
+    planVersion: intent.planVersion,
+    nodeId,
+    priorStatus: intent.nodeStates[nodeId]!.status,
+    nextStatus: intent.nodeStates[nodeId]!.status,
+    attempt: intent.nodeStates[nodeId]!.attempts,
+    timestamp: now,
+    artifactRefs: [],
+    sideEffect: {
+      phase: "result",
+      ordinal: pending.ordinal,
+      idempotencyKey: pending.idempotencyKey,
+      class: pending.class,
+      outcome: "succeeded",
+      resultRef: {
+        planVersion: intent.planVersion,
+        nodeId,
+        contract: "test-effect",
+        path: `nodes/${intent.planVersion}/${nodeId}/test-effect.json`,
+        sha256: "e".repeat(64),
+        sizeBytes: 1,
+      },
+    },
+  }, compiled.schedulerMetadata);
 }
 
 function start(

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { compileLegacySequentialBuildPlan } from "../src/core/buildPlan.js";
 import { DEFAULT_EXECUTION_LIMITS, type GraphEvent } from "../src/core/scheduler.js";
 import {
+  acquireBuildGraphExecutionLease,
   buildGraphExecutionPaths,
   checkpointBuildGraphEvent,
   initializeBuildGraphExecution,
@@ -14,7 +15,7 @@ import {
 import { acquireRunLease, createRun, releaseRunLease } from "../src/lifecycle/artifacts.js";
 
 const temporaryDirectories: string[] = [];
-const owner = "build-graph-owner";
+const ownerToken = "build-graph-owner";
 const now = "2026-07-22T00:00:00.000Z";
 
 afterEach(() => {
@@ -25,9 +26,13 @@ function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "build-graph-execution-"));
   temporaryDirectories.push(cwd);
   const run = createRun(cwd, ".ai-orchestrator/runs", "durable BUILD graph");
-  acquireRunLease(run.paths, owner);
+  const owner = acquireRunLease(run.paths, ownerToken);
+  const graphOwner = acquireBuildGraphExecutionLease(run.paths, owner, {
+    now,
+    pid: process.pid,
+  });
   const compiled = compileLegacySequentialBuildPlan("Implement it.", 1, ["src"]);
-  return { run, compiled };
+  return { run, compiled, owner, graphOwner };
 }
 
 function startEvent(state: ReturnType<typeof initializeBuildGraphExecution>): GraphEvent {
@@ -52,9 +57,10 @@ function startEvent(state: ReturnType<typeof initializeBuildGraphExecution>): Gr
 
 describe("durable BUILD graph execution", () => {
   it("initializes idempotently and recovers an event appended before the snapshot rename", () => {
-    const { run, compiled } = fixture();
+    const { run, compiled, owner, graphOwner } = fixture();
     const initial = initializeBuildGraphExecution(run.paths, compiled, {
       owner,
+      graphOwner,
       now,
       pid: process.pid,
       limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
@@ -62,27 +68,34 @@ describe("durable BUILD graph execution", () => {
     expect(initial).toMatchObject({ runId: run.runId, planVersion: 1, ready: ["legacy-build"] });
     expect(() => checkpointBuildGraphEvent(run.paths, compiled, initial, startEvent(initial), {
       owner,
+      graphOwner,
       tempId: "crash-after-event",
       failAt(point) {
         if (point === "after-event-append") throw new Error("simulated crash");
       },
     })).toThrow(/simulated crash/i);
 
-    const recovered = recoverBuildGraphExecution(run.paths, compiled, { owner, tempId: "recover-event" });
+    const recovered = recoverBuildGraphExecution(run.paths, compiled, {
+      owner,
+      graphOwner,
+      tempId: "recover-event",
+    });
     expect(recovered.nodeStates["legacy-build"]).toMatchObject({ status: "running", attempts: 1 });
     expect(initializeBuildGraphExecution(run.paths, compiled, {
       owner,
+      graphOwner,
       now,
       pid: process.pid,
       limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
     })).toEqual(recovered);
-    expect(releaseBuildGraphExecution(run.paths, owner)).toBe(true);
+    expect(releaseBuildGraphExecution(run.paths, graphOwner)).toBe(true);
   });
 
   it("binds the checkpoint to one immutable plan and the outer lifecycle lease", () => {
-    const { run, compiled } = fixture();
+    const { run, compiled, owner, graphOwner } = fixture();
     initializeBuildGraphExecution(run.paths, compiled, {
       owner,
+      graphOwner,
       now,
       pid: process.pid,
       limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
@@ -90,14 +103,36 @@ describe("durable BUILD graph execution", () => {
     const changed = compileLegacySequentialBuildPlan("Different plan.", 1, ["src"]);
     expect(() => initializeBuildGraphExecution(run.paths, changed, {
       owner,
+      graphOwner,
       now,
       pid: process.pid,
       limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
     })).toThrow(/immutable graph checkpoint|immutable BUILD plan/i);
-    expect(releaseBuildGraphExecution(run.paths, owner)).toBe(true);
+    expect(releaseBuildGraphExecution(run.paths, graphOwner)).toBe(true);
     expect(releaseRunLease(run.paths, owner)).toBe(true);
-    expect(() => recoverBuildGraphExecution(run.paths, compiled, { owner, tempId: "without-lifecycle-lease" }))
+    expect(() => recoverBuildGraphExecution(run.paths, compiled, {
+      owner,
+      graphOwner,
+      tempId: "without-lifecycle-lease",
+    }))
       .toThrow(/lifecycle lease/i);
     expect(buildGraphExecutionPaths(run.paths).root).toContain(`${join("build", "execution")}`);
+  });
+
+  it("rejects a current nested lease inherited from a stale outer lifecycle generation", () => {
+    const { run, compiled, owner, graphOwner } = fixture();
+    expect(releaseRunLease(run.paths, owner)).toBe(true);
+    const replacement = acquireRunLease(run.paths, "replacement-build-owner");
+
+    expect(() => initializeBuildGraphExecution(run.paths, compiled, {
+      owner: replacement,
+      graphOwner,
+      now,
+      pid: process.pid,
+      limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    })).toThrow(/active lifecycle generation/i);
+
+    expect(releaseBuildGraphExecution(run.paths, graphOwner)).toBe(true);
+    expect(releaseRunLease(run.paths, replacement)).toBe(true);
   });
 });

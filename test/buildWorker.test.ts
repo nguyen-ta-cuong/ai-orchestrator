@@ -21,6 +21,11 @@ import {
 } from "../src/runtime/buildWorker.js";
 
 const now = "2026-07-22T00:00:00.000Z";
+const budgetCheckpoint = {
+  path: `mutations/${"a".repeat(64)}.json`,
+  sha256: "b".repeat(64),
+  sizeBytes: 1,
+} as const;
 
 function plan(): BuildPlan {
   return {
@@ -173,6 +178,8 @@ function setup() {
     observedCostUsd: 0,
     inputTokens: 100,
     outputTokens: 100,
+    checkpointRef: budgetCheckpoint,
+    routingDecisionId: "build-route-1",
   });
   state = applySchedulerEvent(compiled.graph, state, budget.event, compiled.schedulerMetadata);
   return { compiled, state, action, reservation: budget.reservation };
@@ -346,6 +353,8 @@ describe("BUILD worker runtime boundary", () => {
       observedCostUsd: 0,
       inputTokens: 200,
       outputTokens: 200,
+      checkpointRef: budgetCheckpoint,
+      routingDecisionId: "build-route-1",
     });
     state = applySchedulerEvent(compiled.graph, state, budget.event, compiled.schedulerMetadata);
     const request = createBuildWorkerRequest(compiled, state, { ...identity, kind: "invoke-worker" }, {

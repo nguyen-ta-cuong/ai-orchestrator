@@ -12,18 +12,20 @@ import {
 import {
   appendBuildDispatchCheckpoint,
   buildPlanVersionForSubmission,
+  readBuildNodeArtifact,
   readBuildDispatchLedger,
   readImmutableBuildPlan,
   recoverIncompleteBuildPlan,
   sealBuildDispatchLedger,
   writeBuildEffectReceipt,
+  writeBuildNodeArtifact,
   writeImmutableBuildPlan,
 } from "../src/lifecycle/buildArtifacts.js";
 import { acquireRunLease, createRun, releaseRunLease } from "../src/lifecycle/artifacts.js";
 
 const tempDirs: string[] = [];
 const artifactsDir = ".ai-orchestrator/runs";
-const owner = "build-owner";
+const ownerToken = "build-owner";
 const now = "2026-07-22T00:00:00.000Z";
 
 afterEach(() => {
@@ -34,8 +36,8 @@ function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "build-artifacts-"));
   tempDirs.push(cwd);
   const run = createRun(cwd, artifactsDir, "build artifacts");
-  acquireRunLease(run.paths, owner);
-  return { cwd, run };
+  const owner = acquireRunLease(run.paths, ownerToken);
+  return { cwd, run, owner };
 }
 
 function checkpoint(
@@ -67,7 +69,7 @@ function checkpoint(
 
 describe("immutable BUILD artifacts", () => {
   it("writes canonical structured JSON and generated Markdown once per plan version", () => {
-    const { run } = fixture();
+    const { run, owner } = fixture();
     const compiled = compileLegacySequentialBuildPlan("Implement it.", 1, ["src"]);
     const written = writeImmutableBuildPlan(run.paths, compiled, { owner });
 
@@ -80,13 +82,25 @@ describe("immutable BUILD artifacts", () => {
     const collision = compileLegacySequentialBuildPlan("Different approved prose.", 1, ["src"]);
     expect(() => writeImmutableBuildPlan(run.paths, collision, { owner })).toThrow(/immutable.*version|collision/i);
     expect(buildPlanVersionForSubmission(run.paths)).toBe(2);
+    const artifact = writeBuildNodeArtifact(run.paths, {
+      planVersion: 1,
+      nodeId: "legacy-build",
+      attempt: 1,
+      contract: "legacy-build-output",
+      bytes: "{}\n",
+    }, { owner });
+    expect(readBuildNodeArtifact(run.paths, artifact).toString("utf8")).toBe("{}\n");
+    expect(() => readBuildNodeArtifact(run.paths, {
+      ...artifact,
+      path: "nodes/1/legacy-build/../../plan.md",
+    })).toThrow(/outside its plan\/node directory/i);
     expect(releaseRunLease(run.paths, owner)).toBe(true);
   });
 
   it.each(["after-reservation", "after-graph", "after-markdown"] as const)(
     "recovers a crash %s from the single immutable submission reservation",
     (failurePoint) => {
-      const { run } = fixture();
+      const { run, owner } = fixture();
       const compiled = compileLegacySequentialBuildPlan("Implement it.", 1, ["src"]);
       expect(() => writeImmutableBuildPlan(run.paths, compiled, {
         owner,
@@ -110,10 +124,10 @@ describe("immutable BUILD artifacts", () => {
     expect(() => writeImmutableBuildPlan(
       skipped.run.paths,
       compileLegacySequentialBuildPlan("Skipped version.", 2, ["src"]),
-      { owner },
+      { owner: skipped.owner },
     )).toThrow(/next durable submission version/i);
 
-    const { run } = fixture();
+    const { run, owner } = fixture();
     const compiled = compileLegacySequentialBuildPlan("Version one.", 1, ["src"]);
     const written = writeImmutableBuildPlan(run.paths, compiled, { owner });
     writeFileSync(written.manifestPath, "{}\n");
@@ -126,7 +140,7 @@ describe("immutable BUILD artifacts", () => {
   });
 
   it("appends intent and terminal receipt under CAS, replays exact duplicates, and seals the ledger head", () => {
-    const { run } = fixture();
+    const { run, owner } = fixture();
     const compiled = compileLegacySequentialBuildPlan("Implement it.", 1, ["src"]);
     writeImmutableBuildPlan(run.paths, compiled, { owner });
     const intent = checkpoint(compiled, run.runId, "intent-recorded");
@@ -249,7 +263,7 @@ describe("immutable BUILD artifacts", () => {
   });
 
   it("seals a successful retry while preserving terminal evidence from the failed attempt", () => {
-    const { run } = fixture();
+    const { run, owner } = fixture();
     const base = compileLegacySequentialBuildPlan("Implement it with one retry.", 1, ["src"]);
     const compiled = compileBuildPlan({
       ...base.plan,
@@ -332,7 +346,7 @@ describe("immutable BUILD artifacts", () => {
   });
 
   it("keeps an unknown outcome unresolved until reconciliation proves a terminal result", () => {
-    const { run } = fixture();
+    const { run, owner } = fixture();
     const compiled = compileLegacySequentialBuildPlan("Implement it.", 1, ["src"]);
     const intent = checkpoint(compiled, run.runId, "intent-recorded");
     const first = appendBuildDispatchCheckpoint(run.paths, intent, { owner, expectedHead: null });
@@ -368,7 +382,7 @@ describe("immutable BUILD artifacts", () => {
   });
 
   it("fails closed on stale heads, missing lease ownership, corrupt suffixes, and symlinked paths", () => {
-    const { run } = fixture();
+    const { run, owner } = fixture();
     const compiled = compileLegacySequentialBuildPlan("Implement it.", 1, ["src"]);
     const intent = checkpoint(compiled, run.runId, "intent-recorded");
     const first = appendBuildDispatchCheckpoint(run.paths, intent, { owner, expectedHead: null });
@@ -407,7 +421,7 @@ describe("immutable BUILD artifacts", () => {
     expect(() => appendBuildDispatchCheckpoint(
       second.run.paths,
       checkpoint(secondCompiled, second.run.runId, "intent-recorded"),
-      { owner, expectedHead: null },
+      { owner: second.owner, expectedHead: null },
     )).toThrow(/symlink/i);
 
     const third = fixture();
@@ -420,7 +434,7 @@ describe("immutable BUILD artifacts", () => {
     expect(() => appendBuildDispatchCheckpoint(
       third.run.paths,
       checkpoint(thirdCompiled, third.run.runId, "intent-recorded"),
-      { owner, expectedHead: null },
+      { owner: third.owner, expectedHead: null },
     )).toThrow(/symlink/i);
     expect(readFileSync(outsideLedger, "utf8")).toBe("");
   });

@@ -10,7 +10,8 @@ import {
   type BuildHumanIntegrationDecision,
   type BuildHumanIntegrationReceipt,
 } from "../core/buildExecution.js";
-import type { ArtifactReference, GraphExecutionState } from "../core/scheduler.js";
+import type { ArtifactReference, GraphEvent, GraphExecutionState } from "../core/scheduler.js";
+import { writeNodeArtifact, type GraphCheckpointLease } from "../runtime/graphCheckpoint.js";
 import type { RunPaths } from "./artifacts.js";
 import {
   readBuildDispatchLedger,
@@ -18,7 +19,12 @@ import {
   sealBuildDispatchLedger,
   writeBuildNodeArtifact,
 } from "./buildArtifacts.js";
-import { checkpointBuildGraphEvent } from "./buildGraphExecution.js";
+import {
+  buildGraphExecutionPaths,
+  checkpointBuildGraphEvent,
+  mirrorBuildDispatchSealToGraph,
+  mirrorBuildNodeArtifactToGraph,
+} from "./buildGraphExecution.js";
 import { executeDurableBuildAction } from "./buildExecution.js";
 import {
   createOwnedBuildWorkspaceIdentity,
@@ -97,7 +103,7 @@ export function prepareBuildHumanIntegrationReview(
   compiled: Readonly<CompiledBuildPlan>,
   state: Readonly<GraphExecutionState>,
   options: Readonly<{
-    owner: string;
+    owner: Readonly<GraphCheckpointLease>;
     repositoryRoot: string;
     git: GitRunner;
     now(): string;
@@ -133,10 +139,12 @@ export async function completeBuildHumanIntegration(
   state: Readonly<GraphExecutionState>,
   input: Readonly<CompleteBuildHumanIntegrationInput>,
   options: Readonly<{
-    owner: string;
+    owner: Readonly<GraphCheckpointLease>;
+    graphOwner: Readonly<GraphCheckpointLease>;
     repositoryRoot: string;
     git: GitRunner;
     now(): string;
+    failAt?(point: "after-effect-result"): void;
   }>,
 ): Promise<Readonly<CompleteBuildHumanIntegrationResult>> {
   if (input.confirmedByUser !== true) throw new Error("BUILD human integration decision requires explicit user confirmation");
@@ -230,6 +238,7 @@ export async function completeBuildHumanIntegration(
     recordedAt: persisted.decision.recordedAt,
     context: { graphState: state },
   });
+  let graphResultRef: Readonly<ArtifactReference>;
   if (persisted.decision.decision === "integrated") {
     const seal = sealBuildDispatchLedger(paths, {
       runId: state.runId,
@@ -244,21 +253,125 @@ export async function completeBuildHumanIntegration(
         stableJson(seal.outputArtifacts[0]) !== stableJson(artifactRef)) {
       throw new Error("BUILD human integration seal does not bind its exact output evidence");
     }
+    graphResultRef = mirrorBuildDispatchSealToGraph(paths, seal, {
+      owner: options.owner,
+      graphOwner: options.graphOwner,
+    });
+  } else {
+    graphResultRef = writeNodeArtifact(buildGraphExecutionPaths(paths), {
+      owner: options.graphOwner,
+      planVersion: state.planVersion,
+      nodeId,
+      contract: "build-human-decision",
+      bytes: Buffer.from(`${stableJson(persisted)}\n`, "utf8"),
+    });
   }
+  const graphArtifactRef = artifactRef === undefined
+    ? undefined
+    : mirrorBuildNodeArtifactToGraph(paths, artifactRef, {
+      owner: options.owner,
+      graphOwner: options.graphOwner,
+    });
+  const persistedEffect = state.nodeStates[nodeId]?.sideEffect;
+  const effectState = persistedEffect?.status === "succeeded"
+    ? recoverHumanIntegrationEffectResult(state, nodeId, graphResultRef)
+    : checkpointBuildGraphEvent(
+        paths,
+        compiled,
+        state,
+        humanIntegrationEffectResult(state, nodeId, graphResultRef, persisted.decision.recordedAt),
+        {
+          owner: options.owner,
+          graphOwner: options.graphOwner,
+          tempId: `human-effect-result-${state.lastAppliedEventSequence + 1}`,
+        },
+      );
+  options.failAt?.("after-effect-result");
   const event = createBuildHumanIntegrationResultEvent(
     compiled,
-    state,
+    effectState,
     persisted.decision,
     artifactRef,
+    graphArtifactRef,
     receipt,
     durable.checkpoint,
-    `build-human-result-${state.lastAppliedEventSequence + 1}`,
+    `build-human-result-${effectState.lastAppliedEventSequence + 1}`,
   );
-  const next = checkpointBuildGraphEvent(paths, compiled, state, event, {
+  const next = checkpointBuildGraphEvent(paths, compiled, effectState, event, {
     owner: options.owner,
-    tempId: `human-result-${state.lastAppliedEventSequence + 1}`,
+    graphOwner: options.graphOwner,
+    tempId: `human-result-${effectState.lastAppliedEventSequence + 1}`,
   });
   return Object.freeze({ decision: persisted.decision, state: next });
+}
+
+function humanIntegrationEffectResult(
+  state: Readonly<GraphExecutionState>,
+  nodeId: string,
+  resultRef: Readonly<ArtifactReference>,
+  timestamp: string,
+): GraphEvent {
+  const node = state.nodeStates[nodeId]!;
+  const effect = node.sideEffect;
+  if (node.status !== "waiting_human" || !effect || effect.status !== "intent_recorded" ||
+      effect.class !== "external" || effect.attempt !== node.attempts) {
+    throw new Error("BUILD human integration lacks its exact durable external-effect intent");
+  }
+  return {
+    schemaVersion: 1,
+    kind: "side-effect-result",
+    sequence: state.lastAppliedEventSequence + 1,
+    eventId: `build-human-effect-result-${state.lastAppliedEventSequence + 1}`,
+    requestRef: effect.requestRef,
+    checkpointRef: effect.checkpointRef,
+    runId: state.runId,
+    graphId: state.graphId,
+    graphVersion: state.graphVersion,
+    graphDigest: state.graphDigest,
+    planVersion: state.planVersion,
+    nodeId,
+    priorStatus: "waiting_human",
+    nextStatus: "waiting_human",
+    attempt: node.attempts,
+    timestamp,
+    artifactRefs: [],
+    sideEffect: {
+      phase: "result",
+      ordinal: effect.ordinal,
+      idempotencyKey: effect.idempotencyKey,
+      class: effect.class,
+      outcome: "succeeded",
+      resultRef,
+    },
+  };
+}
+
+function recoverHumanIntegrationEffectResult(
+  state: Readonly<GraphExecutionState>,
+  nodeId: string,
+  resultRef: Readonly<ArtifactReference>,
+): GraphExecutionState {
+  const node = state.nodeStates[nodeId];
+  const effect = node?.sideEffect;
+  if (node?.status !== "waiting_human" || effect?.status !== "succeeded" ||
+      effect.class !== "external" || effect.attempt !== node.attempts ||
+      !sameArtifactReference(effect.resultRef, resultRef)) {
+    throw new Error("BUILD human integration persisted external-effect result conflicts with trusted evidence");
+  }
+  return state as GraphExecutionState;
+}
+
+function sameArtifactReference(
+  left: Readonly<ArtifactReference> | undefined,
+  right: Readonly<ArtifactReference> | undefined,
+): boolean {
+  return left !== undefined && right !== undefined &&
+    left.planVersion === right.planVersion &&
+    left.nodeId === right.nodeId &&
+    left.contract === right.contract &&
+    left.path === right.path &&
+    left.sha256 === right.sha256 &&
+    left.sizeBytes === right.sizeBytes;
 }
 
 function captureSnapshot(
@@ -267,7 +380,12 @@ function captureSnapshot(
   state: Readonly<GraphExecutionState>,
   nodeId: string,
   attempt: number,
-  options: Readonly<{ owner: string; repositoryRoot: string; git: GitRunner; now(): string }>,
+  options: Readonly<{
+    owner: Readonly<GraphCheckpointLease>;
+    repositoryRoot: string;
+    git: GitRunner;
+    now(): string;
+  }>,
 ): HumanWaitSnapshot {
   const main = inspectMainWorkspace(options.repositoryRoot, options.git);
   const candidates = inspectCandidates(paths, compiled, state, options.git);
@@ -302,7 +420,7 @@ function persistDecision(
   snapshot: Readonly<HumanWaitSnapshot>,
   candidates: readonly Readonly<CandidateSnapshot>[],
   main: Readonly<MainWorkspaceInspection>,
-  options: Readonly<{ owner: string; now(): string }>,
+  options: Readonly<{ owner: Readonly<GraphCheckpointLease>; now(): string }>,
 ): PersistedDecision {
   const recordedAt = options.now();
   const selectedCandidateNodeIds = [...input.selectedCandidateNodeIds].sort(compare);

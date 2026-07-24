@@ -27,6 +27,7 @@ import {
   type BuildWorkspaceIdentity,
 } from "../core/buildExecution.js";
 import type { ArtifactReference } from "../core/scheduler.js";
+import type { GraphCheckpointLease } from "../runtime/graphCheckpoint.js";
 import {
   assertRunPathsSafe,
   ownsRunLease,
@@ -64,7 +65,7 @@ export interface BuildValidatedOutputsReceipt {
 }
 
 export interface BuildArtifactMutationOptions {
-  owner: string;
+  owner: Readonly<GraphCheckpointLease>;
   failAt?(point: "after-reservation" | "after-graph" | "after-markdown"): void;
 }
 
@@ -262,6 +263,28 @@ export function writeBuildNodeArtifact(
   });
 }
 
+/** Read one immutable BUILD node artifact through its exact persisted reference. */
+export function readBuildNodeArtifact(
+  paths: RunPaths,
+  reference: Readonly<ArtifactReference>,
+): Buffer {
+  assertRunPathsSafe(paths);
+  assertPositiveInteger(reference.planVersion, "BUILD node artifact plan version");
+  assertToken(reference.nodeId, "BUILD node artifact node id");
+  assertToken(reference.contract, "BUILD node artifact contract");
+  const prefix = `nodes/${reference.planVersion}/${reference.nodeId}/`;
+  if (!reference.path.startsWith(prefix) || reference.path.includes("\\") ||
+      reference.path.split("/").some((part) => part.length === 0 || part === "." || part === "..")) {
+    throw new Error("BUILD node artifact reference is outside its plan/node directory");
+  }
+  const path = join(paths.root, ...reference.path.split("/"));
+  const bytes = readBoundedBytes(paths.root, path, 64 * 1024 * 1024, "BUILD node artifact");
+  if (bytes.byteLength !== reference.sizeBytes || sha256(bytes) !== reference.sha256) {
+    throw new Error("BUILD node artifact does not match its immutable reference");
+  }
+  return bytes;
+}
+
 export function appendBuildDispatchCheckpoint(
   paths: RunPaths,
   checkpointValue: unknown,
@@ -418,6 +441,26 @@ export function sealBuildDispatchLedger(
     sizeBytes: Buffer.byteLength(bytes),
     outputArtifacts: artifactRefs,
   });
+}
+
+/** Read and verify a dispatch seal before binding it into another trusted checkpoint namespace. */
+export function readBuildDispatchSeal(
+  paths: RunPaths,
+  reference: Readonly<BuildDispatchSealReference>,
+): Buffer {
+  assertRunPathsSafe(paths);
+  assertPositiveInteger(reference.planVersion, "BUILD dispatch seal plan version");
+  assertToken(reference.nodeId, "BUILD dispatch seal node id");
+  if (reference.contract !== "build-dispatch-ledger" ||
+      reference.path !== `nodes/${reference.planVersion}/${reference.nodeId}/build-dispatch-seal.json`) {
+    throw new Error("BUILD dispatch seal reference is invalid");
+  }
+  const path = join(paths.root, ...reference.path.split("/"));
+  const bytes = readBoundedBytes(paths.root, path, MAX_MANIFEST_BYTES, "BUILD dispatch seal");
+  if (bytes.byteLength !== reference.sizeBytes || sha256(bytes) !== reference.sha256) {
+    throw new Error("BUILD dispatch seal does not match its immutable reference");
+  }
+  return bytes;
 }
 
 function validateBuildWorkspaceReceipts(
@@ -819,10 +862,11 @@ function buildLedgerPath(paths: RunPaths, planVersion: number, nodeId: string): 
   return join(buildNodeDirectory(paths, planVersion, nodeId), "build-dispatch.jsonl");
 }
 
-function assertMutationAuthority(paths: RunPaths, owner: string): void {
+function assertMutationAuthority(paths: RunPaths, owner: Readonly<GraphCheckpointLease>): void {
   assertRunPathsSafe(paths);
-  assertToken(owner, "BUILD artifact lease owner");
-  if (!ownsRunLease(paths, owner)) throw new Error(`BUILD artifact mutation requires current lifecycle lease owner ${owner}`);
+  if (!ownsRunLease(paths, owner)) {
+    throw new Error(`BUILD artifact mutation requires current lifecycle lease owner ${owner.owner}`);
+  }
 }
 
 function mkdirContained(root: string, directory: string): void {
