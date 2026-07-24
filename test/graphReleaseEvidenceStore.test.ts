@@ -87,12 +87,19 @@ describe("trusted graph release evidence", () => {
   it("verifies canonical artifact bytes and removes only the verified-artifact retirement blocker", () => {
     const fixture = writeReleaseFixture(makeTempDir());
 
-    expect(verifyFixture(fixture)).toEqual({
+    const assessment = verifyFixture(fixture);
+    expect(assessment).toMatchObject({
       eligible: true,
       missing: [],
       releaseVersion: fixture.releaseVersion,
       decision: "enable-sequential-graph",
+      releasedCompatibilityWindows: 1,
       artifactDigests: fixture.record.artifactDigests,
+    });
+    expect(assessment.report).toMatchObject({
+      qualityClaim: "observed-executions-only",
+      recommendedDecision: "enable-sequential-graph",
+      rolloutDecisionEligible: true,
     });
   });
 

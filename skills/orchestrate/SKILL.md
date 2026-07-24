@@ -19,6 +19,8 @@ When running inside Pi with the extension installed:
 
 Pi performs configured model switching and records routing evidence. Capability-shadow remains observational; capability mode activates ranking. The maker must not judge its own work.
 
+Graph execution uses a separate `execution.engine`. `graph-shadow` is the default and only checks compiled edges while reducer results remain active. A repository cannot promote graph mode or grant parallel writes; active graph execution and isolated mutation require trusted-user authority. Do not infer rollout readiness from synthetic tests.
+
 ## Cursor with MCP tools
 
 When `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, `orchestrator_run_recover`, and `orchestrator_run_cancel` are available:

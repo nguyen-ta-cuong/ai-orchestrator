@@ -3,7 +3,7 @@ import type { CompiledBuildPlan } from "../core/buildPlan.js";
 import type { BuildExecutionPolicy } from "../core/buildExecution.js";
 import type { ExecutionLimits } from "../core/scheduler.js";
 import type { GraphCheckpointLease } from "../runtime/graphCheckpoint.js";
-import { createPiBuildWorkerAdapter, type PiBuildModel, type PiNestedSessionFactory } from "../runtime/piBuildWorker.js";
+import type { PiBuildModel, PiNestedSessionFactory } from "../runtime/piBuildWorker.js";
 import type { RunPaths } from "./artifacts.js";
 import {
   runBuildCoordinator,
@@ -54,6 +54,9 @@ export interface ExecutePiBuildGraphLifecycleOptions {
 export async function executeBuildGraphLifecycle(
   options: Readonly<ExecutePiBuildGraphLifecycleOptions>,
 ): Promise<BuildCoordinatorResult> {
+  // Pi peers are optional for MCP/core consumers. Link the Pi-only worker only
+  // when a Pi BUILD graph is actually executed.
+  const { createPiBuildWorkerAdapter } = await import("../runtime/piBuildWorker.js");
   const maximumNodeTimeout = Math.max(...options.compiled.plan.nodes.map(({ timeoutMs }) => timeoutMs));
   const git = options.git ?? createLocalGitRunner({ timeoutMs: maximumNodeTimeout });
   const worker = createPiBuildWorkerAdapter({

@@ -27,7 +27,7 @@ How to read the canvas:
 
 - [Setup guide](docs/setup.md): install Pi or Cursor, configure trusted MCP providers/models, and verify the installation.
 - [User guide](docs/user-guide.md): run the fast path, durable lifecycle, routing operations, Cursor handoffs, recovery, and publication gates.
-- [Structured graph architecture](docs/graph-architecture.md): current state ownership, target graph canvases, artifact layouts, recovery levels, and the 0010–0017 migration sequence.
+- [Structured graph architecture](docs/graph-architecture.md): current state ownership, graph canvases, artifact layouts, recovery levels, and the 0010–0017 migration sequence.
 - [Configuration and trust boundaries](#configuration-and-trust-boundaries): complete routing/catalog reference and security model.
 - [Troubleshooting](#troubleshooting): common Pi, Cursor, MCP, routing, and recovery problems.
 - [Contributing](CONTRIBUTING.md): development workflow, architecture constraints, and validation requirements.
@@ -42,7 +42,7 @@ flowchart LR
     R -->|"durable or parallel"| L["Lifecycle graph around immutable BUILD DAGs"]
 ```
 
-The detailed [structured graph architecture](docs/graph-architecture.md) distinguishes today's reducer-owned control flow from the planned graph compiler, durable scheduler, BUILD DAG, stateful MCP, and versioned recovery work.
+The detailed [structured graph architecture](docs/graph-architecture.md) explains the shipped graph compiler, durable scheduler, BUILD DAG, stateful MCP authority, versioned recovery, and the evidence gates that keep active graph execution in shadow mode by default.
 
 Automated Pi and MCP surfaces use the same pure routing concepts: stage requirements, task features, capability profiles, pins/preferences, deny rules, cost-aware ranking, policy versions, and maker/checker separation. Cursor's instructions-only surface mirrors the gates and separation rules through manual handoffs but cannot enforce routing itself. The fast planner maps to `plan`; the fast judge maps to `fast-judge`, a combined verification/review policy. Existing loop state machines remain authoritative for counters and escalation.
 
@@ -52,7 +52,7 @@ The adapters intentionally differ where their hosts differ:
 | --- | --- | --- | --- |
 | Pi fast path | Discovers callable models from Pi's local registry and can switch Pi automatically | Keeps session-visible routing state | No durable lifecycle run directory |
 | Pi lifecycle | Discovers callable models from Pi and can switch every stage, including BUILD | Persists state, routing traces, and minimized evidence under the run directory | Pi ignores `mcp.providers` and `mcp.models` |
-| MCP | Calls planner/judge candidates from the trusted user `mcp.models` catalog through trusted user providers | Does not read project files or write run artifacts; returns routing metadata to the client | Cannot discover Pi or Cursor models and does not route Cursor's coder |
+| MCP | Calls planner/judge candidates from the trusted user `mcp.models` catalog through trusted user providers | Persists durable run authority in the trusted user store; an optional project mirror is status-only | Cannot discover Pi or Cursor models, inspect project source, or route Cursor's coder |
 | Cursor instructions | The user selects the Cursor model manually and records its identity | Cursor gathers repository context, diffs, tests, and optional run notes | Markdown cannot switch models or prove host availability |
 
 For MCP, Cursor supplies the task, repository context, diff, tests, loop counters, and coder identity. The server treats supplied text as untrusted data and does not inspect the repository.
@@ -238,8 +238,44 @@ Pi uses its own model registry and credentials and ignores `mcp.*`. MCP loads pr
 - Only trusted user configuration can select `routing.engine`, define profiles, or change scoring, unknown-cost, and evidence policy for MCP.
 - Project routing may set stage `prefer`/`pins`, add deny rules, require stronger separation, and lower limits/budgets/circuit-breaker thresholds. It cannot weaken user ceilings or expand the trusted catalog.
 - Project `roles.planner` and `roles.judge` are ignored by the MCP loader because repository input may not select models that receive user credentials. Built-in or trusted user roles remain compatible exact routes in `legacy` and `capability-shadow`.
+- Project execution policy cannot activate graph execution unless trusted user policy grants that authority, cannot raise trusted execution limits, and cannot create permission for parallel writes.
 - Prototype-pollution keys are dropped, lifecycle artifact paths must stay inside the project, user evidence paths must stay inside `~/.ai-orchestrator`, and provider URLs must use HTTPS.
 - An MCP API key may be a literal or an exact `$ENV_VAR` reference. `${VAR}` and other shell syntax are rejected; no shell expansion occurs.
+
+### Graph execution, routing, and rollback
+
+Graph execution has a separate engine from capability-based model routing:
+
+```json
+{
+  "execution": {
+    "engine": "graph-shadow",
+    "allowProjectGraph": false
+  }
+}
+```
+
+`execution.engine` accepts:
+
+| Engine | Transition authority | Intended use |
+| --- | --- | --- |
+| `legacy` | Pure workflow reducers only | Emergency compatibility rollback |
+| `graph-shadow` | Reducers remain active; compiled graph edges are checked and mismatches are reported | Fresh-install default and release evaluation |
+| `graph` | The graph runner executes the reducer-selected edge with ownership checks | Trusted-user opt-in only |
+
+The default remains `graph-shadow`. The implemented verifier fixtures prove the evidence policy, not product superiority: there is no real G0–G6 field corpus, paid-provider comparison, or released compatibility window in this repository. Consequently no legacy execution helper has been retired.
+
+Task routing is deterministic pure policy with three outputs: `fast`, `lifecycle-sequential`, and `lifecycle-dag`. Simple low-risk tasks stay on the bounded fast path. Durability, elevated risk, more than three expected steps, or independent branches require a lifecycle route. Parallel mutation still requires explicit trusted-user permission, worktree isolation, and independently verified disjoint write sets; repository configuration may only reduce authority.
+
+To activate graph execution directly, set `"engine": "graph"` in trusted user config. A repository request for graph mode is honored only when trusted user config also sets `allowProjectGraph: true`. For immediate rollback, restore `"engine": "graph-shadow"`; use `"legacy"` only when the shadow check itself must be disabled. A release rollback may instead install the previous package version and restore its reviewed config.
+
+Release evidence is local and privacy-minimal. Canonical records live under `~/.ai-orchestrator/graph-releases/<release-version>/`; accepted event fields exclude prompts, source, diffs, artifact text, credentials, endpoints, remotes, and personal paths. Verify a release and print the recomputed aggregate report with:
+
+```sh
+ai-orchestrator graph-rollout-report 1.2.3
+```
+
+Exit status is `0` only when the trusted release record proves every legacy-retirement requirement, `2` for a valid evidence-backed no-go, and `1` for invalid or missing evidence. The command reads fixed canonical files from the trusted user store, follows no caller-selected root, performs no network call, and never changes configuration.
 
 ### Trusted user MCP providers and model catalog
 
@@ -397,7 +433,8 @@ These are starting defaults, not model requirements:
 
 | Setting | Built-in default/preference |
 | --- | --- |
-| Routing engine | `capability-shadow` |
+| Model routing engine | `capability-shadow` |
+| Graph execution engine | `graph-shadow` |
 | Fast planner/judge roles | `anthropic/claude-fable-5`, `xhigh` |
 | Fast coder / lifecycle BUILD preference | `openai-codex/gpt-5.5`, `xhigh` |
 | Legacy lifecycle route preferences | Fable first for DEFINE/PLAN/SHIP; GPT-5.6 Sol first for VERIFY/REVIEW/DEBUG |
@@ -422,6 +459,7 @@ npm test
 npx tsc --noEmit
 npm run build
 npm pack --dry-run
+npm audit --omit=dev
 ```
 
 A source checkout must be built before running `bin/ai-orchestrator-mcp.js` directly.
@@ -455,6 +493,10 @@ Pass the exact Cursor coder identity as `provider/model` to both the `fast-judge
 ### Capability-shadow did not change the active model
 
 That is intentional. `capability-shadow` ranks only in previews while active calls keep exact legacy selection. Set `routing.engine` in trusted user config to `capability` to activate MCP catalog routing, or use `legacy` for rollback.
+
+### Graph-shadow did not change transition execution
+
+That is intentional. `execution.engine: "graph-shadow"` checks the compiled graph against the reducer-selected transition while the reducer result remains active. Graph execution requires a trusted-user `"engine": "graph"` setting. Do not promote because tests pass alone; use `ai-orchestrator graph-rollout-report <release-version>` and retain shadow mode unless canonical released evidence supports promotion.
 
 ### Cursor cannot connect or has no orchestrator tools
 

@@ -80,6 +80,8 @@ On interruption, restore the user's model and active tools but keep disk phase a
 
 For parallel features, create separate branch worktrees yourself; do not make multiple agents edit one checkout. Worktrees prevent file collisions but do not remove the need for human review.
 
+The execution engine remains `graph-shadow` by default. A lifecycle DAG does not itself authorize concurrent source mutation: trusted-user permission, worktree isolation, and verified-disjoint write-set receipts are all required. Repository policy may reduce execution authority but cannot expand it. Keep the legacy path until trusted released evidence proves a compatibility window and clean rollback.
+
 ## Without lifecycle tools
 
 When lifecycle commands or verdict tools are unavailable, reproduce the workflow manually:

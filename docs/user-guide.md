@@ -159,6 +159,43 @@ Pi maintains `budget.jsonl` independently of optional recommendation evidence, s
 
 Routing and evidence files contain bounded identities, policy/profile versions, task categories/features, typed failure reasons, usage/cost values (or `unknown`), and outcomes. They exclude prompts, source text, diffs, artifact text, credentials, request headers, and repository remotes.
 
+## Graph execution and rollout
+
+Workflow transition policy remains in the pure fast and lifecycle reducers. `execution.engine` controls how the compiled graph participates:
+
+- `legacy` runs the reducer without a graph check.
+- `graph-shadow` is the fresh-install default. It validates the reducer-selected transition against the compiled graph and records a sanitized mismatch, but returns the reducer result.
+- `graph` executes the validated edge through the graph runner and its ownership check.
+
+Graph mode is a trusted-user opt-in. Repository configuration cannot activate it unless trusted user policy sets `execution.allowProjectGraph: true`, cannot increase scheduler limits, and cannot grant parallel writes. Parallel mutation additionally needs trusted-user permission, worktree isolation, and verified-disjoint BUILD write-set receipts.
+
+The deterministic complexity policy selects `fast`, `lifecycle-sequential`, or `lifecycle-dag`. Short low-risk work stays on the bounded fast path. Durability, elevated risk, more than three expected steps, or independent branches require a lifecycle route. A DAG route does not imply concurrent mutation; unsafe, conflicting, or unverified writes run sequentially.
+
+### Evidence status and report command
+
+The current production decision is no-go: keep `graph-shadow` and keep the legacy path. The synthetic G0–G6 fixtures validate the reporter and release gates; they are not a real representative corpus, a paid-provider comparison, or a released compatibility window.
+
+Release evidence is local, allowlisted, and observed-only. It cannot contain prompts, source, diffs, artifacts, credentials, endpoints, remotes, error prose, or personal paths. A trusted release bundle lives at:
+
+```text
+~/.ai-orchestrator/graph-releases/<release-version>/
+  release-record.json
+  rollout-report.json
+  graph-coverage.json
+  clean-rollback.json
+  config-migration.json
+```
+
+After building a source checkout, or from an installed package, run:
+
+```sh
+ai-orchestrator graph-rollout-report <release-version>
+```
+
+The command recomputes aggregate metrics from the canonical manifest and event ledger, verifies artifact digests, coverage, rollback, config migration, and every claimed compatibility release, then prints JSON without raw events. It exits `0` only for a retirement-eligible release, `2` for valid evidence that still says no-go, and `1` when evidence is missing or invalid. It is read-only and has no caller-selectable evidence root.
+
+Rollback active graph execution by setting trusted user config to `"execution": { "engine": "graph-shadow" }`. Use `legacy` only if graph shadow checking must also be disabled. Package-level rollback installs the prior reviewed release and restores its reviewed config. Never delete the legacy path until at least one real released compatibility window verifies clean package/config rollback.
+
 ## Cursor with MCP
 
 The MCP server routes only its planner and checker calls. Cursor's selected host model remains the coder. Prefer the durable run tools:

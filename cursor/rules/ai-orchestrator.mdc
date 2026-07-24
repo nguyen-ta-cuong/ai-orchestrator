@@ -22,6 +22,8 @@ Use this path when the `orchestrator_run_*` tools are available.
 
 The user-owned durable store, not Cursor notes or client-supplied counters, is run authority. Cursor remains the coder; MCP routes only its planner/checker calls. The stateless `orchestrator_plan` and `orchestrator_judge` tools remain available only for compatibility. Routing metadata never permits skipping approval or publication gates.
 
+Graph execution is independently release-gated. Fresh installs remain on `execution.engine: "graph-shadow"`; repository input cannot promote graph authority or grant parallel writes. Treat synthetic graph tests as verifier coverage, not field evidence, and keep the compatibility path until a trusted release report proves a real compatibility window and clean rollback.
+
 ## Without orchestrator MCP tools
 
 Follow `.cursor/skills/orchestrate/SKILL.md` section **Without orchestrator tools**. Produce and approve a plan, record each manually selected Cursor model identity, implement with a coding-capable maker, manually switch to an independent checker for diff review, and use the configured loop caps. If an independent checker is unavailable under strict policy, fail closed. A named model may be a configured preference or example, never a universal requirement.

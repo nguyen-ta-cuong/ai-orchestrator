@@ -17,6 +17,7 @@ import {
   buildGraphEvidenceReport,
   validateGraphExperimentManifest,
   type GraphEvidenceEvent,
+  type GraphEvidenceReport,
   type GraphExperimentManifest,
   type GraphRolloutDecision,
   type LegacyRetirementAssessment,
@@ -101,6 +102,9 @@ export interface VerifyGraphReleaseRecordInput {
 export interface VerifiedGraphReleaseAssessment extends LegacyRetirementAssessment {
   releaseVersion: string;
   decision: GraphRolloutDecision;
+  releasedCompatibilityWindows: number;
+  /** Recomputed from the canonical manifest and event ledger; raw events are never returned. */
+  report: Readonly<GraphEvidenceReport>;
   artifactDigests: Readonly<GraphReleaseArtifactDigests>;
 }
 
@@ -241,6 +245,8 @@ export function verifyGraphReleaseRecord(
       missing,
       releaseVersion: record.releaseVersion,
       decision: rolloutDecision.decision,
+      releasedCompatibilityWindows: record.releasedCompatibilityWindows,
+      report: rolloutDecision.report,
       artifactDigests: Object.freeze({ ...record.artifactDigests }),
     });
   } catch (error) {
@@ -441,7 +447,7 @@ function validateReleaseRecord(value: unknown, expectedRelease: string): GraphRe
 function validateRolloutArtifact(
   value: unknown,
   releaseVersion: string,
-): { decision: GraphRolloutDecision; graphVersion: string } {
+): { decision: GraphRolloutDecision; graphVersion: string; report: Readonly<GraphEvidenceReport> } {
   const record = exactRecord(value, [
     "schemaVersion", "kind", "releaseVersion", "decision", "experimentManifest", "events",
   ]);
@@ -468,7 +474,11 @@ function validateRolloutArtifact(
   }
   const graphVersions = Object.keys(report.totals.graphVersions);
   if (graphVersions.length !== 1) invalidArtifact();
-  return { decision: record.decision as GraphRolloutDecision, graphVersion: graphVersions[0]! };
+  return {
+    decision: record.decision as GraphRolloutDecision,
+    graphVersion: graphVersions[0]!,
+    report: Object.freeze(report),
+  };
 }
 
 function validateCoverageArtifact(value: unknown, releaseVersion: string, graphVersion: string): void {
