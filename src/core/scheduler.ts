@@ -1148,7 +1148,7 @@ function assertPersistedSideEffect(
   if (sideEffect.status === "succeeded" && !node.succeededSideEffectKeys.includes(sideEffect.idempotencyKey)) {
     throw new Error(`Successful side-effect key is not indexed for ${node.nodeId}`);
   }
-  if (sideEffect.resultRef) assertEvidenceArtifactReference(node.planVersion, node.nodeId, sideEffect.resultRef);
+  if (sideEffect.resultRef) assertSideEffectArtifactReference(node.planVersion, node.nodeId, sideEffect.resultRef);
   if (node.idempotencyKey !== sideEffect.idempotencyKey) throw new Error(`Node ${node.nodeId} idempotency key does not match side-effect state`);
 }
 
@@ -1372,7 +1372,7 @@ function assertEventIdentity(state: Readonly<GraphExecutionState>, event: Readon
 
 function assertEventArtifacts(graph: CompiledGraph, event: Readonly<GraphEvent>): void {
   for (const reference of event.artifactRefs) assertArtifactReference(graph, event.planVersion, event.nodeId, reference);
-  if (event.sideEffect?.resultRef) assertEvidenceArtifactReference(event.planVersion, event.nodeId, event.sideEffect.resultRef);
+  if (event.sideEffect?.resultRef) assertSideEffectArtifactReference(event.planVersion, event.nodeId, event.sideEffect.resultRef);
   if (event.checkpointRef) assertGraphCheckpointRefShape(event.checkpointRef);
   if (event.activationRef) assertEvidenceArtifactReference(event.nextPlanVersion!, event.nodeId, event.activationRef);
 }
@@ -1430,6 +1430,24 @@ function assertEvidenceArtifactReference(
   const expectedDirectory = `nodes/${planVersion}/${nodeId}/`;
   if (!reference.path.startsWith(expectedDirectory)) {
     throw new Error(`Artifact reference must remain inside node artifact directory ${expectedDirectory}`);
+  }
+}
+
+/** Side-effect receipts are control-plane evidence, not business output
+ * contracts. They remain content-addressed and confined to the exact node
+ * artifact directory without impersonating one of the node's declarations. */
+function assertSideEffectArtifactReference(
+  planVersion: number,
+  nodeId: string,
+  reference: Readonly<ArtifactReference>,
+): void {
+  assertArtifactReferenceShape(reference);
+  if (reference.planVersion !== planVersion || reference.nodeId !== nodeId) {
+    throw new Error("Side-effect artifact reference does not match its node");
+  }
+  const expectedDirectory = `nodes/${planVersion}/${nodeId}/`;
+  if (!reference.path.startsWith(expectedDirectory)) {
+    throw new Error(`Side-effect artifact reference must remain inside ${expectedDirectory}`);
   }
 }
 
