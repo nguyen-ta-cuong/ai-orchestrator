@@ -13,3 +13,4 @@ export * from "./core/routingEvidence.js";
 export * from "./core/taskFeatures.js";
 export * from "./core/tests.js";
 export * from "./core/workflowGraphs.js";
+export * from "./lifecycle/graphReleaseEvidenceStore.js";
