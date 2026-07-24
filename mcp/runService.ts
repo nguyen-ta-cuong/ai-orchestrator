@@ -10,12 +10,18 @@ import {
 import { compileGraph, type CompiledGraph, type GraphDefinition } from "../src/core/graph.js";
 import {
   applyRecoveryDecisionToLedger,
+  applyRecoverySuccessorEventToLedger,
   createRecoveryLedger,
   fingerprintFailure,
   registerRecovery,
+  validateRecoveryDirective,
   validateRecoveryLedger,
+  type FailureCategory,
   type FailureEvidence,
+  type RecoveryDecision,
+  type RecoveryDirective,
   type RecoveryLedger,
+  type RecoveryState,
 } from "../src/core/recovery.js";
 import {
   createSchedulerRecoveryBinding,
@@ -71,6 +77,17 @@ const judgeProviderResultSchema = z.discriminatedUnion("verdict", [
   mcpRunApproveVerdictSchema.extend({ routing: mcpRunJudgeRoutingDecisionSchema }).strict(),
   mcpRunRejectVerdictSchema.extend({ routing: mcpRunJudgeRoutingDecisionSchema }).strict(),
 ]);
+const diagnosisProviderResultSchema = z.object({
+  diagnosis: z.object({
+    rootCauseCategory: z.string(),
+    confidence: z.enum(["low", "medium", "high"]),
+    summary: z.string().trim().min(1).max(50_000),
+    repairScope: z.array(z.string()).max(256),
+    validationRequirements: z.array(z.string()).max(256),
+    topologyAssessment: z.enum(["preserve", "structural"]),
+  }).strict(),
+  routing: mcpRunJudgeRoutingDecisionSchema,
+}).strict();
 
 const preflightResultSchema = z.object({
   coderFamily: z.string().trim().min(1).max(500).optional(),
@@ -142,7 +159,7 @@ class ProviderCheckpointError extends Error {
 
 export interface ProviderEffectBase {
   effectId: string;
-  kind: "plan" | "judge";
+  kind: "plan" | "judge" | "debug";
   ordinal: number;
 }
 
@@ -150,27 +167,27 @@ const providerAttemptEvidenceSchema = z.discriminatedUnion("phase", [
   providerAttemptReservationSchema.extend({
     phase: z.literal("failed"),
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
-    kind: z.enum(["plan", "judge"]),
+    kind: z.enum(["plan", "judge", "debug"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     failureCode: z.enum(MCP_PROVIDER_DEFINITE_FAILURE_CODES),
   }).strict(),
   providerAttemptReservationSchema.extend({
     phase: z.literal("unknown"),
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
-    kind: z.enum(["plan", "judge"]),
+    kind: z.enum(["plan", "judge", "debug"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     failureCode: z.enum(MCP_PROVIDER_UNCERTAIN_FAILURE_CODES),
   }).strict(),
   providerAttemptReservationSchema.extend({
     phase: z.enum(["awaiting_output_commit", "discarded"]),
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
-    kind: z.enum(["plan", "judge"]),
+    kind: z.enum(["plan", "judge", "debug"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   }).strict(),
   providerAttemptReservationSchema.extend({
     phase: z.literal("output_committed"),
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
-    kind: z.enum(["plan", "judge"]),
+    kind: z.enum(["plan", "judge", "debug"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     resultRef: artifactReferenceSchema,
   }).strict(),
@@ -219,6 +236,20 @@ export interface McpRunJudgeRequest {
   afterAttempt: (result: RoutedCompletionAttemptResult) => void | Promise<void>;
 }
 
+export interface McpRunDiagnosisRequest {
+  task: string;
+  plan: string;
+  failureFingerprint: string;
+  observedCategory: FailureCategory;
+  evidenceRefs: readonly string[];
+  lastVerdict?: JudgeReport;
+  coderIdentity: string;
+  taskFeatures?: McpRunStartInput["taskFeatures"];
+  signal?: AbortSignal;
+  beforeAttempt: (attempt: RoutedCompletionAttempt) => void | Promise<void>;
+  afterAttempt: (result: RoutedCompletionAttemptResult) => void | Promise<void>;
+}
+
 export interface McpRunProvider {
   /**
    * Resolve trusted checker eligibility without a provider/network call.
@@ -230,6 +261,17 @@ export interface McpRunProvider {
   };
   plan(input: McpRunPlanRequest): Promise<{ plan: string; routing: PlanRoutingDecision }>;
   judge(input: McpRunJudgeRequest): Promise<RunVerdict & { routing: JudgeRoutingDecision }>;
+  diagnose?(input: McpRunDiagnosisRequest): Promise<{
+    diagnosis: {
+      rootCauseCategory: FailureCategory;
+      confidence: RecoveryDirective["confidence"];
+      summary: string;
+      repairScope: string[];
+      validationRequirements: string[];
+      topologyAssessment: RecoveryDirective["topologyAssessment"];
+    };
+    routing: JudgeRoutingDecision;
+  }>;
 }
 
 /**
@@ -267,8 +309,19 @@ export interface McpRunRecord {
 export interface McpRunRecoveryEnvelope {
   version: 1;
   binding: Readonly<SchedulerRecoveryBinding>;
+  occurrenceBindings: readonly Readonly<SchedulerRecoveryBinding>[];
   ledger: Readonly<RecoveryLedger>;
   artifacts: readonly Readonly<RecoveryArtifactBinding>[];
+  executionHistory: readonly Readonly<NonNullable<McpRunRecoveryEnvelope["execution"]>>[];
+  execution?: Readonly<{
+    version: 1;
+    failureFingerprint: string;
+    action: "retry" | "repair";
+    status: "awaiting-client" | "executing-provider" | "completed";
+    providerKind?: "plan" | "judge";
+    requestRef?: string;
+    resultRef?: Readonly<ArtifactReference>;
+  }>;
 }
 
 export interface McpRunRecoveryContext {
@@ -327,7 +380,7 @@ export interface McpRunProviderOutput {
   runId: string;
   effect: ProviderEffectBase;
   attempt: ProviderAttemptReservation;
-  contract: "mcp-plan-output-v1" | "mcp-judge-output-v1";
+  contract: "mcp-plan-output-v1" | "mcp-judge-output-v1" | "mcp-debug-output-v1";
   bytes: Uint8Array;
 }
 
@@ -415,6 +468,7 @@ const stateSchema = z.object({
     requiredFixes: z.string().max(50_000).optional(),
   }).strict()).max(Number.MAX_SAFE_INTEGER),
   yolo: z.boolean(),
+  pendingProviderRetry: z.enum(["plan", "judge"]).optional(),
   originalModel: z.object({
     provider: z.string(),
     id: z.string(),
@@ -428,10 +482,10 @@ const runVerdictSchema = z.discriminatedUnion("verdict", [
 ]);
 
 const providerEffectSchema = z.discriminatedUnion("phase", [
-  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge"]), ordinal: z.number().int().min(1), phase: z.literal("prepared") }).strict(),
-  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge"]), ordinal: z.number().int().min(1), phase: z.literal("attempting"), attempt: providerAttemptReservationSchema }).strict(),
-  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge"]), ordinal: z.number().int().min(1), phase: z.literal("attempted"), result: providerNonSuccessAttemptResultSchema }).strict(),
-  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge"]), ordinal: z.number().int().min(1), phase: z.literal("awaiting_output_commit"), attempt: providerAttemptReservationSchema }).strict(),
+  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge", "debug"]), ordinal: z.number().int().min(1), phase: z.literal("prepared") }).strict(),
+  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge", "debug"]), ordinal: z.number().int().min(1), phase: z.literal("attempting"), attempt: providerAttemptReservationSchema }).strict(),
+  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge", "debug"]), ordinal: z.number().int().min(1), phase: z.literal("attempted"), result: providerNonSuccessAttemptResultSchema }).strict(),
+  z.object({ effectId: z.string().regex(/^[a-f0-9]{64}$/), kind: z.enum(["plan", "judge", "debug"]), ordinal: z.number().int().min(1), phase: z.literal("awaiting_output_commit"), attempt: providerAttemptReservationSchema }).strict(),
 ]);
 
 const mutationEffectSchema = z.discriminatedUnion("operation", [
@@ -483,7 +537,7 @@ const runRecordSchema = z.object({
   providerAttempts: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   providerEffects: z.array(z.object({
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
-    kind: z.enum(["plan", "judge"]),
+    kind: z.enum(["plan", "judge", "debug"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   }).strict()).max(MCP_RUN_ROUTING_MAX),
   providerEvidence: z.array(providerAttemptEvidenceSchema).max(MCP_RUN_ROUTING_MAX),
@@ -493,7 +547,7 @@ const runRecordSchema = z.object({
   cancelledCheckpoint: stateSchema.optional(),
   abandonedProviderAttempt: z.object({
     effectId: z.string().regex(/^[a-f0-9]{64}$/),
-    kind: z.enum(["plan", "judge"]),
+    kind: z.enum(["plan", "judge", "debug"]),
     ordinal: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     attempt: providerAttemptReservationSchema,
   }).strict().optional(),
@@ -546,12 +600,43 @@ export function validateMcpRunRecoveryEnvelope(value: unknown): McpRunRecoveryEn
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (stableJson(keys) !== stableJson(["artifacts", "binding", "ledger", "version"])) {
+  const expectedKeys = [
+    "artifacts",
+    "binding",
+    "executionHistory",
+    "ledger",
+    "occurrenceBindings",
+    "version",
+    ...(record.execution === undefined ? [] : ["execution"]),
+  ].sort();
+  if (stableJson(keys) !== stableJson(expectedKeys)) {
     throw new Error("MCP recovery envelope has unexpected or missing fields");
   }
   if (record.version !== 1) throw new Error("MCP recovery envelope version must be 1");
   const binding = validateSchedulerRecoveryBinding(record.binding);
   const ledger = validateRecoveryLedger(record.ledger, binding.authority);
+  if (!Array.isArray(record.occurrenceBindings) ||
+      Object.keys(record.occurrenceBindings).length !== record.occurrenceBindings.length ||
+      record.occurrenceBindings.length < 1 ||
+      record.occurrenceBindings.length > binding.authority.limits.maxEntries) {
+    throw new Error("MCP recovery occurrence bindings must be a bounded non-empty dense array");
+  }
+  const occurrenceBindings = record.occurrenceBindings.map(validateSchedulerRecoveryBinding);
+  if (stableJson(occurrenceBindings[0]) !== stableJson(binding) ||
+      occurrenceBindings.some((candidate) =>
+        stableJson(candidate.authority) !== stableJson(binding.authority))) {
+    throw new Error("MCP recovery occurrences must retain their genesis ledger authority");
+  }
+  for (let index = 1; index < occurrenceBindings.length; index += 1) {
+    if (occurrenceBindings[index]!.anchor.schedulerRevision <=
+        occurrenceBindings[index - 1]!.anchor.schedulerRevision) {
+      throw new Error("MCP recovery occurrence anchors must advance monotonically");
+    }
+  }
+  const registrations = ledger.records.filter((candidate) => candidate.kind === "registration");
+  if (registrations.length !== occurrenceBindings.length) {
+    throw new Error("MCP recovery occurrences do not match ledger registrations");
+  }
   if (!Array.isArray(record.artifacts) || Object.keys(record.artifacts).length !== record.artifacts.length ||
       record.artifacts.length > 4_096) {
     throw new Error("MCP recovery artifacts must be a bounded dense array");
@@ -560,12 +645,101 @@ export function validateMcpRunRecoveryEnvelope(value: unknown): McpRunRecoveryEn
   if (new Set(artifacts.map(({ semanticRef }) => semanticRef)).size !== artifacts.length) {
     throw new Error("MCP recovery artifact references must be unique");
   }
+  const execution = record.execution === undefined
+    ? undefined
+    : validateMcpRecoveryExecution(record.execution);
+  if (!Array.isArray(record.executionHistory) ||
+      Object.keys(record.executionHistory).length !== record.executionHistory.length ||
+      record.executionHistory.length > occurrenceBindings.length) {
+    throw new Error("MCP recovery execution history must be a bounded dense array");
+  }
+  const executionHistory = record.executionHistory.map(validateMcpRecoveryExecution);
+  if (executionHistory.some((candidate) => candidate.status !== "completed") ||
+      new Set(executionHistory.map(({ failureFingerprint }) => failureFingerprint)).size !==
+        executionHistory.length) {
+    throw new Error("MCP recovery execution history accepts unique completed actions only");
+  }
+  for (const historical of executionHistory) {
+    assertMcpRecoveryExecutionMatchesLedger(historical, ledger);
+  }
+  if (execution) {
+    assertMcpRecoveryExecutionMatchesLedger(execution, ledger);
+    if (executionHistory.some(({ failureFingerprint }) =>
+      failureFingerprint === execution.failureFingerprint)) {
+      throw new Error("MCP recovery current execution duplicates its immutable history");
+    }
+  }
   return Object.freeze({
     version: 1,
     binding,
+    occurrenceBindings: Object.freeze(occurrenceBindings),
     ledger,
     artifacts: Object.freeze(artifacts),
+    executionHistory: Object.freeze(executionHistory),
+    ...(execution === undefined ? {} : { execution }),
   });
+}
+
+function assertMcpRecoveryExecutionMatchesLedger(
+  execution: NonNullable<McpRunRecoveryEnvelope["execution"]>,
+  ledger: RecoveryLedger,
+): void {
+  const matching = [...ledger.records].reverse().find((candidate) =>
+    candidate.kind === "decision" && candidate.fingerprint === execution.failureFingerprint);
+  if (!matching || matching.kind !== "decision" || matching.decision.action !== execution.action ||
+      matching.state.status !== "released") {
+    throw new Error("MCP recovery execution lacks its released ledger decision");
+  }
+}
+
+function validateMcpRecoveryExecution(value: unknown): NonNullable<McpRunRecoveryEnvelope["execution"]> {
+  assertCanonicalJsonData(value, "MCP recovery execution");
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("MCP recovery execution must be a plain object");
+  }
+  const record = value as Record<string, unknown>;
+  const expected = [
+    "version", "failureFingerprint", "action", "status",
+    ...(record.providerKind === undefined ? [] : ["providerKind"]),
+    ...(record.requestRef === undefined ? [] : ["requestRef"]),
+    ...(record.resultRef === undefined ? [] : ["resultRef"]),
+  ].sort();
+  if (stableJson(Object.keys(record).sort()) !== stableJson(expected) ||
+      record.version !== 1 ||
+      typeof record.failureFingerprint !== "string" ||
+      !/^[a-f0-9]{64}$/.test(record.failureFingerprint) ||
+      (record.action !== "retry" && record.action !== "repair") ||
+      (record.status !== "awaiting-client" && record.status !== "executing-provider" &&
+        record.status !== "completed") ||
+      (record.providerKind !== undefined && record.providerKind !== "plan" && record.providerKind !== "judge") ||
+      (record.requestRef !== undefined && (typeof record.requestRef !== "string" || !/^[a-f0-9]{64}$/.test(record.requestRef)))) {
+    throw new Error("MCP recovery execution identity is invalid");
+  }
+  if (record.action === "repair" && record.providerKind !== undefined) {
+    throw new Error("MCP recovery repair cannot carry a provider retry kind");
+  }
+  if (record.action === "retry" && record.providerKind !== "plan" && record.providerKind !== "judge") {
+    throw new Error("MCP recovery retry requires its exact provider kind");
+  }
+  const resultRef = record.resultRef === undefined
+    ? undefined
+    : artifactReferenceSchema.parse(record.resultRef);
+  if (record.status === "completed" && (record.requestRef === undefined || resultRef === undefined)) {
+    throw new Error("Completed MCP recovery execution requires request and result evidence");
+  }
+  if ((record.status === "awaiting-client" || record.status === "executing-provider") &&
+      (record.requestRef !== undefined || resultRef !== undefined)) {
+    throw new Error("Incomplete MCP recovery execution cannot contain completion evidence");
+  }
+  return Object.freeze({
+    version: 1,
+    failureFingerprint: record.failureFingerprint,
+    action: record.action,
+    status: record.status,
+    ...(record.providerKind === undefined ? {} : { providerKind: record.providerKind }),
+    ...(record.requestRef === undefined ? {} : { requestRef: record.requestRef }),
+    ...(resultRef === undefined ? {} : { resultRef }),
+  } as NonNullable<McpRunRecoveryEnvelope["execution"]>);
 }
 
 export interface CreateMcpRunServiceOptions {
@@ -692,7 +866,10 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
           return conflictResponse(current, input.expectedRevision);
         }
         if (current.pendingProviderIntent && input.event.type !== "cancelled") return responseFor(current, "current");
-        if (current.recovery !== undefined && input.event.type !== "cancelled") return responseFor(current, "current");
+        if (current.recovery !== undefined && input.event.type !== "cancelled" &&
+            !recoveryPermitsClientEvent(current, input.event.type)) {
+          return responseFor(current, "current");
+        }
         if (input.event.type === "cancelled") assertCancellable(current);
         else assertMutable(current);
 
@@ -727,7 +904,7 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
       });
     },
 
-    recover: async (unparsed) => {
+    recover: async (unparsed, signal) => {
       const input = mcpRunRecoverInputSchema.parse(unparsed);
       const identity = requestIdentity("recover", input.requestId, input);
       return options.repository.withRunLease(input.runId, async (transaction) => {
@@ -741,7 +918,7 @@ export function createMcpRunService(options: CreateMcpRunServiceOptions): McpRun
         if (current.status === "done" || current.status === "cancelled") {
           throw new Error(`Recovery cannot mutate terminal run status ${current.status}`);
         }
-        return classifyMcpRunRecovery(transaction, current, identity);
+        return classifyMcpRunRecovery(transaction, current, identity, options, signal);
       });
     },
   };
@@ -757,6 +934,8 @@ async function classifyMcpRunRecovery(
   transaction: McpRunTransaction,
   current: McpRunRecord,
   identity: RequestIdentity,
+  options: CreateMcpRunServiceOptions,
+  signal?: AbortSignal,
 ): Promise<McpRunResponse> {
   if (!current.state.plan) throw new Error("Recovery requires an authenticated approved-plan artifact");
   if (!transaction.getRecoveryContext || !transaction.writeRecoveryArtifact) {
@@ -767,13 +946,37 @@ async function classifyMcpRunRecovery(
   const existingEnvelope = current.recovery === undefined
     ? undefined
     : validateMcpRunRecoveryEnvelope(current.recovery);
-  const binding = existingEnvelope?.binding ?? createSchedulerRecoveryBinding(graph, context.schedulerState, {
+  if (existingEnvelope?.execution !== undefined &&
+      existingEnvelope.execution.status !== "completed") {
+    throw new Error("The latest closed failure is already registered and its recovery action is awaiting execution");
+  }
+  if (existingEnvelope !== undefined) {
+    const priorResponse = recoveryResponseFor(existingEnvelope);
+    const priorState = recoveryStateFor(existingEnvelope, priorResponse.failureFingerprint);
+    if (priorState.status !== "released") {
+      throw new Error(`The latest recovery occurrence remains ${priorState.status}`);
+    }
+  }
+  const binding = createSchedulerRecoveryBinding(graph, context.schedulerState, {
     nodeId: context.graphDefinition.entry,
     activePlanVersion: current.planVersion,
     activePlanHash: currentPlanArtifactHash(current),
+    ...(existingEnvelope === undefined ? {} : { ledgerAuthority: existingEnvelope.binding.authority }),
   });
   const failure = deriveMcpRunFailureEvidence(graph, binding, current);
-  let envelope = existingEnvelope ?? await createInitialRecoveryEnvelope(transaction, current, context, binding);
+  let envelope: McpRunRecoveryEnvelope;
+  if (existingEnvelope === undefined) {
+    envelope = await createInitialRecoveryEnvelope(transaction, current, context, binding);
+  } else {
+    const { execution, ...prior } = existingEnvelope;
+    envelope = {
+      ...prior,
+      occurrenceBindings: [...existingEnvelope.occurrenceBindings, binding],
+      executionHistory: execution?.status === "completed"
+        ? [...existingEnvelope.executionHistory, execution]
+        : existingEnvelope.executionHistory,
+    };
+  }
   const fingerprint = fingerprintFailure(failure);
   if (envelope.ledger.records.some((record) =>
     record.kind === "registration" && record.state.fingerprint === fingerprint)) {
@@ -793,14 +996,446 @@ async function classifyMcpRunRecovery(
       undefined,
     ),
   };
+  const state = recoveryStateFor(envelope, fingerprint);
+  const decision = recoveryDecisionFor(envelope, fingerprint);
+  if (state.status === "waiting-diagnosis" && decision.reason === "diagnosis-required" &&
+      options.provider.diagnose) {
+    return diagnoseMcpRunRecovery(
+      transaction,
+      current,
+      identity,
+      options,
+      envelope,
+      failure,
+      signal,
+    );
+  }
+  const directed = recoveryDirectedState(current, decision, latestFailedProviderKind(current));
+  const execution = executionForRecoveryDecision(decision, latestFailedProviderKind(current));
+  if (decision.action === "retry" && execution?.providerKind === "plan") {
+    return executeMcpRecoveryPlanRetry(
+      transaction,
+      current,
+      identity,
+      options,
+      envelope,
+      directed,
+      {
+        ...execution,
+        status: "executing-provider",
+      },
+      signal,
+    );
+  }
   const committed = await compareAndSwapValidated(
     transaction,
     current.revision,
-    draftFrom(current, { recovery: envelope }),
+    draftFrom(current, {
+      recovery: {
+        ...envelope,
+        ...(execution === undefined ? {} : { execution }),
+      },
+      state: directed,
+      status: statusFor(directed),
+      terminalMessage: directed.phase === "failed"
+        ? "Recovery authority rejected further execution."
+        : undefined,
+    }),
     settledRequest(identity, "advanced"),
     "advanced",
   );
   return responseFor(requireCommitted(committed, "persisting recovery decision"), "advanced");
+}
+
+async function executeMcpRecoveryPlanRetry(
+  transaction: McpRunTransaction,
+  current: McpRunRecord,
+  identity: RequestIdentity,
+  options: CreateMcpRunServiceOptions,
+  envelopeValue: McpRunRecoveryEnvelope,
+  directed: OrchestratorState,
+  execution: NonNullable<McpRunRecoveryEnvelope["execution"]>,
+  signal?: AbortSignal,
+): Promise<McpRunResponse> {
+  if (!current.state.plan || execution.action !== "retry" ||
+      execution.providerKind !== "plan" || execution.status !== "executing-provider") {
+    throw new Error("MCP PLAN retry lacks an immutable current plan and exact retry authority");
+  }
+  assertRoutingCapacity(current);
+  const envelope = validateMcpRunRecoveryEnvelope({
+    ...envelopeValue,
+    execution,
+  });
+  const effect = allocateProviderEffect(current, "plan");
+  const reserved = await compareAndSwapValidated(
+    transaction,
+    current.revision,
+    draftFrom(current, {
+      recovery: envelope,
+      state: directed,
+      status: statusFor(directed),
+      pendingProviderIntent: true,
+      providerEffects: [...current.providerEffects, providerEffectBase(effect)],
+      nextProviderEffectOrdinal: effect.ordinal + 1,
+    }),
+    pendingRequest(identity, effect),
+    "current",
+  );
+  const intent = requireCommitted(reserved, "reserving recovery PLAN retry intent");
+  const tracker = providerAttemptTracker(transaction, intent, identity, effect, [effect.effectId]);
+  const providerResult = await callPlanProvider(options.provider, planRequest(intent, tracker, {
+    previousPlan: current.state.plan,
+    userFeedback: stableJson({
+      version: 1,
+      kind: "recovery-plan-retry",
+      failureFingerprint: execution.failureFingerprint,
+      invariant: "preserve-immutable-plan",
+    }),
+    judgeReports: current.state.judgeReports,
+    signal,
+  }));
+  if (!providerResult.ok || !tracker.canCommitReturnedResult()) {
+    return settleOrBlockProviderFailure(transaction, tracker, identity, "advanced");
+  }
+  const completion = providerResult.value;
+  const providerCheckpoint = tracker.current();
+  if (!tracker.routingMatches(completion.routing) || completion.plan !== current.state.plan) {
+    return settleProviderFailure(transaction, providerCheckpoint, identity, "advanced");
+  }
+  await options.afterProviderResult?.({ runId: current.runId, effect });
+  const resultRef = await writeProviderOutput(
+    transaction,
+    providerCheckpoint,
+    effect,
+    "mcp-plan-output-v1",
+    Buffer.from(completion.plan, "utf8"),
+  );
+  const withPlan = nextPhase(
+    providerCheckpoint.state,
+    { type: "plan_produced", plan: completion.plan },
+    providerCheckpoint.loop,
+  );
+  const completedRecovery = validateMcpRunRecoveryEnvelope({
+    ...envelope,
+    execution: {
+      ...execution,
+      status: "completed",
+      requestRef: identity.requestRef,
+      resultRef,
+    },
+  });
+  const committed = await compareAndSwapValidated(
+    transaction,
+    providerCheckpoint.revision,
+    draftFrom(providerCheckpoint, {
+      recovery: completedRecovery,
+      state: withPlan,
+      status: "active",
+      routing: [...providerCheckpoint.routing, completion.routing],
+      providerEvidence: markProviderOutput(
+        providerCheckpoint.providerEvidence,
+        effect,
+        "output_committed",
+        resultRef,
+      ),
+      pendingProviderIntent: false,
+    }),
+    settledRequestFor(providerCheckpoint, identity, "advanced"),
+    "advanced",
+  );
+  return responseFor(requireCommitted(committed, "settling recovery PLAN retry"), "advanced");
+}
+
+async function diagnoseMcpRunRecovery(
+  transaction: McpRunTransaction,
+  current: McpRunRecord,
+  identity: RequestIdentity,
+  options: CreateMcpRunServiceOptions,
+  envelopeValue: McpRunRecoveryEnvelope,
+  failure: FailureEvidence,
+  signal?: AbortSignal,
+): Promise<McpRunResponse> {
+  if (!current.state.plan || !options.provider.diagnose || !transaction.writeRecoveryArtifact) {
+    throw new Error("MCP DEBUG diagnosis execution is unavailable");
+  }
+  assertRoutingCapacity(current);
+  const envelope = validateMcpRunRecoveryEnvelope(envelopeValue);
+  const fingerprint = fingerprintFailure(failure);
+  const effect = allocateProviderEffect(current, "debug");
+  const reserved = await compareAndSwapValidated(
+    transaction,
+    current.revision,
+    draftFrom(current, {
+      recovery: envelope,
+      pendingProviderIntent: true,
+      providerEffects: [...current.providerEffects, providerEffectBase(effect)],
+      nextProviderEffectOrdinal: effect.ordinal + 1,
+    }),
+    pendingRequest(identity, effect),
+    "current",
+  );
+  const intent = requireCommitted(reserved, "reserving DEBUG diagnosis intent");
+  const tracker = providerAttemptTracker(transaction, intent, identity, effect, [effect.effectId]);
+  const evidenceRefs = [`plan-versions/${current.planVersion}/plan.md`];
+  const providerResult = await callDiagnosisProvider(options.provider, {
+    task: intent.state.task,
+    plan: intent.state.plan!,
+    failureFingerprint: fingerprint,
+    observedCategory: failure.category,
+    evidenceRefs,
+    ...(intent.lastVerdict === undefined ? {} : { lastVerdict: structuredClone(intent.lastVerdict) }),
+    coderIdentity: intent.coderIdentity,
+    ...(intent.taskFeatures === undefined ? {} : { taskFeatures: structuredClone(intent.taskFeatures) }),
+    ...(signal === undefined ? {} : { signal }),
+    beforeAttempt: tracker.beforeAttempt,
+    afterAttempt: tracker.afterAttempt,
+  });
+  if (!providerResult.ok || !tracker.canCommitReturnedResult()) {
+    return settleOrBlockProviderFailure(transaction, tracker, identity, "advanced");
+  }
+  const completion = providerResult.value;
+  const checkpoint = tracker.current();
+  if (!tracker.routingMatches(completion.routing) ||
+      !checkerEvidenceIsValid(checkpoint, completion.routing)) {
+    return settleProviderFailure(transaction, checkpoint, identity, "advanced");
+  }
+  await options.afterProviderResult?.({ runId: current.runId, effect });
+  const diagnosisBytes = Buffer.from(stableJson({
+    schemaVersion: 1,
+    kind: "mcp-debug-diagnosis",
+    failureFingerprint: fingerprint,
+    ...completion.diagnosis,
+  }), "utf8");
+  const resultRef = await writeProviderOutput(
+    transaction,
+    checkpoint,
+    effect,
+    "mcp-debug-output-v1",
+    diagnosisBytes,
+  );
+  const diagnosisRef = `plan-versions/${current.planVersion}/diagnosis/${fingerprint}.json`;
+  const diagnosisArtifact = await transaction.writeRecoveryArtifact({
+    runId: current.runId,
+    semanticRef: diagnosisRef,
+    bytes: diagnosisBytes,
+  });
+  if (diagnosisArtifact.sha256 !== resultRef.sha256 ||
+      diagnosisArtifact.sizeBytes !== resultRef.sizeBytes) {
+    throw new Error("MCP DEBUG provider output and recovery diagnosis artifact differ");
+  }
+  const directive = validateRecoveryDirective({
+    version: 1,
+    failureFingerprint: fingerprint,
+    rootCauseCategory: completion.diagnosis.rootCauseCategory,
+    confidence: completion.diagnosis.confidence,
+    diagnosisRef,
+    diagnosisHash: diagnosisArtifact.sha256,
+    evidenceRefs,
+    repairScope: completion.diagnosis.repairScope,
+    validationRequirements: completion.diagnosis.validationRequirements,
+    topologyAssessment: completion.diagnosis.topologyAssessment,
+  });
+  const diagnosedEnvelope: McpRunRecoveryEnvelope = {
+    ...envelope,
+    ledger: applyRecoveryDecisionToLedger(
+      envelope.ledger,
+      envelope.binding.authority,
+      fingerprint,
+      directive,
+    ),
+    artifacts: [...envelope.artifacts, diagnosisArtifact],
+  };
+  const decision = recoveryDecisionFor(diagnosedEnvelope, fingerprint);
+  const directed = recoveryDirectedState(current, decision, latestFailedProviderKind(current));
+  if (decision.action === "replan") {
+    return executeMcpRecoverySuccessorPlan(
+      transaction,
+      checkpoint,
+      identity,
+      options,
+      diagnosedEnvelope,
+      directed,
+      effect,
+      resultRef,
+      completion.routing,
+      signal,
+    );
+  }
+  const execution = executionForRecoveryDecision(decision, latestFailedProviderKind(current));
+  const committed = await compareAndSwapValidated(
+    transaction,
+    checkpoint.revision,
+    draftFrom(checkpoint, {
+      recovery: {
+        ...diagnosedEnvelope,
+        ...(execution === undefined ? {} : { execution }),
+      },
+      state: directed,
+      status: statusFor(directed),
+      routing: [...checkpoint.routing, completion.routing],
+      providerEvidence: markProviderOutput(
+        checkpoint.providerEvidence,
+        effect,
+        "output_committed",
+        resultRef,
+      ),
+      pendingProviderIntent: false,
+      terminalMessage: directed.phase === "failed"
+        ? "Recovery authority rejected further execution."
+        : undefined,
+    }),
+    settledRequestFor(checkpoint, identity, "advanced"),
+    "advanced",
+  );
+  return responseFor(requireCommitted(committed, "settling DEBUG diagnosis"), "advanced");
+}
+
+async function executeMcpRecoverySuccessorPlan(
+  transaction: McpRunTransaction,
+  checkpoint: McpRunRecord,
+  identity: RequestIdentity,
+  options: CreateMcpRunServiceOptions,
+  diagnosedEnvelopeValue: McpRunRecoveryEnvelope,
+  directed: OrchestratorState,
+  debugEffect: ProviderEffectBase,
+  debugResultRef: Readonly<ArtifactReference>,
+  debugRouting: RunRoutingDecision,
+  signal?: AbortSignal,
+): Promise<McpRunResponse> {
+  if (!transaction.getRecoveryContext || !transaction.writeRecoveryArtifact) {
+    throw new Error("MCP successor PLAN execution is unavailable");
+  }
+  assertRoutingCapacity({ routing: [...checkpoint.routing, debugRouting] });
+  const diagnosedEnvelope = validateMcpRunRecoveryEnvelope(diagnosedEnvelopeValue);
+  const state = recoveryStateFor(
+    diagnosedEnvelope,
+    recoveryResponseFor(diagnosedEnvelope).failureFingerprint,
+  );
+  if (state.status !== "waiting-successor-artifact" || !state.successor) {
+    throw new Error("MCP recovery is not waiting for an immutable successor plan");
+  }
+  const planEffect = allocateProviderEffect(checkpoint, "plan");
+  const effectIds = [debugEffect.effectId, planEffect.effectId];
+  const reserved = await compareAndSwapValidated(
+    transaction,
+    checkpoint.revision,
+    draftFrom(checkpoint, {
+      recovery: diagnosedEnvelope,
+      state: directed,
+      status: statusFor(directed),
+      routing: [...checkpoint.routing, debugRouting],
+      providerEvidence: markProviderOutput(
+        checkpoint.providerEvidence,
+        debugEffect,
+        "output_committed",
+        debugResultRef,
+      ),
+      pendingProviderIntent: true,
+      providerEffects: [...checkpoint.providerEffects, providerEffectBase(planEffect)],
+      nextProviderEffectOrdinal: planEffect.ordinal + 1,
+    }),
+    pendingRequest(identity, planEffect, effectIds),
+    "current",
+  );
+  const intent = requireCommitted(reserved, "reserving recovery successor PLAN intent");
+  const tracker = providerAttemptTracker(transaction, intent, identity, planEffect, effectIds);
+  const diagnosisRecord = [...diagnosedEnvelope.ledger.records].reverse().find((record) =>
+    record.kind === "decision" && record.fingerprint === state.fingerprint &&
+    record.directive !== undefined);
+  if (diagnosisRecord?.kind !== "decision" || diagnosisRecord.directive === undefined) {
+    throw new Error("MCP successor PLAN lacks its typed DEBUG diagnosis");
+  }
+  const planResult = await callPlanProvider(options.provider, planRequest(intent, tracker, {
+    previousPlan: checkpoint.state.plan,
+    judgeReports: checkpoint.state.judgeReports,
+    userFeedback: stableJson({
+      version: 1,
+      kind: "recovery-successor-plan",
+      failureFingerprint: state.fingerprint,
+      diagnosisRef: diagnosisRecord.directive.diagnosisRef,
+      topologyAssessment: "structural",
+      targetPlanVersion: state.successor.targetPlanVersion,
+    }),
+    signal,
+  }));
+  if (!planResult.ok || !tracker.canCommitReturnedResult()) {
+    return settleOrBlockProviderFailure(transaction, tracker, identity, "advanced");
+  }
+  const completion = planResult.value;
+  if (!tracker.routingMatches(completion.routing)) {
+    return settleProviderFailure(transaction, tracker.current(), identity, "advanced");
+  }
+  await options.afterProviderResult?.({ runId: checkpoint.runId, effect: planEffect });
+  const planCheckpoint = tracker.current();
+  const planResultRef = await writeProviderOutput(
+    transaction,
+    planCheckpoint,
+    planEffect,
+    "mcp-plan-output-v1",
+    Buffer.from(completion.plan, "utf8"),
+  );
+  const context = await transaction.getRecoveryContext();
+  const graphRef = `plan-versions/${state.successor.targetPlanVersion}/graph.json`;
+  const planRef = `plan-versions/${state.successor.targetPlanVersion}/plan.md`;
+  const graphArtifact = await transaction.writeRecoveryArtifact({
+    runId: checkpoint.runId,
+    semanticRef: graphRef,
+    bytes: Buffer.from(stableJson(context.graphDefinition), "utf8"),
+  });
+  const planArtifact = await transaction.writeRecoveryArtifact({
+    runId: checkpoint.runId,
+    semanticRef: planRef,
+    bytes: Buffer.from(completion.plan, "utf8"),
+  });
+  if (planArtifact.sha256 !== planResultRef.sha256 ||
+      planArtifact.sizeBytes !== planResultRef.sizeBytes) {
+    throw new Error("MCP successor plan artifact differs from its committed PLAN provider output");
+  }
+  const recovery = validateMcpRunRecoveryEnvelope({
+    ...diagnosedEnvelope,
+    ledger: applyRecoverySuccessorEventToLedger(
+      diagnosedEnvelope.ledger,
+      diagnosedEnvelope.binding.authority,
+      {
+        version: 1,
+        phase: "artifact-durable",
+        failureFingerprint: state.fingerprint,
+        sourcePlanVersion: state.sourcePlanVersion,
+        targetPlanVersion: state.successor.targetPlanVersion,
+        graphHash: graphArtifact.sha256,
+        planHash: planArtifact.sha256,
+        graphRef,
+        planRef,
+      },
+    ),
+    artifacts: [...diagnosedEnvelope.artifacts, graphArtifact, planArtifact],
+  });
+  const withPlan = nextPhase(
+    planCheckpoint.state,
+    { type: "plan_produced", plan: completion.plan },
+    planCheckpoint.loop,
+  );
+  const committed = await compareAndSwapValidated(
+    transaction,
+    planCheckpoint.revision,
+    draftFrom(planCheckpoint, {
+      recovery,
+      state: withPlan,
+      status: "active",
+      planVersion: state.successor.targetPlanVersion,
+      routing: [...planCheckpoint.routing, completion.routing],
+      providerEvidence: markProviderOutput(
+        planCheckpoint.providerEvidence,
+        planEffect,
+        "output_committed",
+        planResultRef,
+      ),
+      pendingProviderIntent: false,
+    }),
+    settledRequestFor(planCheckpoint, identity, "advanced"),
+    "advanced",
+  );
+  return responseFor(requireCommitted(committed, "settling recovery successor PLAN"), "advanced");
 }
 
 async function createInitialRecoveryEnvelope(
@@ -828,12 +1463,14 @@ async function createInitialRecoveryEnvelope(
   if (graphArtifact.sha256 !== binding.authority.graphDigest || planArtifact.sha256 !== activePlanHash) {
     throw new Error("Recovery genesis artifacts do not match scheduler and approved-plan authority");
   }
-  return validateMcpRunRecoveryEnvelope({
+  return {
     version: 1,
     binding,
+    occurrenceBindings: [binding],
     ledger: createRecoveryLedger(binding.authority),
     artifacts: [graphArtifact, planArtifact],
-  });
+    executionHistory: [],
+  };
 }
 
 function currentPlanArtifactHash(record: McpRunRecord): string {
@@ -856,8 +1493,8 @@ export function deriveMcpRunFailureEvidence(
   record: McpRunRecord,
 ): FailureEvidence {
   if (record.runId !== binding.authority.runId ||
-      record.planVersion !== binding.authority.activePlanVersion ||
-      currentPlanArtifactHash(record) !== binding.authority.activePlanHash) {
+      record.planVersion !== binding.anchor.activePlanVersion ||
+      currentPlanArtifactHash(record) !== binding.anchor.activePlanHash) {
     throw new Error("Recovery failure evidence is not bound to the current approved plan");
   }
 
@@ -867,7 +1504,7 @@ export function deriveMcpRunFailureEvidence(
     const observation = providerFailureObservation(latestEvidence.failureCode, outputContract);
     return schedulerFailureEvidence(graph, binding, record.providerAttempts, {
       ...observation,
-      artifactHashes: [binding.authority.activePlanHash],
+      artifactHashes: [binding.anchor.activePlanHash],
     });
   }
 
@@ -878,10 +1515,13 @@ export function deriveMcpRunFailureEvidence(
       latestEvidence.kind === "judge" && record.lastVerdict?.verdict === "reject" &&
       lastReport?.verdict === "reject" && record.state.coderIterations > 0) {
     return schedulerFailureEvidence(graph, binding, record.state.coderIterations, {
-      category: "implementation-defect",
+      // A checker rejection proves a contract violation, but not whether its
+      // root cause is local implementation or structural plan topology.
+      // DEBUG is the only authority allowed to make that classification.
+      category: "unknown",
       contractViolation: "validator-rejected",
       contractId: `mcp-judge-output-v1:${latestEvidence.effectId}`,
-      artifactHashes: [binding.authority.activePlanHash],
+      artifactHashes: [binding.anchor.activePlanHash],
     });
   }
 
@@ -925,12 +1565,25 @@ function recoveryResponseFor(envelopeValue: McpRunRecoveryEnvelope): NonNullable
       break;
     }
   }
+  const directive = [...envelope.ledger.records].reverse().find((candidate) =>
+    candidate.kind === "decision" && candidate.fingerprint === state.fingerprint &&
+    candidate.directive !== undefined);
   return {
     failureFingerprint: state.fingerprint,
     status: state.status,
     ...(decision === undefined ? {} : { action: decision.action, reason: decision.reason, targetPlanVersion: decision.targetPlanVersion }),
     sourcePlanVersion: state.sourcePlanVersion,
     remaining: structuredClone(state.remaining),
+    ...(envelope.execution === undefined ? {} : { executionStatus: envelope.execution.status }),
+    ...(directive?.kind !== "decision" || directive.directive === undefined ? {} : {
+      directive: {
+        rootCauseCategory: directive.directive.rootCauseCategory,
+        confidence: directive.directive.confidence,
+        repairScope: [...directive.directive.repairScope],
+        validationRequirements: [...directive.directive.validationRequirements],
+        topologyAssessment: directive.directive.topologyAssessment,
+      },
+    }),
   };
 }
 
@@ -944,6 +1597,117 @@ function currentRecoveryPlanVersion(envelope: McpRunRecoveryEnvelope): number {
   return version;
 }
 
+function recoveryStateFor(
+  envelopeValue: McpRunRecoveryEnvelope,
+  fingerprint: string,
+): RecoveryState {
+  const envelope = validateMcpRunRecoveryEnvelope(envelopeValue);
+  for (let index = envelope.ledger.records.length - 1; index >= 0; index -= 1) {
+    const record = envelope.ledger.records[index]!;
+    const recordFingerprint = record.kind === "registration"
+      ? record.state.fingerprint
+      : record.fingerprint;
+    if (recordFingerprint === fingerprint) return record.state;
+  }
+  throw new Error("MCP recovery state is missing");
+}
+
+function recoveryDecisionFor(
+  envelopeValue: McpRunRecoveryEnvelope,
+  fingerprint: string,
+): RecoveryDecision {
+  const envelope = validateMcpRunRecoveryEnvelope(envelopeValue);
+  for (let index = envelope.ledger.records.length - 1; index >= 0; index -= 1) {
+    const record = envelope.ledger.records[index]!;
+    if (record.kind === "decision" && record.fingerprint === fingerprint) return record.decision;
+  }
+  throw new Error("MCP recovery decision is missing");
+}
+
+function latestFailedProviderKind(record: McpRunRecord): "plan" | "judge" | undefined {
+  const failure = [...record.providerEvidence].reverse().find((candidate) =>
+    candidate.phase === "failed" && candidate.kind !== "debug");
+  return failure?.kind === "plan" || failure?.kind === "judge" ? failure.kind : undefined;
+}
+
+function executionForRecoveryDecision(
+  decision: RecoveryDecision,
+  providerKind: "plan" | "judge" | undefined,
+): McpRunRecoveryEnvelope["execution"] {
+  if (decision.action !== "retry" && decision.action !== "repair") return undefined;
+  if (decision.action === "retry" && providerKind === undefined) {
+    throw new Error("MCP recovery retry lacks its failed provider kind");
+  }
+  return {
+    version: 1,
+    failureFingerprint: decision.failureFingerprint,
+    action: decision.action,
+    status: "awaiting-client",
+    ...(decision.action === "retry" ? { providerKind: providerKind! } : {}),
+  };
+}
+
+function recoveryDirectedState(
+  record: McpRunRecord,
+  decision: RecoveryDecision,
+  providerKind: "plan" | "judge" | undefined,
+): OrchestratorState {
+  if (decision.action === "pause") return structuredClone(record.state);
+  const action = decision.action === "retry" || decision.action === "repair" ||
+    decision.action === "replan" ? decision.action : "fail";
+  return nextPhase(record.state, {
+    type: "recovery_directed",
+    action,
+    ...(action === "retry" ? { providerKind } : {}),
+  }, record.loop);
+}
+
+function recoveryPermitsClientEvent(
+  record: McpRunRecord,
+  event: McpRunClientEvent["type"],
+): boolean {
+  const recovery = record.recovery === undefined
+    ? undefined
+    : validateMcpRunRecoveryEnvelope(record.recovery);
+  if (!recovery) return true;
+  if (recovery.execution?.status === "completed" &&
+      recovery.execution.action === "retry" &&
+      recovery.execution.providerKind === "plan") {
+    return true;
+  }
+  if (recovery.execution?.status === "awaiting-client") {
+    return event === "code_result_submitted" &&
+      (recovery.execution.action === "repair" || recovery.execution.providerKind === "judge");
+  }
+  const state = recoveryResponseFor(recovery);
+  if (state.action === "replan" && state.status === "released") return true;
+  return state.action === "replan" &&
+    state.status === "waiting-successor-approval" &&
+    event === "plan_approved";
+}
+
+function completeMcpClientRecoveryExecution(
+  envelopeValue: McpRunRecoveryEnvelope,
+  requestRef: string,
+  resultRef: Readonly<ArtifactReference>,
+): McpRunRecoveryEnvelope {
+  const envelope = validateMcpRunRecoveryEnvelope(envelopeValue);
+  const execution = envelope.execution;
+  if (!execution || execution.status !== "awaiting-client") return envelope;
+  if (execution.action === "retry" && execution.providerKind === "plan") {
+    throw new Error("A plan-provider retry cannot be completed by code submission");
+  }
+  return validateMcpRunRecoveryEnvelope({
+    ...envelope,
+    execution: {
+      ...execution,
+      status: "completed",
+      requestRef,
+      resultRef: structuredClone(resultRef),
+    },
+  });
+}
+
 async function approvePlan(
   transaction: McpRunTransaction,
   current: McpRunRecord,
@@ -951,10 +1715,67 @@ async function approvePlan(
 ): Promise<McpRunResponse> {
   assertPhase(current, "awaiting_approval", "plan_approved");
   const state = nextPhase(current.state, { type: "plan_approved" }, current.loop);
+  let recovery = current.recovery;
+  if (recovery !== undefined) {
+    const envelope = validateMcpRunRecoveryEnvelope(recovery);
+    const response = recoveryResponseFor(envelope);
+    const recoveryState = recoveryStateFor(envelope, response.failureFingerprint);
+    if (response.action === "replan" && recoveryState.status === "waiting-successor-approval") {
+      const successor = recoveryState.successor;
+      if (!transaction.writeRecoveryArtifact || !successor?.graphHash ||
+          !successor.planHash || !successor.graphRef || !successor.planRef) {
+        throw new Error("MCP recovery successor is not ready for durable approval");
+      }
+      const approvalRef = `plan-versions/${successor.targetPlanVersion}/approval.json`;
+      const approvalArtifact = await transaction.writeRecoveryArtifact({
+        runId: current.runId,
+        semanticRef: approvalRef,
+        bytes: Buffer.from(stableJson({
+          version: 1,
+          kind: "mcp-recovery-plan-approval",
+          runId: current.runId,
+          failureFingerprint: recoveryState.fingerprint,
+          sourcePlanVersion: recoveryState.sourcePlanVersion,
+          targetPlanVersion: successor.targetPlanVersion,
+          requestRef: identity.requestRef,
+        }), "utf8"),
+      });
+      const common = {
+        version: 1 as const,
+        failureFingerprint: recoveryState.fingerprint,
+        sourcePlanVersion: recoveryState.sourcePlanVersion,
+        targetPlanVersion: successor.targetPlanVersion,
+        graphHash: successor.graphHash,
+        planHash: successor.planHash,
+        graphRef: successor.graphRef,
+        planRef: successor.planRef,
+        approvalHash: approvalArtifact.sha256,
+        approvalRef,
+      };
+      let ledger = applyRecoverySuccessorEventToLedger(
+        envelope.ledger,
+        envelope.binding.authority,
+        { ...common, phase: "approved" },
+      );
+      ledger = applyRecoverySuccessorEventToLedger(
+        ledger,
+        envelope.binding.authority,
+        { ...common, phase: "activated" },
+      );
+      recovery = validateMcpRunRecoveryEnvelope({
+        ...envelope,
+        ledger,
+        artifacts: [...envelope.artifacts, approvalArtifact],
+      });
+    }
+  }
   const committed = await compareAndSwapValidated(
     transaction,
     current.revision,
-    draftFrom(current, { state }),
+    draftFrom(current, {
+      state,
+      ...(recovery === undefined ? {} : { recovery }),
+    }),
     settledRequest(identity, "advanced"),
     "advanced",
   );
@@ -1102,6 +1923,13 @@ async function submitCode(
     routing: [...judgeCheckpoint.routing, verdict.routing],
     providerEvidence: markProviderOutput(judgeCheckpoint.providerEvidence, judgeEffect, "output_committed", judgeResultRef),
     lastVerdict,
+    ...(current.recovery === undefined ? {} : {
+      recovery: completeMcpClientRecoveryExecution(
+        current.recovery,
+        identity.requestRef,
+        judgeResultRef,
+      ),
+    }),
     terminalMessage: judged.phase === "failed" ? "Maximum coder iterations reached; the run failed closed." : undefined,
   });
 
@@ -1242,6 +2070,19 @@ async function callJudgeProvider(
 ): Promise<ProviderCallResult<z.infer<typeof judgeProviderResultSchema>>> {
   try {
     return { ok: true, value: judgeProviderResultSchema.parse(await provider.judge(request)) };
+  } catch (error) {
+    if (error instanceof ProviderCheckpointError) throw error;
+    return { ok: false };
+  }
+}
+
+async function callDiagnosisProvider(
+  provider: McpRunProvider,
+  request: McpRunDiagnosisRequest,
+): Promise<ProviderCallResult<z.infer<typeof diagnosisProviderResultSchema>>> {
+  if (!provider.diagnose) return { ok: false };
+  try {
+    return { ok: true, value: diagnosisProviderResultSchema.parse(await provider.diagnose(request)) };
   } catch (error) {
     if (error instanceof ProviderCheckpointError) throw error;
     return { ok: false };
@@ -1660,7 +2501,28 @@ function attemptWithoutOutcome(result: RoutedCompletionAttemptResult): RoutedCom
 function responseFor(record: McpRunRecord, outcome: RunOutcome): McpRunResponse {
   const loop = record.loop;
   const providerBlocked = record.pendingProviderIntent;
-  const recoveryBlocked = record.recovery !== undefined && record.status !== "cancelled";
+  const recovery = record.recovery === undefined ? undefined : validateMcpRunRecoveryEnvelope(record.recovery);
+  const clientRecoveryReady = recovery?.execution?.status === "awaiting-client" &&
+    record.status === "active" &&
+    record.state.phase === "coding" &&
+    (recovery.execution.action === "repair" || recovery.execution.providerKind === "judge");
+  const completedRecoveryDone = recovery?.execution?.status === "completed" && record.status === "done";
+  const completedPlanRetryReady = recovery?.execution?.status === "completed" &&
+    recovery.execution.action === "retry" &&
+    recovery.execution.providerKind === "plan";
+  const successorApprovalReady = recovery !== undefined &&
+    recoveryResponseFor(recovery).action === "replan" &&
+    recoveryResponseFor(recovery).status === "waiting-successor-approval" &&
+    record.status === "active" && record.state.phase === "awaiting_approval";
+  const activatedSuccessorReady = recovery !== undefined &&
+    recoveryResponseFor(recovery).action === "replan" &&
+    recoveryResponseFor(recovery).status === "released";
+  const terminalRecoveryReady = recovery !== undefined &&
+    recoveryResponseFor(recovery).status === "failed" &&
+    record.status === "failed";
+  const recoveryBlocked = recovery !== undefined && record.status !== "cancelled" &&
+    !clientRecoveryReady && !completedRecoveryDone && !successorApprovalReady &&
+    !activatedSuccessorReady && !terminalRecoveryReady && !completedPlanRetryReady;
   const blocked = providerBlocked || recoveryBlocked;
   const visibleState = record.status === "cancelled" && record.cancelledCheckpoint
     ? record.cancelledCheckpoint
@@ -1710,7 +2572,7 @@ function responseFor(record: McpRunRecord, outcome: RunOutcome): McpRunResponse 
       consecutiveRejections: Math.max(0, loop.plannerEscalationAfterRejections - visibleState.consecutiveRejections),
       providerCalls: Math.max(0, record.maxProviderCalls - record.providerAttempts),
     },
-    ...(record.recovery === undefined ? {} : { recovery: recoveryResponseFor(record.recovery) }),
+    ...(recovery === undefined ? {} : { recovery: recoveryResponseFor(recovery) }),
     ...(providerBlocked
       ? { message: "A provider returned but its durable outcome is uncertain; this run requires recovery before it can advance." }
       : recoveryBlocked
@@ -2011,8 +2873,12 @@ function assertRunBusinessInvariants(record: McpRunRecord): void {
   }
   if (record.recovery !== undefined) {
     const recovery = validateMcpRunRecoveryEnvelope(record.recovery);
+    const response = recoveryResponseFor(recovery);
+    const recoveryState = recoveryStateFor(recovery, response.failureFingerprint);
+    const successorAwaitingApproval = recoveryState.status === "waiting-successor-approval" &&
+      recoveryState.successor?.targetPlanVersion === record.planVersion;
     if (recovery.binding.authority.runId !== record.runId ||
-        currentRecoveryPlanVersion(recovery) !== record.planVersion) {
+        (currentRecoveryPlanVersion(recovery) !== record.planVersion && !successorAwaitingApproval)) {
       throw new Error("Persisted MCP recovery authority is not bound to the run's approved plan lineage");
     }
   }
@@ -2050,14 +2916,18 @@ function assertRunBusinessInvariants(record: McpRunRecord): void {
     throw new Error("Provider-intent flag does not match request authority");
   }
   if (record.pendingProviderIntent) {
-    if (record.status !== "active" || !["planning", "judging", "replanning"].includes(phase)) {
+    const activeEffect = record.requestAuthority.state === "pending" ? record.requestAuthority.effect : undefined;
+    const recoveryDebug = record.requestAuthority.mutationEffect.operation === "recover" &&
+      activeEffect?.kind === "debug" &&
+      (record.status === "active" || record.status === "failed") &&
+      ["coding", "replanning", "failed"].includes(phase);
+    if (!recoveryDebug && (record.status !== "active" || !["planning", "judging", "replanning"].includes(phase))) {
       throw new Error("Pending provider intent is not valid for the current status and phase");
     }
-    const activeEffect = record.requestAuthority.state === "pending" ? record.requestAuthority.effect : undefined;
     if (!activeEffect || record.requestAuthority.providerEffectIds.at(-1) !== activeEffect.effectId) {
       throw new Error("Pending request authority does not end with its active provider effect");
     }
-    const expectedKind = phase === "judging" ? "judge" : "plan";
+    const expectedKind = recoveryDebug ? "debug" : phase === "judging" ? "judge" : "plan";
     if (activeEffect.kind !== expectedKind) {
       throw new Error("Pending provider effect kind does not match the active lifecycle phase");
     }
@@ -2189,8 +3059,17 @@ function assertRunBusinessInvariants(record: McpRunRecord): void {
     throw new Error("Routing result order does not match committed provider output order");
   }
   const committedPlans = committedOutputs.filter(({ kind }) => kind === "plan").length;
-  if ((committedPlans === 0 && record.planVersion !== 1)
-    || (committedPlans > 0 && record.planVersion !== committedPlans)) {
+  const recoveryAuthority = record.recovery === undefined
+    ? undefined
+    : validateMcpRunRecoveryEnvelope(record.recovery);
+  const preservedPlanRetries = recoveryAuthority === undefined
+    ? 0
+    : [recoveryAuthority.execution, ...recoveryAuthority.executionHistory].filter((execution) =>
+        execution?.status === "completed" && execution.action === "retry" &&
+        execution.providerKind === "plan").length;
+  const semanticPlanVersions = committedPlans - preservedPlanRetries;
+  if ((semanticPlanVersions === 0 && record.planVersion !== 1)
+    || (semanticPlanVersions > 0 && record.planVersion !== semanticPlanVersions)) {
     throw new Error("Plan version does not match committed PLAN outputs");
   }
   assertReachableLifecycleAuthority(record, attemptsByEffect);
@@ -2215,8 +3094,14 @@ function assertMutationEffectShape(record: McpRunRecord): void {
     return;
   }
   if (mutation.operation === "recover") {
-    if (record.requestAuthority.state !== "settled" || record.requestAuthority.outcome !== "advanced" || ids.length !== 0) {
-      throw new Error("Recovery request must settle without provider effects");
+    if (record.requestAuthority.state === "settled" && record.requestAuthority.outcome !== "advanced") {
+      throw new Error("Settled recovery request has an invalid outcome");
+    }
+    const validEffects = (effects.length === 0) ||
+      (effects.length === 1 && (effects[0]?.kind === "debug" || effects[0]?.kind === "plan")) ||
+      (effects.length === 2 && effects[0]?.kind === "debug" && effects[1]?.kind === "plan");
+    if (!validEffects) {
+      throw new Error("Recovery request may own only DEBUG and successor PLAN effects");
     }
     if (record.recovery === undefined) throw new Error("Recovery request did not persist recovery authority");
     return;
@@ -2316,10 +3201,35 @@ function assertReachableLifecycleAuthority(
   );
   let reportIndex = 0;
   let hasUncommittedEffect = false;
+  const appliedRecoveryFingerprints = new Set<string>();
+  const typedRecoveryDecisions = record.recovery === undefined
+    ? []
+    : validateMcpRunRecoveryEnvelope(record.recovery).ledger.records.filter((candidate) =>
+        candidate.kind === "decision" && candidate.directive !== undefined);
+  let typedRecoveryIndex = 0;
 
   for (const [index, effect] of record.providerEffects.entries()) {
     if (hasUncommittedEffect) {
-      throw new Error("Provider effects after an uncommitted effect are not reachable lifecycle authority");
+      if (record.recovery !== undefined && effect.kind === "debug" &&
+          ["planning", "judging", "replanning"].includes(replay.phase)) {
+        replay = nextPhase(replay, { type: "provider_failed" }, record.loop);
+        hasUncommittedEffect = false;
+      } else if (record.recovery !== undefined && effect.kind === "plan") {
+        const recovery = validateMcpRunRecoveryEnvelope(record.recovery);
+        const planRetry = recovery.execution?.providerKind === "plan"
+          ? recovery.execution
+          : recovery.executionHistory.find((candidate) => candidate.providerKind === "plan");
+        if (!planRetry || planRetry.action !== "retry" ||
+            !["planning", "replanning"].includes(replay.phase)) {
+          throw new Error("Provider PLAN after an uncommitted effect lacks typed retry authority");
+        }
+        replay = nextPhase(replay, { type: "provider_failed" }, record.loop);
+        replay = applyPersistedRecoveryDirection(record, replay);
+        appliedRecoveryFingerprints.add(planRetry.failureFingerprint);
+        hasUncommittedEffect = false;
+      } else {
+        throw new Error("Provider effects after an uncommitted effect are not reachable lifecycle authority");
+      }
     }
     replay = prepareLifecycleForProviderEffect(replay, effect.kind, record.loop);
     const attempts = attemptsByEffect.get(effect.effectId) ?? [];
@@ -2328,7 +3238,12 @@ function assertReachableLifecycleAuthority(
       throw new Error("A provider effect committed more than one output");
     }
     if (committed.length === 0) {
-      if (index !== record.providerEffects.length - 1) {
+      const nextEffect = record.providerEffects[index + 1];
+      const recoveryContinuation = record.recovery !== undefined && nextEffect !== undefined &&
+        (nextEffect.kind === "debug" ||
+          (nextEffect.kind === "plan" &&
+            validateMcpRunRecoveryEnvelope(record.recovery).execution?.providerKind === "plan"));
+      if (index !== record.providerEffects.length - 1 && !recoveryContinuation) {
         throw new Error("Only the final provider effect may remain uncommitted");
       }
       hasUncommittedEffect = true;
@@ -2338,6 +3253,18 @@ function assertReachableLifecycleAuthority(
     if (effect.kind === "plan") {
       if (!visibleState.plan?.trim()) throw new Error("Committed PLAN output is missing its lifecycle plan");
       replay = nextPhase(replay, { type: "plan_produced", plan: visibleState.plan }, record.loop);
+      continue;
+    }
+    if (effect.kind === "debug") {
+      if (record.recovery !== undefined) {
+        const decision = typedRecoveryDecisions[typedRecoveryIndex];
+        if (!decision || decision.kind !== "decision") {
+          throw new Error("Committed DEBUG output lacks its chronological recovery decision");
+        }
+        replay = applyPersistedRecoveryDirection(record, replay, decision);
+        appliedRecoveryFingerprints.add(decision.fingerprint);
+        typedRecoveryIndex += 1;
+      }
       continue;
     }
 
@@ -2361,6 +3288,17 @@ function assertReachableLifecycleAuthority(
     throw new Error("Reducer judge history is not reachable from committed JUDGE outputs");
   }
 
+  if (record.recovery !== undefined) {
+    const currentRecovery = recoveryResponseFor(validateMcpRunRecoveryEnvelope(record.recovery));
+    if (!appliedRecoveryFingerprints.has(currentRecovery.failureFingerprint)) {
+      if (hasUncommittedEffect && ["planning", "judging", "replanning"].includes(replay.phase)) {
+        replay = nextPhase(replay, { type: "provider_failed" }, record.loop);
+        hasUncommittedEffect = false;
+      }
+      replay = applyPersistedRecoveryDirection(record, replay);
+    }
+  }
+
   const candidates = reachableFinalStates(record, replay, hasUncommittedEffect);
   if (!candidates.some((candidate) => stableJson(candidate) === stableJson(visibleState))) {
     throw new Error("Persisted reducer phase and counters are not reachable lifecycle authority");
@@ -2370,12 +3308,38 @@ function assertReachableLifecycleAuthority(
   }
 }
 
+function applyPersistedRecoveryDirection(
+  record: McpRunRecord,
+  state: OrchestratorState,
+  selected?: Extract<RecoveryLedger["records"][number], { kind: "decision" }>,
+): OrchestratorState {
+  if (!record.recovery) return state;
+  const recovery = validateMcpRunRecoveryEnvelope(record.recovery);
+  const decision = selected ?? [...recovery.ledger.records].reverse().find((candidate) =>
+    candidate.kind === "decision");
+  if (!decision || decision.kind !== "decision" || decision.decision.action === "pause") return state;
+  const action = decision.decision.action;
+  const execution = [recovery.execution, ...recovery.executionHistory].find((candidate) =>
+    candidate?.failureFingerprint === decision.fingerprint);
+  if (action === "retry" && execution?.providerKind === undefined) {
+    throw new Error("Retry recovery is missing its exact provider kind");
+  }
+  return nextPhase(state, {
+    type: "recovery_directed",
+    action: action === "fail" ? "fail" : action,
+    ...(action === "retry"
+      ? { providerKind: execution?.providerKind }
+      : {}),
+  }, record.loop);
+}
+
 function prepareLifecycleForProviderEffect(
   state: OrchestratorState,
   kind: ProviderEffectBase["kind"],
   loop: LoopConfig,
 ): OrchestratorState {
   let prepared = state;
+  if (kind === "debug") return prepared;
   if (kind === "plan") {
     if (prepared.phase === "awaiting_approval") {
       prepared = nextPhase(prepared, { type: "plan_rejected_by_user" }, loop);

@@ -14,6 +14,7 @@ import {
 } from "../src/core/scheduler.js";
 import {
   createBuildWorkerRequest,
+  createRecoveryBuildWorkerRequest,
   dispatchBuildWorker,
   reconcileBuildWorker,
   runBoundedBuildWorkerTasks,
@@ -365,5 +366,47 @@ describe("BUILD worker runtime boundary", () => {
       reservation: budget.reservation,
       worktreePath: "/tmp/forged",
     } as never)).toThrow(/unsupported|worktree path/i);
+  });
+
+  it("creates a topology-preserving repair worker from only the typed directive", () => {
+    const failureFingerprint = "d".repeat(64);
+    const directive = {
+      version: 1 as const,
+      failureFingerprint,
+      rootCauseCategory: "implementation-defect" as const,
+      confidence: "high" as const,
+      diagnosisRef: `plan-versions/1/diagnosis/${failureFingerprint}.md`,
+      diagnosisHash: "e".repeat(64),
+      evidenceRefs: ["nodes/1/verifying/rejection.json"],
+      repairScope: ["src/example.ts"],
+      validationRequirements: ["verification-commands"],
+      topologyAssessment: "preserve" as const,
+    };
+    const request = createRecoveryBuildWorkerRequest({
+      runId: "recovery-run",
+      planVersion: 1,
+      planHash: "a".repeat(64),
+      directive,
+      outerEffectRequestRef: "b".repeat(64),
+      timeoutMs: 30_000,
+    });
+
+    expect(request).toMatchObject({
+      handler: "implement",
+      toolPolicy: "declared-writes",
+      declaredWriteSet: ["src/example.ts"],
+      workspace: { kind: "shared" },
+      declaredOutputContracts: [],
+    });
+    expect(request.prompt).toContain(directive.diagnosisRef);
+    expect(request.prompt).not.toContain("Local defect prose that was never declared");
+    expect(() => createRecoveryBuildWorkerRequest({
+      runId: "recovery-run",
+      planVersion: 1,
+      planHash: "a".repeat(64),
+      directive: { ...directive, rootCauseCategory: "missing-dependency", topologyAssessment: "structural" },
+      outerEffectRequestRef: "b".repeat(64),
+      timeoutMs: 30_000,
+    })).toThrow(/topology-preserving/i);
   });
 });

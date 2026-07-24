@@ -203,7 +203,7 @@ export function createPiBuildCoordinatorAdapter(
     const node = buildNode(options.compiled, action.nodeId);
     const cwd = action.workspace.kind === "owned-worktree" ? action.workspace.worktreePath : options.repositoryRoot;
     const workspaceBeforeSha256 = node.handler === "implement"
-      ? workspaceWriteFingerprint(cwd, node.writeSet, options.git)
+      ? buildWorkspaceWriteFingerprint(cwd, node.writeSet, options.git)
       : undefined;
     const receipt = reconcile
       ? await reconcileBuildWorker(request, options.worker, { signal: context?.signal })
@@ -260,7 +260,7 @@ export function createPiBuildCoordinatorAdapter(
         : inspectSharedBuildWorkspace(options.repositoryRoot, node.writeSet, options.git);
       const changedPaths = (workspaceInspection as { changedPaths: readonly string[] }).changedPaths;
       if (changedPaths.length === 0) throw new Error(`BUILD implement node ${node.id} produced no authoritative workspace edits`);
-      const workspaceAfterSha256 = workspaceWriteFingerprint(cwd, node.writeSet, options.git);
+      const workspaceAfterSha256 = buildWorkspaceWriteFingerprint(cwd, node.writeSet, options.git);
       if (!workerDispatch?.workspaceBeforeSha256 || workerDispatch.workspaceBeforeSha256 === workspaceAfterSha256) {
         throw new Error(`BUILD implement node ${node.id} did not change its declared workspace state`);
       }
@@ -508,7 +508,7 @@ function inspectChangedFiles(cwdValue: string, paths: readonly string[]): readon
   return Object.freeze(evidence.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
-function workspaceWriteFingerprint(cwd: string, writeSet: readonly string[], git: GitRunner): string {
+export function buildWorkspaceWriteFingerprint(cwd: string, writeSet: readonly string[], git: GitRunner): string {
   if (writeSet.length === 0) throw new Error("BUILD workspace fingerprint requires a declared write set");
   const pathspec = ["--", ...writeSet];
   const staged = runGitEvidence(git, cwd,

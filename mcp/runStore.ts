@@ -18,6 +18,7 @@ import type { McpRunStorageConfig } from "../src/core/config.js";
 import { compileGraph, type CompiledGraph, type GraphDefinition } from "../src/core/graph.js";
 import {
   applyRecoveryDecisionToLedger,
+  applyRecoverySuccessorEventToLedger,
   createRecoveryLedger,
   fingerprintFailure,
   registerRecovery,
@@ -390,7 +391,11 @@ class DiskMcpRunRepository implements DurableMcpRunRepository {
     if (!sameAttempt(input.attempt, authority.effect.attempt)) {
       throw new Error("Provider output attempt does not match its durable reservation");
     }
-    const expectedContract = input.effect.kind === "plan" ? "mcp-plan-output-v1" : "mcp-judge-output-v1";
+    const expectedContract = input.effect.kind === "plan"
+      ? "mcp-plan-output-v1"
+      : input.effect.kind === "judge"
+        ? "mcp-judge-output-v1"
+        : "mcp-debug-output-v1";
     if (input.contract !== expectedContract) throw new Error("Provider output contract does not match its effect kind");
     const schedulerEffect = loaded.state.nodeStates[AUTHORITY_NODE]?.sideEffect;
     if (!schedulerEffect || schedulerEffect.status !== "intent_recorded" ||
@@ -733,7 +738,12 @@ function validateProviderArtifacts(
 ): void {
   for (const evidence of publication.record.providerEvidence) {
     if (evidence.phase !== "output_committed") continue;
-    const expectedContract = `${evidence.kind === "plan" ? "mcp-plan-output-v1" : "mcp-judge-output-v1"}:${evidence.effectId}`;
+    const contract = evidence.kind === "plan"
+      ? "mcp-plan-output-v1"
+      : evidence.kind === "judge"
+        ? "mcp-judge-output-v1"
+        : "mcp-debug-output-v1";
+    const expectedContract = `${contract}:${evidence.effectId}`;
     if (evidence.resultRef.nodeId !== AUTHORITY_NODE || evidence.resultRef.planVersion !== 1 ||
         evidence.resultRef.contract !== expectedContract) {
       throw new Error("Committed provider output reference is not bound to its exact effect");
@@ -742,7 +752,13 @@ function validateProviderArtifacts(
     if (seen.has(evidence.providerAttemptIdempotencyKey)) continue;
     const expected = evidence.kind === "plan"
       ? publication.record.state.plan
-      : publication.record.lastVerdict === undefined ? undefined : canonicalJson(publication.record.lastVerdict);
+      : evidence.kind === "judge"
+        ? publication.record.lastVerdict === undefined ? undefined : canonicalJson(publication.record.lastVerdict)
+        : publication.record.recovery?.artifacts.find((artifact) =>
+            artifact.sha256 === evidence.resultRef.sha256 &&
+            artifact.semanticRef.includes("/diagnosis/")) === undefined
+          ? undefined
+          : bytes.toString("utf8");
     if (expected === undefined || bytes.toString("utf8") !== expected) {
       throw new Error("Committed provider output bytes do not match the exposed semantic transition");
     }
@@ -766,11 +782,13 @@ function assertRecoveryPublication(
     return;
   }
   const recovery = validateMcpRunRecoveryEnvelope(next.recovery);
-  if (recovery.binding.anchor.schedulerRevision > priorEvents.length) {
-    throw new Error("MCP recovery anchor points beyond durable scheduler authority");
+  for (const binding of recovery.occurrenceBindings) {
+    if (binding.anchor.schedulerRevision > priorEvents.length) {
+      throw new Error("MCP recovery anchor points beyond durable scheduler authority");
+    }
+    const anchorState = schedulerStateAtRevision(graph, genesis, priorEvents, binding.anchor.schedulerRevision);
+    assertSchedulerRecoveryAnchor(graph, anchorState, binding);
   }
-  const anchorState = schedulerStateAtRevision(graph, genesis, priorEvents, recovery.binding.anchor.schedulerRevision);
-  assertSchedulerRecoveryAnchor(graph, anchorState, recovery.binding);
   if (authenticateArtifacts) authenticateRecoveryEnvelope(paths, recovery);
 
   if (prior?.recovery === undefined) {
@@ -793,16 +811,261 @@ function assertRecoveryPublication(
       canonicalJson(recovery.artifacts.slice(0, previous.artifacts.length)) !== canonicalJson(previous.artifacts)) {
     throw new Error("MCP recovery artifact bindings are not append-only");
   }
+  if (recovery.occurrenceBindings.length < previous.occurrenceBindings.length ||
+      canonicalJson(recovery.occurrenceBindings.slice(0, previous.occurrenceBindings.length)) !==
+        canonicalJson(previous.occurrenceBindings)) {
+    throw new Error("MCP recovery occurrence bindings are not append-only");
+  }
+  if (recovery.executionHistory.length < previous.executionHistory.length ||
+      canonicalJson(recovery.executionHistory.slice(0, previous.executionHistory.length)) !==
+        canonicalJson(previous.executionHistory)) {
+    throw new Error("MCP recovery execution history is not append-only");
+  }
   const changed = canonicalJson(previous) !== canonicalJson(recovery);
-  if (operation === "recover" && !changed) throw new Error("MCP recovery mutation made no monotonic progress");
-  if (operation !== "recover" && changed) throw new Error("Only an explicit recovery mutation may change recovery authority");
+  if (!changed) return;
+  const appendedRecords = recovery.ledger.records.slice(previous.ledger.records.length);
   if (operation === "recover") {
-    assertRecoveryRegistrationMatchesClosedFailure(
-      graph,
-      recovery,
-      prior,
-      recovery.ledger.records.slice(previous.ledger.records.length),
-    );
+    if (appendedRecords.some((record) => record.kind === "registration")) {
+      const latestBinding = recovery.occurrenceBindings.at(-1);
+      if (!latestBinding ||
+          recovery.occurrenceBindings.length !== previous.occurrenceBindings.length + 1 ||
+          latestBinding.anchor.schedulerRevision !== priorEvents.length) {
+        throw new Error("MCP recovery occurrence is not anchored to the immediately prior WAL head");
+      }
+      assertRecoveryOccurrenceExecutionRollover(previous, recovery);
+      assertRecoveryRegistrationMatchesClosedFailure(graph, recovery, prior, appendedRecords);
+    } else {
+      assertRecoveryContinuation(graph, previous, recovery, next);
+    }
+    return;
+  }
+  if (operation === "advance" &&
+      next.requestAuthority.mutationEffect.event === "plan_approved") {
+    assertRecoverySuccessorApproval(paths, previous, recovery, next);
+    return;
+  }
+  if (operation === "advance" &&
+      next.requestAuthority.mutationEffect.event === "code_result_submitted") {
+    assertRecoveryClientExecutionCompletion(previous, recovery, next);
+    return;
+  }
+  throw new Error("Only an explicit recovery mutation may change recovery authority");
+}
+
+function assertRecoveryOccurrenceExecutionRollover(
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+): void {
+  if (previous.execution !== undefined && previous.execution.status !== "completed") {
+    throw new Error("MCP recovery occurrence cannot replace incomplete execution authority");
+  }
+  const expectedHistory = previous.execution === undefined
+    ? previous.executionHistory
+    : [...previous.executionHistory, previous.execution];
+  if (canonicalJson(expectedHistory) !== canonicalJson(recovery.executionHistory)) {
+    throw new Error("MCP recovery occurrence did not preserve its completed execution history");
+  }
+}
+
+function assertRecoveryContinuation(
+  graph: CompiledGraph,
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  next: McpRunRecord,
+): void {
+  const appended = recovery.ledger.records.slice(previous.ledger.records.length);
+  if (appended.length === 0 && previous.execution?.status === "executing-provider" &&
+      recovery.execution?.status === "completed") {
+    assertRecoveryServerPlanRetryCompletion(previous, recovery, next);
+    return;
+  }
+  if (appended.length === 1 && appended[0]?.kind === "decision") {
+    assertRecoveryDiagnosisContinuation(previous, recovery, next);
+    return;
+  }
+  if (appended.length === 1 && appended[0]?.kind === "successor" &&
+      appended[0].event.phase === "artifact-durable") {
+    assertRecoverySuccessorArtifacts(graph, previous, recovery, next);
+    return;
+  }
+  throw new Error("MCP recovery continuation is not an authorized diagnosis or successor artifact transition");
+}
+
+function assertRecoveryServerPlanRetryCompletion(
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  next: McpRunRecord,
+): void {
+  const before = previous.execution;
+  const after = recovery.execution;
+  if (!before || before.status !== "executing-provider" || before.action !== "retry" ||
+      before.providerKind !== "plan" || !after || after.status !== "completed" ||
+      after.action !== before.action || after.providerKind !== before.providerKind ||
+      after.failureFingerprint !== before.failureFingerprint ||
+      after.requestRef !== next.requestAuthority.requestRef ||
+      canonicalJson(previous.ledger) !== canonicalJson(recovery.ledger) ||
+      canonicalJson(previous.artifacts) !== canonicalJson(recovery.artifacts) ||
+      canonicalJson(previous.occurrenceBindings) !== canonicalJson(recovery.occurrenceBindings) ||
+      canonicalJson(previous.executionHistory) !== canonicalJson(recovery.executionHistory)) {
+    throw new Error("MCP server PLAN retry did not preserve its typed recovery authority");
+  }
+  const result = after.resultRef;
+  const planEvidence = [...next.providerEvidence].reverse().find((evidence) =>
+    evidence.kind === "plan" && evidence.phase === "output_committed");
+  if (!result || !planEvidence || planEvidence.phase !== "output_committed" ||
+      result.sha256 !== planEvidence.resultRef.sha256 ||
+      result.path !== planEvidence.resultRef.path ||
+      next.state.phase !== "awaiting_approval") {
+    throw new Error("MCP server PLAN retry lacks its exact committed PLAN output");
+  }
+}
+
+function assertRecoveryDiagnosisContinuation(
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  next: McpRunRecord,
+): void {
+  const appended = recovery.ledger.records.slice(previous.ledger.records.length);
+  if (appended.length !== 1 || appended[0]?.kind !== "decision" || appended[0].directive === undefined) {
+    throw new Error("MCP recovery diagnosis continuation must append exactly one typed decision");
+  }
+  const decisionRecord = appended[0];
+  const directive = decisionRecord.directive;
+  if (!directive) throw new Error("MCP recovery diagnosis directive is missing");
+  const expected = applyRecoveryDecisionToLedger(
+    previous.ledger,
+    previous.binding.authority,
+    decisionRecord.fingerprint,
+    directive,
+  );
+  if (canonicalJson(expected.records.slice(previous.ledger.records.length)) !== canonicalJson(appended)) {
+    throw new Error("MCP recovery diagnosis decision does not replay from prior authority");
+  }
+  const diagnosis = recovery.artifacts.find((artifact) =>
+    artifact.semanticRef === directive.diagnosisRef);
+  const debugEvidence = [...next.providerEvidence].reverse().find((evidence) =>
+    evidence.kind === "debug" && evidence.phase === "output_committed");
+  if (!diagnosis || diagnosis.sha256 !== directive.diagnosisHash ||
+      !debugEvidence || debugEvidence.phase !== "output_committed" ||
+      debugEvidence.resultRef.sha256 !== diagnosis.sha256 ||
+      debugEvidence.resultRef.sizeBytes !== diagnosis.sizeBytes) {
+    throw new Error("MCP recovery diagnosis lacks its exact committed DEBUG provider output");
+  }
+}
+
+function assertRecoverySuccessorArtifacts(
+  graph: CompiledGraph,
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  next: McpRunRecord,
+): void {
+  const appended = recovery.ledger.records.slice(previous.ledger.records.length);
+  const successor = appended[0];
+  if (appended.length !== 1 || successor?.kind !== "successor" ||
+      successor.event.phase !== "artifact-durable") {
+    throw new Error("MCP recovery successor must append exactly one durable artifact event");
+  }
+  const expected = applyRecoverySuccessorEventToLedger(
+    previous.ledger,
+    previous.binding.authority,
+    successor.event,
+  );
+  if (canonicalJson(expected.records.slice(previous.ledger.records.length)) !== canonicalJson(appended) ||
+      canonicalJson(previous.execution ?? null) !== canonicalJson(recovery.execution ?? null)) {
+    throw new Error("MCP recovery successor artifacts do not replay from prior authority");
+  }
+  const appendedArtifacts = recovery.artifacts.slice(previous.artifacts.length);
+  const graphArtifact = appendedArtifacts.find((artifact) =>
+    artifact.semanticRef === successor.event.graphRef);
+  const planArtifact = appendedArtifacts.find((artifact) =>
+    artifact.semanticRef === successor.event.planRef);
+  const planEvidence = [...next.providerEvidence].reverse().find((evidence) =>
+    evidence.kind === "plan" && evidence.phase === "output_committed");
+  if (appendedArtifacts.length !== 2 || !graphArtifact || !planArtifact ||
+      graphArtifact.sha256 !== successor.event.graphHash ||
+      graphArtifact.sha256 !== graphDefinitionDigest(graph) ||
+      planArtifact.sha256 !== successor.event.planHash ||
+      !planEvidence || planEvidence.phase !== "output_committed" ||
+      planEvidence.resultRef.sha256 !== planArtifact.sha256 ||
+      planEvidence.resultRef.sizeBytes !== planArtifact.sizeBytes ||
+      next.planVersion !== successor.event.targetPlanVersion ||
+      next.state.phase !== "awaiting_approval") {
+    throw new Error("MCP recovery successor lacks its exact graph, plan, or PLAN-provider evidence");
+  }
+}
+
+function assertRecoverySuccessorApproval(
+  paths: GraphCheckpointPaths,
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  next: McpRunRecord,
+): void {
+  const appended = recovery.ledger.records.slice(previous.ledger.records.length);
+  const approved = appended[0];
+  const activated = appended[1];
+  if (appended.length !== 2 || approved?.kind !== "successor" ||
+      approved.event.phase !== "approved" || activated?.kind !== "successor" ||
+      activated.event.phase !== "activated") {
+    throw new Error("MCP successor approval must append ordered approved and activated events");
+  }
+  let expected = applyRecoverySuccessorEventToLedger(
+    previous.ledger,
+    previous.binding.authority,
+    approved.event,
+  );
+  expected = applyRecoverySuccessorEventToLedger(
+    expected,
+    previous.binding.authority,
+    activated.event,
+  );
+  const appendedArtifacts = recovery.artifacts.slice(previous.artifacts.length);
+  const approvalArtifact = appendedArtifacts[0];
+  if (canonicalJson(expected.records.slice(previous.ledger.records.length)) !== canonicalJson(appended) ||
+      canonicalJson(previous.execution ?? null) !== canonicalJson(recovery.execution ?? null) ||
+      appendedArtifacts.length !== 1 || !approvalArtifact ||
+      approvalArtifact.semanticRef !== approved.event.approvalRef ||
+      approvalArtifact.sha256 !== approved.event.approvalHash ||
+      next.planVersion !== activated.event.targetPlanVersion ||
+      next.state.phase !== "coding") {
+    throw new Error("MCP recovery successor approval lacks exact provenance or activation authority");
+  }
+  const approvalBytes = readGraphMutationArtifact(paths, approvalArtifact.storageRef);
+  const expectedApproval = canonicalJson({
+    version: 1,
+    kind: "mcp-recovery-plan-approval",
+    runId: next.runId,
+    failureFingerprint: approved.fingerprint,
+    sourcePlanVersion: approved.event.sourcePlanVersion,
+    targetPlanVersion: approved.event.targetPlanVersion,
+    requestRef: next.requestAuthority.requestRef,
+  });
+  if (Buffer.from(approvalBytes).toString("utf8") !== expectedApproval) {
+    throw new Error("MCP recovery successor approval bytes do not match their request provenance");
+  }
+}
+
+function assertRecoveryClientExecutionCompletion(
+  previous: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  recovery: ReturnType<typeof validateMcpRunRecoveryEnvelope>,
+  next: McpRunRecord,
+): void {
+  if (canonicalJson(previous.ledger) !== canonicalJson(recovery.ledger) ||
+      canonicalJson(previous.artifacts) !== canonicalJson(recovery.artifacts) ||
+      previous.execution?.status !== "awaiting-client" ||
+      recovery.execution?.status !== "completed" ||
+      previous.execution.failureFingerprint !== recovery.execution.failureFingerprint ||
+      previous.execution.action !== recovery.execution.action ||
+      previous.execution.providerKind !== recovery.execution.providerKind ||
+      recovery.execution.requestRef !== next.requestAuthority.requestRef) {
+    throw new Error("MCP recovery client execution did not preserve its typed action authority");
+  }
+  const result = recovery.execution.resultRef;
+  const judgeEvidence = [...next.providerEvidence].reverse().find((evidence) =>
+    evidence.kind === "judge" && evidence.phase === "output_committed");
+  if (!result || !judgeEvidence || judgeEvidence.phase !== "output_committed" ||
+      result.sha256 !== judgeEvidence.resultRef.sha256 ||
+      result.path !== judgeEvidence.resultRef.path) {
+    throw new Error("MCP recovery client execution lacks its exact JUDGE result receipt");
   }
 }
 
@@ -812,7 +1075,9 @@ function assertRecoveryRegistrationMatchesClosedFailure(
   prior: McpRunRecord,
   appendedRecords: readonly ReturnType<typeof validateMcpRunRecoveryEnvelope>["ledger"]["records"][number][],
 ): void {
-  const expected = deriveMcpRunFailureEvidence(graph, recovery.binding, prior);
+  const binding = recovery.occurrenceBindings.at(-1);
+  if (!binding) throw new Error("Recovery registration lacks its scheduler occurrence binding");
+  const expected = deriveMcpRunFailureEvidence(graph, binding, prior);
   const baseLedger = prior.recovery === undefined
     ? createRecoveryLedger(recovery.binding.authority)
     : validateMcpRunRecoveryEnvelope(prior.recovery).ledger;

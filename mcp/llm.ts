@@ -225,7 +225,7 @@ async function completeCandidate(config: OrchestratorConfig, role: ModelRole, ro
       console.error("[ai-orchestrator-mcp] AI_ORCH_FAKE_LLM=1 is active; returning fake planner/judge responses.");
       fakeLlmWarningPrinted = true;
     }
-    return fakeCompletion(role);
+    return fakeCompletion(role, prompt);
   }
 
   const text = await (async () => {
@@ -266,13 +266,23 @@ function sanitizeError(error: unknown, secrets: string[]): string {
   return "MCP candidate failed";
 }
 
-function fakeCompletion(role: ModelRole): string {
+function fakeCompletion(role: ModelRole, prompt: string): string {
   if (role === "planner") {
     return [
       "1. Inspect the relevant files and existing tests.",
       "2. Implement the requested behavior with minimal, focused changes.",
       "3. Run the detected project tests and fix any failures.",
     ].join("\n");
+  }
+  if (prompt.includes("read-only DEBUG checker")) {
+    return JSON.stringify({
+      rootCauseCategory: "implementation-defect",
+      confidence: "high",
+      summary: "The fake checker rejection identifies a local implementation defect.",
+      repairScope: ["src"],
+      validationRequirements: ["verification-tests"],
+      topologyAssessment: "preserve",
+    });
   }
   const verdict = process.env.AI_ORCH_FAKE_LLM_VERDICT === "approve" ? "approve" : "reject";
   return JSON.stringify({

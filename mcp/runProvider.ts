@@ -3,6 +3,7 @@ import { loadConfig, type OrchestratorConfig } from "../src/core/config.js";
 import { classifyMcpProviderFailure } from "./failureCodes.js";
 import {
   completeMcpJudge,
+  completeMcpDiagnosis,
   completeMcpPlan,
   type McpCompletionExecutor,
 } from "./routedCompletion.js";
@@ -96,6 +97,31 @@ export function createRoutedMcpRunProvider(
       });
       return {
         ...completion.verdict,
+        routing: runRoutingDecision("fast-judge", completion.routing),
+      };
+    },
+
+    diagnose: async (input) => {
+      const config = configForCall();
+      const routingDecisionId = createDecisionId("fast-judge");
+      const completion = await completeMcpDiagnosis({
+        config,
+        routingDecisionId,
+        task: input.task,
+        plan: input.plan,
+        failureFingerprint: input.failureFingerprint,
+        observedCategory: input.observedCategory,
+        evidenceRefs: input.evidenceRefs,
+        ...(input.lastVerdict === undefined ? {} : { lastVerdict: input.lastVerdict }),
+        coderIdentity: input.coderIdentity,
+        ...(input.taskFeatures === undefined ? {} : { taskFeatures: input.taskFeatures }),
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        beforeAttempt: input.beforeAttempt,
+        afterAttempt: input.afterAttempt,
+        ...(options.complete === undefined ? {} : { complete: options.complete }),
+      });
+      return {
+        diagnosis: completion.diagnosis,
         routing: runRoutingDecision("fast-judge", completion.routing),
       };
     },

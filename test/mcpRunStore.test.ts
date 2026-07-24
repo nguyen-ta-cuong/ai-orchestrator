@@ -7,6 +7,7 @@ import type { McpProviderDefiniteFailureCode } from "../mcp/failureCodes.js";
 import {
   createMcpRunService,
   validateMcpRunRecoveryEnvelope,
+  type McpRunDiagnosisRequest,
   type McpRunJudgeRequest,
   type McpRunPlanRequest,
   type McpRunProvider,
@@ -256,7 +257,12 @@ describe("durable MCP run store", () => {
       runId: retryRun.runId,
       expectedRevision: retried.revision,
       event: { type: "plan_approved" },
-    })).toMatchObject({ status: "blocked", revision: retried.revision, requiredAction: "inspect_run" });
+    })).toMatchObject({
+      status: "active",
+      revision: retried.revision,
+      requiredAction: "implement_and_submit_code",
+      permittedEvents: ["code_result_submitted", "cancelled"],
+    });
     expect(await retryService.recover({
       requestId: "recovery-retry-1",
       runId: retryRun.runId,
@@ -290,7 +296,66 @@ describe("durable MCP run store", () => {
       expectedRevision: retried.revision,
       reason: "operator stopped recovery",
     });
-    expect(cancelled).toMatchObject({ status: "cancelled", outcome: "cancelled", currentNode: "failed" });
+    expect(cancelled).toMatchObject({ status: "cancelled", outcome: "cancelled", currentNode: "coding" });
+  }, 30_000);
+
+  it("retries a failed PLAN provider without mutating the immutable plan version", async () => {
+    const fixture = createFixture();
+    const provider = new PlanProvider(
+      ["approve"],
+      [],
+      [],
+      [undefined, "http_error", undefined],
+    );
+    const service = serviceFor(fixture, provider);
+    const started = await service.start(startInput("recovery-plan-retry-start"));
+    const failed = await service.advance({
+      requestId: "recovery-plan-retry-revise",
+      runId: started.runId,
+      expectedRevision: started.revision,
+      event: { type: "plan_revision_requested", feedback: "Clarify the existing plan without changing it." },
+    });
+    expect(failed).toMatchObject({ status: "failed", currentNode: "failed" });
+
+    const retried = await service.recover({
+      requestId: "recovery-plan-retry",
+      runId: started.runId,
+      expectedRevision: failed.revision,
+    });
+    expect(provider.planCalls).toBe(3);
+    expect(retried).toMatchObject({
+      status: "active",
+      currentNode: "awaiting_approval",
+      plan: "Durable plan",
+      progress: { planVersion: 1 },
+      recovery: {
+        action: "retry",
+        reason: "transient-failure",
+        executionStatus: "completed",
+        sourcePlanVersion: 1,
+      },
+    });
+
+    const restarted = serviceFor(fixture, provider, createStore(fixture));
+    const approved = await restarted.advance({
+      requestId: "recovery-plan-retry-approve",
+      runId: started.runId,
+      expectedRevision: retried.revision,
+      event: { type: "plan_approved" },
+    });
+    expect(approved).toMatchObject({
+      status: "active",
+      currentNode: "coding",
+      progress: { planVersion: 1 },
+      recovery: { executionStatus: "completed" },
+    });
+    const completed = await restarted.advance({
+      requestId: "recovery-plan-retry-code",
+      runId: started.runId,
+      expectedRevision: approved.revision,
+      event: { type: "code_result_submitted", diff: "implementation", testOutput: "passed" },
+    });
+    expect(completed).toMatchObject({ status: "done", currentNode: "done" });
   }, 30_000);
 
   it("rejects manufactured observations and derives checker rejection without client-authored diagnosis", async () => {
@@ -340,6 +405,194 @@ describe("durable MCP run store", () => {
         topologyAssessment: "preserve",
       },
     } as never)).rejects.toThrow();
+  }, 30_000);
+
+  it("executes server-authored DEBUG repair authority and resumes only the declared client BUILD action", async () => {
+    const fixture = createFixture();
+    const provider = new DiagnosingPlanProvider(["reject", "approve"]);
+    const service = serviceFor(fixture, provider);
+    const started = await service.start(startInput("recovery-debug-start"));
+    const approved = await service.advance({
+      requestId: "recovery-debug-approve",
+      runId: started.runId,
+      expectedRevision: started.revision,
+      event: { type: "plan_approved" },
+    });
+    const rejected = await service.advance({
+      requestId: "recovery-debug-code-1",
+      runId: started.runId,
+      expectedRevision: approved.revision,
+      event: { type: "code_result_submitted", diff: "defective implementation", testOutput: "failed" },
+    });
+    const diagnosed = await service.recover({
+      requestId: "recovery-debug-diagnose",
+      runId: started.runId,
+      expectedRevision: rejected.revision,
+    });
+    expect(provider.diagnoseCalls).toBe(1);
+    expect(diagnosed).toMatchObject({
+      status: "active",
+      currentNode: "coding",
+      requiredAction: "implement_and_submit_code",
+      permittedEvents: ["code_result_submitted", "cancelled"],
+      recovery: {
+        status: "released",
+        action: "repair",
+        executionStatus: "awaiting-client",
+        directive: {
+          rootCauseCategory: "implementation-defect",
+          repairScope: ["src"],
+          validationRequirements: ["verification-tests"],
+          topologyAssessment: "preserve",
+        },
+      },
+    });
+
+    const restarted = serviceFor(fixture, provider, createStore(fixture));
+    expect(await restarted.get({ runId: started.runId })).toMatchObject({
+      revision: diagnosed.revision,
+      recovery: { executionStatus: "awaiting-client" },
+    });
+    const completed = await restarted.advance({
+      requestId: "recovery-debug-code-2",
+      runId: started.runId,
+      expectedRevision: diagnosed.revision,
+      event: { type: "code_result_submitted", diff: "scoped repair", testOutput: "passed" },
+    });
+    expect(completed).toMatchObject({
+      status: "done",
+      currentNode: "done",
+      recovery: { action: "repair", executionStatus: "completed" },
+    });
+    const authority = await createStore(fixture).get(started.runId);
+    expect(authority?.recovery?.execution).toMatchObject({
+      action: "repair",
+      status: "completed",
+      requestRef: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(authority?.providerEvidence.some((evidence) =>
+      evidence.kind === "debug" && evidence.phase === "output_committed")).toBe(true);
+  }, 30_000);
+
+  it("materializes, restarts, approves, and activates an immutable structural successor plan", async () => {
+    const fixture = createFixture();
+    const provider = new DiagnosingPlanProvider(
+      ["reject", "reject"],
+      "structural",
+      ["Plan version one", "Plan version two"],
+    );
+    const service = serviceFor(fixture, provider);
+    const started = await service.start(startInput("recovery-replan-start"));
+    const approved = await service.advance({
+      requestId: "recovery-replan-approve-v1",
+      runId: started.runId,
+      expectedRevision: started.revision,
+      event: { type: "plan_approved" },
+    });
+    const rejected = await service.advance({
+      requestId: "recovery-replan-code-v1",
+      runId: started.runId,
+      expectedRevision: approved.revision,
+      event: { type: "code_result_submitted", diff: "wrong decomposition", testOutput: "failed" },
+    });
+    const successor = await service.recover({
+      requestId: "recovery-replan-diagnose",
+      runId: started.runId,
+      expectedRevision: rejected.revision,
+    });
+    expect(provider.diagnoseCalls).toBe(1);
+    expect(provider.planCalls).toBe(2);
+    expect(successor).toMatchObject({
+      status: "active",
+      currentNode: "awaiting_approval",
+      plan: "Plan version two",
+      progress: { planVersion: 2 },
+      requiredAction: "approve_or_revise_plan",
+      permittedEvents: ["plan_approved", "plan_revision_requested", "cancelled"],
+      recovery: {
+        action: "replan",
+        status: "waiting-successor-approval",
+        sourcePlanVersion: 1,
+        targetPlanVersion: 2,
+        directive: {
+          rootCauseCategory: "invalid-topology",
+          topologyAssessment: "structural",
+        },
+      },
+    });
+    const successorAuthority = await createStore(fixture).get(started.runId);
+    expect(successorAuthority?.recovery?.artifacts.map(({ semanticRef }) => semanticRef)).toEqual(
+      expect.arrayContaining([
+        "plan-versions/2/graph.json",
+        "plan-versions/2/plan.md",
+      ]),
+    );
+
+    const restarted = serviceFor(fixture, provider, createStore(fixture));
+    expect(await restarted.get({ runId: started.runId })).toMatchObject({
+      outcome: "current",
+      runId: successor.runId,
+      revision: successor.revision,
+      currentNode: "awaiting_approval",
+      progress: { planVersion: 2 },
+      recovery: { status: "waiting-successor-approval", targetPlanVersion: 2 },
+    });
+    const activated = await restarted.advance({
+      requestId: "recovery-replan-approve-v2",
+      runId: started.runId,
+      expectedRevision: successor.revision,
+      event: { type: "plan_approved" },
+    });
+    expect(activated).toMatchObject({
+      status: "active",
+      currentNode: "coding",
+      progress: { planVersion: 2 },
+      recovery: {
+        action: "replan",
+        status: "released",
+        sourcePlanVersion: 1,
+        targetPlanVersion: 2,
+      },
+    });
+    const activatedAuthority = await createStore(fixture).get(started.runId);
+    expect(activatedAuthority?.recovery?.artifacts.map(({ semanticRef }) => semanticRef))
+      .toContain("plan-versions/2/approval.json");
+    expect(activatedAuthority?.recovery?.ledger.records.slice(-2).map((record) =>
+      record.kind === "successor" ? record.event.phase : record.kind))
+      .toEqual(["approved", "activated"]);
+
+    const rejectedAgain = await restarted.advance({
+      requestId: "recovery-replan-code-v2",
+      runId: started.runId,
+      expectedRevision: activated.revision,
+      event: { type: "code_result_submitted", diff: "successor implementation", testOutput: "passed" },
+    });
+    expect(rejectedAgain).toMatchObject({
+      status: "active",
+      currentNode: "coding",
+      progress: { planVersion: 2 },
+    });
+    const exhausted = await restarted.recover({
+      requestId: "recovery-replan-exhausted",
+      runId: started.runId,
+      expectedRevision: rejectedAgain.revision,
+    });
+    expect(exhausted).toMatchObject({
+      status: "failed",
+      currentNode: "failed",
+      recovery: {
+        action: "fail",
+        reason: "recovery-level-consumed",
+        sourcePlanVersion: 2,
+        remaining: { retry: 1, repair: 1, replan: 0 },
+      },
+    });
+    expect(provider.diagnoseCalls).toBe(2);
+    expect(provider.planCalls).toBe(2);
+    const exhaustedAuthority = await createStore(fixture).get(started.runId);
+    expect(exhaustedAuthority?.recovery?.occurrenceBindings).toHaveLength(2);
+    expect(exhaustedAuthority?.recovery?.ledger.records.filter((record) =>
+      record.kind === "registration")).toHaveLength(2);
   }, 30_000);
 
   it("rejects a correct recovery registration bundled with a forged diagnosis decision", async () => {
@@ -491,6 +744,8 @@ class PlanProvider implements McpRunProvider {
   constructor(
     private readonly verdicts: Array<"approve" | "reject"> = [],
     private readonly judgeFailures: McpProviderDefiniteFailureCode[] = [],
+    private readonly plans: string[] = [],
+    private readonly planFailures: Array<McpProviderDefiniteFailureCode | undefined> = [],
   ) {}
 
   preflight() {
@@ -516,9 +771,14 @@ class PlanProvider implements McpRunProvider {
       estimatedCostUsd: 0.01,
     };
     await input.beforeAttempt(attempt);
+    const failureCode = this.planFailures.shift();
+    if (failureCode !== undefined) {
+      await input.afterAttempt({ ...attempt, outcome: "failed", failureCode });
+      throw new Error(failureCode);
+    }
     await input.afterAttempt({ ...attempt, outcome: "succeeded" });
     return {
-      plan: "Durable plan",
+      plan: this.plans.shift() ?? "Durable plan",
       routing: {
         decisionId: decision.decisionId,
         stage: "plan" as const,
@@ -575,6 +835,64 @@ class PlanProvider implements McpRunProvider {
     return verdict === "approve"
       ? { verdict, reasons: "independently approved", routing }
       : { verdict, reasons: "needs work", requiredFixes: "fix it", routing };
+  }
+}
+
+class DiagnosingPlanProvider extends PlanProvider {
+  diagnoseCalls = 0;
+
+  constructor(
+    verdicts: Array<"approve" | "reject"> = [],
+    private readonly topology: "preserve" | "structural" = "preserve",
+    plans: string[] = [],
+  ) {
+    super(verdicts, [], plans);
+  }
+
+  async diagnose(input: McpRunDiagnosisRequest): Promise<Awaited<ReturnType<NonNullable<McpRunProvider["diagnose"]>>>> {
+    this.diagnoseCalls += 1;
+    const decision = {
+      decisionId: `debug-${this.diagnoseCalls}`,
+      policyVersion: "test-v1",
+      policyDigest: digest("debug-policy"),
+      configDigest: digest("debug-config"),
+      candidatesDigest: digest("debug-candidates"),
+    };
+    const attempt: RoutedCompletionAttempt = {
+      attempt: 1,
+      providerRequestRef: digest(`debug-request-${this.diagnoseCalls}`),
+      routingDecision: decision,
+      identity: { provider: "test", model: "debugger", family: "debugger-family" },
+      thinking: "high",
+      requestedOutputTokens: 256,
+      estimatedCostUsd: 0.01,
+    };
+    await input.beforeAttempt(attempt);
+    await input.afterAttempt({ ...attempt, outcome: "succeeded" });
+    return {
+      diagnosis: {
+        rootCauseCategory: this.topology === "structural" ? "invalid-topology" : "implementation-defect",
+        confidence: "high",
+        summary: this.topology === "structural"
+          ? "The checker evidence identifies an invalid plan topology."
+          : "The checker evidence identifies a local implementation defect.",
+        repairScope: ["src"],
+        validationRequirements: ["verification-tests"],
+        topologyAssessment: this.topology,
+      },
+      routing: {
+        decisionId: decision.decisionId,
+        stage: "fast-judge",
+        selectedIndex: 0,
+        selectedIdentity: attempt.identity,
+        thinking: attempt.thinking,
+        policyVersion: decision.policyVersion,
+        policyDigest: decision.policyDigest,
+        configDigest: decision.configDigest,
+        candidatesDigest: decision.candidatesDigest,
+        fallbackHistory: [],
+      },
+    };
   }
 }
 

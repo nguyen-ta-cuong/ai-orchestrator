@@ -380,9 +380,15 @@ describe("MCP server", () => {
       });
       expect(toolStructuredContent(recoveryResult)).toMatchObject({
         runId: started.runId,
-        status: "blocked",
-        requiredAction: "inspect_run",
-        recovery: { action: "pause", reason: "diagnosis-required", status: "waiting-diagnosis" },
+        status: "active",
+        currentNode: "coding",
+        requiredAction: "implement_and_submit_code",
+        recovery: {
+          action: "repair",
+          reason: "local-defect",
+          status: "released",
+          executionStatus: "awaiting-client",
+        },
       });
     });
   });

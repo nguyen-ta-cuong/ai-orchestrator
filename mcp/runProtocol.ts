@@ -1,4 +1,5 @@
 import { z } from "zod/v3";
+import { FAILURE_CATEGORIES } from "../src/core/recovery.js";
 import { MCP_PROVIDER_DEFINITE_FAILURE_CODES } from "./failureCodes.js";
 
 const MCP_RUN_TEXT_MAX = 2_000_000;
@@ -170,6 +171,14 @@ export const mcpRunResponseSchema = z.object({
     sourcePlanVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     targetPlanVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
     remaining: z.object({ retry: z.number().int().min(0).max(1), repair: z.number().int().min(0).max(1), replan: z.number().int().min(0).max(1) }).strict(),
+    executionStatus: z.enum(["awaiting-client", "executing-provider", "completed"]).optional(),
+    directive: z.object({
+      rootCauseCategory: z.enum(FAILURE_CATEGORIES),
+      confidence: z.enum(["low", "medium", "high"]),
+      repairScope: z.array(z.string().max(4_096)).max(256),
+      validationRequirements: z.array(z.string().max(256)).max(256),
+      topologyAssessment: z.enum(["preserve", "structural"]),
+    }).strict().optional(),
   }).strict().optional(),
   conflict: z.object({
     expectedRevision: safeRevision,

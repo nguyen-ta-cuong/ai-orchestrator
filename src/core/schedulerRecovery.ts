@@ -58,7 +58,12 @@ const FROZEN_RECOVERY_BUDGETS: Readonly<RecoveryBudgets> = Object.freeze({
 export function createSchedulerRecoveryBinding(
   graph: CompiledGraph,
   stateValue: Readonly<GraphExecutionState>,
-  input: { nodeId: string; activePlanVersion: number; activePlanHash: string },
+  input: {
+    nodeId: string;
+    activePlanVersion: number;
+    activePlanHash: string;
+    ledgerAuthority?: Readonly<RecoveryAuthority>;
+  },
 ): SchedulerRecoveryBinding {
   assertScheduleValid(graph, stateValue);
   if (stateValue.lastAppliedEventSequence === 0 || stateValue.lastAppliedEventId === undefined ||
@@ -78,9 +83,6 @@ export function createSchedulerRecoveryBinding(
     runId: stateValue.runId,
     graphDigest: stateValue.graphDigest,
     nodeId: input.nodeId,
-    nodeVisit: node.visits,
-    schedulerRevision: stateValue.revision,
-    eventChainHash: stateValue.eventChainHash,
   }));
   const anchor: SchedulerRecoveryAnchor = Object.freeze({
     version: 1,
@@ -100,18 +102,28 @@ export function createSchedulerRecoveryBinding(
     activePlanHash: input.activePlanHash,
     failureLineageId: `lineage-${lineageDigest.slice(0, 48)}`,
   });
-  const authority = validateRecoveryAuthority({
-    version: 1,
-    runId: stateValue.runId,
-    graphDigest: stateValue.graphDigest,
-    activePlanVersion: input.activePlanVersion,
-    activePlanHash: input.activePlanHash,
-    limits: {
-      maxEntries: Math.min(stateValue.effectiveLimits.maxGraphSteps, MAX_RECOVERY_ENTRIES),
-      maxPlanVersions: stateValue.effectiveLimits.maxPlanVersions,
-      budgets: FROZEN_RECOVERY_BUDGETS,
-    },
-  });
+  const expectedLimits = {
+    maxEntries: Math.min(stateValue.effectiveLimits.maxGraphSteps, MAX_RECOVERY_ENTRIES),
+    maxPlanVersions: stateValue.effectiveLimits.maxPlanVersions,
+    budgets: FROZEN_RECOVERY_BUDGETS,
+  };
+  const authority = input.ledgerAuthority === undefined
+    ? validateRecoveryAuthority({
+        version: 1,
+        runId: stateValue.runId,
+        graphDigest: stateValue.graphDigest,
+        activePlanVersion: input.activePlanVersion,
+        activePlanHash: input.activePlanHash,
+        limits: expectedLimits,
+      })
+    : validateRecoveryAuthority(input.ledgerAuthority);
+  if (authority.runId !== stateValue.runId || authority.graphDigest !== stateValue.graphDigest ||
+      authority.activePlanVersion > input.activePlanVersion ||
+      (authority.activePlanVersion === input.activePlanVersion &&
+        authority.activePlanHash !== input.activePlanHash) ||
+      canonicalJson(authority.limits) !== canonicalJson(expectedLimits)) {
+    throw new Error("Recovery ledger authority is incompatible with the scheduler occurrence");
+  }
   return validateSchedulerRecoveryBinding({ version: 1, anchor, authority });
 }
 
@@ -149,7 +161,9 @@ export function validateSchedulerRecoveryBinding(value: unknown): SchedulerRecov
   }
   const authority = validateRecoveryAuthority(record.authority);
   if (authority.runId !== anchor.runId || authority.graphDigest !== anchor.graphDigest ||
-      authority.activePlanVersion !== anchor.activePlanVersion || authority.activePlanHash !== anchor.activePlanHash) {
+      authority.activePlanVersion > anchor.activePlanVersion ||
+      (authority.activePlanVersion === anchor.activePlanVersion &&
+        authority.activePlanHash !== anchor.activePlanHash)) {
     throw new Error("Scheduler recovery authority is not bound to its external anchor");
   }
   return Object.freeze({ version: 1, anchor, authority });
@@ -186,6 +200,7 @@ export function assertSchedulerRecoveryAnchor(
     nodeId: anchor.nodeId,
     activePlanVersion: anchor.activePlanVersion,
     activePlanHash: anchor.activePlanHash,
+    ledgerAuthority: authority,
   });
   if (canonicalJson(recreated) !== canonicalJson(binding)) {
     throw new Error("Scheduler recovery failure lineage is not scheduler-issued");
@@ -210,8 +225,8 @@ export function schedulerFailureEvidence(
     nodeKind: node.handler,
     graphVersion: binding.anchor.graphVersion,
     graphDigest: binding.authority.graphDigest,
-    planVersion: binding.authority.activePlanVersion,
-    planHash: binding.authority.activePlanHash,
+    planVersion: binding.anchor.activePlanVersion,
+    planHash: binding.anchor.activePlanHash,
     attempt,
     failureLineageId: binding.anchor.failureLineageId,
     ...(observation.contractViolation === undefined ? {} : { contractViolation: observation.contractViolation }),

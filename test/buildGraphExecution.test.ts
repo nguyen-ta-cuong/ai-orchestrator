@@ -135,4 +135,46 @@ describe("durable BUILD graph execution", () => {
     expect(releaseBuildGraphExecution(run.paths, graphOwner)).toBe(true);
     expect(releaseRunLease(run.paths, replacement)).toBe(true);
   });
+
+  it("keeps every immutable plan version in a distinct recoverable graph namespace", () => {
+    const { run, compiled, owner, graphOwner } = fixture();
+    const second = compileLegacySequentialBuildPlan("Implement the successor.", 2, ["src"]);
+    const secondOwner = acquireBuildGraphExecutionLease(run.paths, owner, {
+      now,
+      pid: process.pid,
+      planVersion: 2,
+    });
+
+    const firstState = initializeBuildGraphExecution(run.paths, compiled, {
+      owner,
+      graphOwner,
+      now,
+      pid: process.pid,
+      limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+    const secondState = initializeBuildGraphExecution(run.paths, second, {
+      owner,
+      graphOwner: secondOwner,
+      now,
+      pid: process.pid,
+      limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: {} },
+    });
+
+    expect(firstState.planVersion).toBe(1);
+    expect(secondState.planVersion).toBe(2);
+    expect(buildGraphExecutionPaths(run.paths, 1).root).not.toBe(buildGraphExecutionPaths(run.paths, 2).root);
+    expect(recoverBuildGraphExecution(run.paths, compiled, {
+      owner,
+      graphOwner,
+      tempId: "recover-first-version",
+    }).planVersion).toBe(1);
+    expect(recoverBuildGraphExecution(run.paths, second, {
+      owner,
+      graphOwner: secondOwner,
+      tempId: "recover-second-version",
+    }).planVersion).toBe(2);
+
+    expect(releaseBuildGraphExecution(run.paths, graphOwner, 1)).toBe(true);
+    expect(releaseBuildGraphExecution(run.paths, secondOwner, 2)).toBe(true);
+  });
 });

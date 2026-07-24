@@ -139,6 +139,41 @@ describe("nextStage", () => {
     expect(reviewing.consecutiveRejections).toBe(0);
   });
 
+  it("applies typed recovery routes without re-deriving legacy counter policy", () => {
+    const debugging = createIdleLifecycleState({
+      phase: "debugging",
+      task: "recover",
+      buildIterations: 1,
+      consecutiveRejections: 1,
+    });
+
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "retry",
+      retryPhase: "reviewing",
+    }, config).phase).toBe("reviewing");
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "repair",
+    }, config).phase).toBe("building");
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "replan",
+    }, config)).toMatchObject({ phase: "planning", consecutiveRejections: 0 });
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "fail",
+    }, config).phase).toBe("failed");
+    expect(() => nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "retry",
+    }, config)).toThrow(/exact checker phase/i);
+    expect(nextStage(createIdleLifecycleState({
+      phase: "building",
+      task: "recover",
+    }), { type: "recovery_failed" }, config).phase).toBe("failed");
+  });
+
   it("escalates two consecutive review rejections to planning while preserving build iterations", () => {
     const reviewing = nextStage(builtOnce(), { type: "verdict", stage: "verify", verdict: "approve", reasons: "ok" }, config);
     const firstDebug = nextStage(reviewing, { type: "verdict", stage: "review", verdict: "reject", reasons: "first" }, config);

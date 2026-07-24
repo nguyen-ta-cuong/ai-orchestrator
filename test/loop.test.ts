@@ -269,4 +269,39 @@ describe("nextPhase", () => {
     const coding = approvePlan();
     expect(nextPhase(coding, { type: "provider_failed" }, config)).toEqual(coding);
   });
+
+  it("routes typed recovery without charging a judge retry as another BUILD pass", () => {
+    const failedJudge = nextPhase(completeCoding(approvePlan()), { type: "provider_failed" }, config);
+    const retrying = nextPhase(
+      failedJudge,
+      { type: "recovery_directed", action: "retry", providerKind: "judge" },
+      config,
+    );
+    expect(retrying).toMatchObject({
+      phase: "coding",
+      coderIterations: 1,
+      pendingProviderRetry: "judge",
+    });
+    expect(nextPhase(retrying, { type: "code_produced" }, config)).toMatchObject({
+      phase: "judging",
+      coderIterations: 1,
+      pendingProviderRetry: undefined,
+    });
+  });
+
+  it("routes recovery repair and replan but never bypasses the BUILD cap", () => {
+    const rejected = nextPhase(
+      completeCoding(approvePlan()),
+      { type: "verdict", verdict: "reject", reasons: "defect", requiredFixes: "repair it" },
+      config,
+    );
+    expect(nextPhase(rejected, { type: "recovery_directed", action: "repair" }, config).phase).toBe("coding");
+    expect(nextPhase(rejected, { type: "recovery_directed", action: "replan" }, config)).toMatchObject({
+      phase: "replanning",
+      consecutiveRejections: 0,
+    });
+    const capped = { ...rejected, coderIterations: config.maxCoderIterations };
+    expect(nextPhase(capped, { type: "recovery_directed", action: "repair" }, config).phase).toBe("failed");
+    expect(nextPhase(capped, { type: "recovery_directed", action: "replan" }, config).phase).toBe("failed");
+  });
 });
