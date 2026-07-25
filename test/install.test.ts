@@ -10,6 +10,7 @@ const mcpBinPath = resolve("bin/ai-orchestrator-mcp.js");
 const staticSnippetPath = resolve("cursor/mcp.json");
 const packageJsonPath = resolve("package.json");
 const galleryImagePath = resolve("docs/images/ai-orchestrator-workflow.png");
+const piBuildGraphLifecyclePath = resolve("src/lifecycle/piBuildGraphLifecycle.ts");
 
 function makeTempDir(): string {
   const dir = join(tmpdir(), `ai-orchestrator-install-${process.pid}-${Math.random().toString(36).slice(2)}`);
@@ -179,6 +180,13 @@ describe("ai-orchestrator install-cursor", () => {
       skills: ["./skills"],
       image: "https://cdn.jsdelivr.net/npm/@miracle3010/ai-orchestrator/docs/images/ai-orchestrator-workflow.png",
     });
+  });
+
+  it("keeps the package root linkable when optional Pi peers are absent", () => {
+    const source = readFileSync(piBuildGraphLifecyclePath, "utf8");
+
+    expect(source).toContain('await import("../runtime/piBuildWorker.js")');
+    expect(source).not.toMatch(/^import\s+\{[^}]*createPiBuildWorkerAdapter[^}]*\}\s+from\s+"..\/runtime\/piBuildWorker\.js";/m);
   });
 
   it("declares the approved npm author", () => {

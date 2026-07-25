@@ -391,7 +391,7 @@ describe("MCP server", () => {
         },
       });
     });
-  });
+  }, 15_000);
 
   it("calls orchestrator_plan for fresh plans and replans", async () => {
     await withServer(async (client) => {

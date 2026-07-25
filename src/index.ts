@@ -1,4 +1,5 @@
 export * from "./core/config.js";
+export * from "./core/executionRouting.js";
 export * from "./core/buildPlan.js";
 export * from "./core/buildExecution.js";
 export * from "./core/buildScheduler.js";
@@ -6,6 +7,7 @@ export * from "./lifecycle/buildCoordinator.js";
 export * from "./lifecycle/piBuildGraphLifecycle.js";
 export * from "./lifecycle/buildHumanIntegration.js";
 export * from "./core/graph.js";
+export * from "./core/graphEvidence.js";
 export * from "./core/lifecycle.js";
 export * from "./core/lifecyclePrompts.js";
 export * from "./core/lifecycleRouting.js";
@@ -20,3 +22,4 @@ export * from "./core/schedulerRecovery.js";
 export * from "./core/taskFeatures.js";
 export * from "./core/tests.js";
 export * from "./core/workflowGraphs.js";
+export * from "./lifecycle/graphReleaseEvidenceStore.js";
