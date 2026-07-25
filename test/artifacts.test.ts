@@ -1101,6 +1101,24 @@ describe("lifecycle artifacts", () => {
     expect(existsSync(join(cwd, ".ai-orchestrator", "active-run.json"))).toBe(true);
   });
 
+  it("preserves a replacement active-run registry across a release race", () => {
+    const cwd = makeTempDir();
+    const run = createRun(cwd, artifactsDir, "task");
+    const pointer = join(cwd, ".ai-orchestrator", "runs", "current");
+    const registry = join(cwd, ".ai-orchestrator", "active-run.json");
+    const registryBytes = readFileSync(registry);
+
+    expect(releaseRun(cwd, artifactsDir, run.runId, {
+      beforeRegistryRemove() {
+        unlinkSync(registry);
+        writeFileSync(registry, registryBytes);
+      },
+    })).toBe(false);
+    expect(existsSync(pointer)).toBe(false);
+    expect(readFileSync(registry)).toEqual(registryBytes);
+    expect(currentRun(cwd, artifactsDir)).toMatchObject({ runId: run.runId });
+  });
+
   it("recovers exact registry ownership after a crash between pointer and registry release", () => {
     const cwd = makeTempDir();
     const run = createRun(cwd, artifactsDir, "task");
