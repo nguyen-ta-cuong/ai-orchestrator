@@ -210,7 +210,7 @@ export async function runBuildCoordinator(
               state = checkpoint(paths, compiled, state, budget.event, options, "worker-budget");
               reservation = budget.reservation;
             } else {
-              const intent = readGraphEvents(buildGraphExecutionPaths(paths)).find((event) =>
+              const intent = readGraphEvents(buildGraphExecutionPaths(paths, state.planVersion)).find((event) =>
                 event.kind === "side-effect-intent" && event.requestRef === sideEffect.requestRef);
               if (!intent) throw new Error("BUILD worker budget intent is absent from the durable graph event log");
               reservation = recoverBuildWorkerBudgetReservation(compiled, state, action, intent, estimates);
@@ -434,7 +434,7 @@ function buildHumanIntegrationIntent(
   };
   const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
   const requestRef = createHash("sha256").update(bytes).digest("hex");
-  const checkpointRef = writeGraphMutationArtifact(buildGraphExecutionPaths(paths), {
+  const checkpointRef = writeGraphMutationArtifact(buildGraphExecutionPaths(paths, state.planVersion), {
     owner: options.graphOwner,
     mutationId: requestRef,
     bytes,
@@ -507,7 +507,7 @@ function writeBuildWorkerBudgetCheckpoint(
   };
   const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
   const mutationId = createHash("sha256").update(bytes).digest("hex");
-  return writeGraphMutationArtifact(buildGraphExecutionPaths(paths), {
+  return writeGraphMutationArtifact(buildGraphExecutionPaths(paths, state.planVersion), {
     owner: options.graphOwner,
     mutationId,
     bytes,

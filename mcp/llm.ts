@@ -1,5 +1,12 @@
+import { createHash, randomUUID } from "node:crypto";
 import type { OrchestratorConfig, ThinkingLevel } from "../src/core/config.js";
 import type { McpCompletionCandidate } from "./routing.js";
+import {
+  classifyMcpProviderFailure,
+  isUncertainMcpProviderFailure,
+  type McpProviderDefiniteFailureCode,
+  type McpProviderUncertainFailureCode,
+} from "./failureCodes.js";
 
 export type ModelRole = "planner" | "judge";
 
@@ -12,14 +19,44 @@ export interface CompletionRequest {
 
 export interface RoutedCompletionRequest extends CompletionRequest {
   candidates: readonly McpCompletionCandidate[];
+  /** Frozen before the first durable attempt reservation or provider call. */
+  routingDecision?: RoutedCompletionDecision;
   /** Reject candidate output before accepting it, allowing an eligible fallback. */
   validateText?: (text: string) => void;
+  /** Called before each paid provider attempt. Callback failures stop fallback. */
+  beforeAttempt?: (attempt: RoutedCompletionAttempt) => void | Promise<void>;
+  /** Called after each provider attempt. Callback failures stop fallback. */
+  afterAttempt?: (result: RoutedCompletionAttemptResult) => void | Promise<void>;
 }
+
+export interface RoutedCompletionAttempt {
+  attempt: number;
+  /** Stable, server-derived identity for the exact paid provider request. */
+  providerRequestRef: string;
+  routingDecision: RoutedCompletionDecision;
+  identity: { provider: string; model: string; family?: string };
+  thinking: ThinkingLevel;
+  requestedOutputTokens?: number;
+  estimatedCostUsd?: number;
+}
+
+export type RoutedCompletionAttemptResult =
+  | (RoutedCompletionAttempt & { outcome: "succeeded" })
+  | (RoutedCompletionAttempt & { outcome: "failed"; failureCode: McpProviderDefiniteFailureCode })
+  | (RoutedCompletionAttempt & { outcome: "unknown"; failureCode: McpProviderUncertainFailureCode });
 
 export interface RoutedCompletionResult {
   text: string;
   selectedIndex: number;
-  fallbackHistory: Array<{ identity: string; reason: string }>;
+  fallbackHistory: Array<{ identity: string; reason: McpProviderDefiniteFailureCode }>;
+}
+
+export interface RoutedCompletionDecision {
+  decisionId: string;
+  policyVersion: string;
+  policyDigest: string;
+  configDigest: string;
+  candidatesDigest: string;
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
@@ -32,12 +69,46 @@ export async function completeWithRole({ config, role, prompt, signal }: Complet
   return (await completeRouted({ config, role, prompt, signal, candidates: [config.roles[role]] })).text;
 }
 
-export async function completeRouted({ config, role, prompt, signal, candidates, validateText }: RoutedCompletionRequest): Promise<RoutedCompletionResult> {
+export async function completeRouted({
+  config,
+  role,
+  prompt,
+  signal,
+  candidates,
+  routingDecision: suppliedRoutingDecision,
+  validateText,
+  beforeAttempt,
+  afterAttempt,
+}: RoutedCompletionRequest): Promise<RoutedCompletionResult> {
+  const routingDecision = suppliedRoutingDecision ?? freezeRoutingDecision(
+    config,
+    candidates,
+    config.routing.version,
+    `compat-${randomUUID()}`,
+  );
   const fallbackHistory: RoutedCompletionResult["fallbackHistory"] = [];
   for (let index = 0; index < candidates.length; index += 1) {
     const roleConfig = candidates[index]!;
+    const attempt: RoutedCompletionAttempt = {
+      attempt: index + 1,
+      providerRequestRef: providerRequestReference(config, role, prompt, roleConfig, index + 1),
+      routingDecision: structuredClone(routingDecision),
+      identity: {
+        provider: roleConfig.provider,
+        model: roleConfig.model,
+        ...(roleConfig.family === undefined ? {} : { family: roleConfig.family }),
+      },
+      thinking: roleConfig.thinking,
+      ...(roleConfig.requestedOutputTokens === undefined ? {} : { requestedOutputTokens: roleConfig.requestedOutputTokens }),
+      ...(roleConfig.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: roleConfig.estimatedCostUsd }),
+    };
+
+    // These callbacks are outside the provider catch boundary deliberately:
+    // a failed durable reservation/settlement must never trigger another call.
+    await beforeAttempt?.(attempt);
+    let text: string;
     try {
-      const text = await completeCandidate(config, role, roleConfig, prompt, signal);
+      text = await completeCandidate(config, role, roleConfig, prompt, signal);
       if (validateText) {
         try {
           validateText(text);
@@ -45,14 +116,98 @@ export async function completeRouted({ config, role, prompt, signal, candidates,
           throw new Error("Candidate output failed required schema validation");
         }
       }
-      return { text, selectedIndex: index, fallbackHistory };
     } catch (error) {
-      const reason = sanitizeError(error, Object.values(config.mcp.providers).flatMap((provider) => provider.apiKey ? [provider.apiKey] : []));
-      fallbackHistory.push({ identity: `${roleConfig.provider}/${roleConfig.model}`, reason });
-      if (signal?.aborted || index === candidates.length - 1) throw new Error(`All eligible MCP completion candidates failed: ${fallbackHistory.map((item) => `${item.identity}: ${item.reason}`).join("; ")}`);
+      const safeSummary = sanitizeError(error, Object.values(config.mcp.providers).flatMap((provider) => provider.apiKey ? [provider.apiKey] : []));
+      const failureCode = classifyMcpProviderFailure(safeSummary);
+      if (isUncertainMcpProviderFailure(failureCode)) {
+        await afterAttempt?.({ ...attempt, outcome: "unknown", failureCode });
+        throw new Error(`Provider outcome is uncertain for ${roleConfig.provider}/${roleConfig.model}: ${safeSummary}`);
+      }
+      await afterAttempt?.({ ...attempt, outcome: "failed", failureCode });
+      fallbackHistory.push({ identity: `${roleConfig.provider}/${roleConfig.model}`, reason: failureCode });
+      if (signal?.aborted || index === candidates.length - 1) {
+        throw new Error(`All eligible MCP completion candidates failed: ${roleConfig.provider}/${roleConfig.model}: ${safeSummary}`);
+      }
+      continue;
     }
+    await afterAttempt?.({ ...attempt, outcome: "succeeded" });
+    return { text, selectedIndex: index, fallbackHistory };
   }
   throw new Error("No MCP completion candidates were supplied");
+}
+
+/** Freeze non-secret routing authority before any provider-attempt callback. */
+export function freezeRoutingDecision(
+  config: OrchestratorConfig,
+  candidates: readonly McpCompletionCandidate[],
+  policyVersion: string,
+  decisionId: string,
+): RoutedCompletionDecision {
+  const providers = Object.fromEntries(Object.entries(config.mcp.providers).map(([name, provider]) => [
+    name,
+    { baseUrl: provider.baseUrl, api: provider.api },
+  ]));
+  return {
+    decisionId,
+    policyVersion,
+    policyDigest: sha256(canonicalJson(config.routing)),
+    configDigest: sha256(canonicalJson({ roles: config.roles, providers, models: config.mcp.models })),
+    candidatesDigest: sha256(canonicalJson(candidates)),
+  };
+}
+
+/**
+ * Hash only canonical, non-secret inputs that determine a provider call. The
+ * reference is intentionally independent from the client mutation request ID:
+ * one mutation may contain several paid fallback attempts.
+ */
+export function providerRequestReference(
+  config: OrchestratorConfig,
+  role: ModelRole,
+  prompt: string,
+  candidate: McpCompletionCandidate,
+  attempt: number,
+): string {
+  const provider = config.mcp.providers[candidate.provider];
+  const canonical = {
+    version: "mcp-provider-request-v1",
+    operation: role === "planner" ? "plan" : "judge",
+    role,
+    attempt,
+    promptHash: sha256(prompt),
+    provider: {
+      name: candidate.provider,
+      api: provider?.api ?? null,
+      baseUrl: provider?.baseUrl ?? null,
+    },
+    candidate: {
+      model: candidate.model,
+      family: candidate.family ?? null,
+      thinking: candidate.thinking,
+      requestedOutputTokens: candidate.requestedOutputTokens ?? null,
+      maxOutputTokens: candidate.maxOutputTokens ?? null,
+    },
+  };
+  return sha256(JSON.stringify(canonical));
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, item]) => [key, canonicalize(item)]));
+  }
+  return value;
 }
 
 async function completeCandidate(config: OrchestratorConfig, role: ModelRole, roleConfig: McpCompletionCandidate, prompt: string, signal?: AbortSignal): Promise<string> {
@@ -70,7 +225,7 @@ async function completeCandidate(config: OrchestratorConfig, role: ModelRole, ro
       console.error("[ai-orchestrator-mcp] AI_ORCH_FAKE_LLM=1 is active; returning fake planner/judge responses.");
       fakeLlmWarningPrinted = true;
     }
-    return fakeCompletion(role);
+    return fakeCompletion(role, prompt);
   }
 
   const text = await (async () => {
@@ -111,13 +266,23 @@ function sanitizeError(error: unknown, secrets: string[]): string {
   return "MCP candidate failed";
 }
 
-function fakeCompletion(role: ModelRole): string {
+function fakeCompletion(role: ModelRole, prompt: string): string {
   if (role === "planner") {
     return [
       "1. Inspect the relevant files and existing tests.",
       "2. Implement the requested behavior with minimal, focused changes.",
       "3. Run the detected project tests and fix any failures.",
     ].join("\n");
+  }
+  if (prompt.includes("read-only DEBUG checker")) {
+    return JSON.stringify({
+      rootCauseCategory: "implementation-defect",
+      confidence: "high",
+      summary: "The fake checker rejection identifies a local implementation defect.",
+      repairScope: ["src"],
+      validationRequirements: ["verification-tests"],
+      topologyAssessment: "preserve",
+    });
   }
   const verdict = process.env.AI_ORCH_FAKE_LLM_VERDICT === "approve" ? "approve" : "reject";
   return JSON.stringify({

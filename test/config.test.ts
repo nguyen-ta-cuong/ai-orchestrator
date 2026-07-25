@@ -378,6 +378,98 @@ describe("loadConfig", () => {
     });
   });
 
+  it("keeps MCP run authority user-owned while project config may only tighten mirror and retention", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+
+    expect(loadConfig(project, { ignoreProjectMcpProviders: true }).mcp.runs).toEqual({
+      userStoreDir: "mcp-runs",
+      projectMirror: false,
+      terminalRetentionDays: 30,
+    });
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: {
+        runs: {
+          userStoreDir: "trusted-mcp-state",
+          projectMirror: true,
+          terminalRetentionDays: 60,
+        },
+      },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: {
+        runs: {
+          userStoreDir: "../../attacker-state",
+          authorityRoot: "/future/attacker-authority",
+          providerCredentialPath: "../../future-secret",
+          projectMirror: false,
+          terminalRetentionDays: 7,
+        },
+      },
+    });
+
+    const constrained = loadConfig(project, { ignoreProjectMcpProviders: true }).mcp.runs;
+    expect(constrained).toEqual({
+      userStoreDir: "trusted-mcp-state",
+      projectMirror: false,
+      terminalRetentionDays: 7,
+    });
+    expect(constrained).not.toHaveProperty("authorityRoot");
+    expect(constrained).not.toHaveProperty("providerCredentialPath");
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {});
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: {
+        runs: {
+          userStoreDir: "../../attacker-state",
+          projectMirror: true,
+          terminalRetentionDays: 365,
+        },
+      },
+    });
+    expect(loadConfig(project, { ignoreProjectMcpProviders: true }).mcp.runs).toEqual({
+      userStoreDir: "mcp-runs",
+      projectMirror: false,
+      terminalRetentionDays: 30,
+    });
+  });
+
+  it("validates trusted MCP run storage configuration", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: { runs: { userStoreDir: "../outside" } },
+    });
+    expect(() => loadConfig(project, { ignoreProjectMcpProviders: true }))
+      .toThrow("mcp.runs.userStoreDir must be a relative path inside the user ai-orchestrator directory");
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: { runs: { terminalRetentionDays: 0 } },
+    });
+    expect(() => loadConfig(project, { ignoreProjectMcpProviders: true }))
+      .toThrow("mcp.runs.terminalRetentionDays must be a positive integer");
+  });
+
+  it.each([".", "./mcp-runs", "mcp-runs/.", "mcp-runs//nested", "mcp-runs/", "mcp-runs\u0000nested"]) (
+    "rejects non-canonical MCP run storage path %j",
+    (userStoreDir) => {
+      const home = makeTempDir();
+      const project = makeTempDir();
+      mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+      vi.stubEnv("HOME", home);
+      writeJson(join(home, ".ai-orchestrator", "config.json"), { mcp: { runs: { userStoreDir } } });
+
+      expect(() => loadConfig(project, { ignoreProjectMcpProviders: true }))
+        .toThrow("mcp.runs.userStoreDir must be a relative path inside the user ai-orchestrator directory");
+    },
+  );
+
   it("does not merge prototype-pollution keys from config files", () => {
     const home = makeTempDir();
     const project = makeTempDir();

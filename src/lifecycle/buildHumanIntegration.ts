@@ -258,7 +258,7 @@ export async function completeBuildHumanIntegration(
       graphOwner: options.graphOwner,
     });
   } else {
-    graphResultRef = writeNodeArtifact(buildGraphExecutionPaths(paths), {
+    graphResultRef = writeNodeArtifact(buildGraphExecutionPaths(paths, state.planVersion), {
       owner: options.graphOwner,
       planVersion: state.planVersion,
       nodeId,

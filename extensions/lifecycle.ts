@@ -51,6 +51,7 @@ import {
   type CompiledBuildPlan,
 } from "../src/core/buildPlan.js";
 import { requireBuildRepositoryPath } from "../src/core/repositoryPath.js";
+import { FAILURE_CATEGORIES, type FailureCategory } from "../src/core/recovery.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import { createReviewedCommandRegistry, executeReviewedCommand } from "../src/lifecycle/reviewedCommandRegistry.js";
@@ -96,12 +97,28 @@ import {
 } from "../src/lifecycle/buildGraphExecution.js";
 import { executeBuildGraphLifecycle } from "../src/lifecycle/piBuildGraphLifecycle.js";
 import {
+  approveAndActivateLifecycleRecoverySuccessor,
+  completeLifecycleRecoveryAction,
+  createLifecycleRecoveryEnvelope,
+  currentLifecycleRecoveryState,
+  latestLifecycleRecoveryDecision,
+  latestLifecycleRecoveryDirective,
+  recordLifecycleRecoveryDiagnosis,
+  recordLifecycleRecoverySuccessorArtifacts,
+  registerLifecycleRecoveryOccurrence,
+  startLifecycleRecoveryAction,
+} from "../src/lifecycle/recoveryExecution.js";
+import {
   completeBuildHumanIntegration,
   prepareBuildHumanIntegrationReview,
   type BuildHumanIntegrationReview,
 } from "../src/lifecycle/buildHumanIntegration.js";
 import { createLocalGitRunner } from "../src/lifecycle/worktreeExecution.js";
-import type { PiBuildModel } from "../src/runtime/piBuildWorker.js";
+import { createPiBuildWorkerAdapter, type PiBuildModel } from "../src/runtime/piBuildWorker.js";
+import {
+  createRecoveryBuildWorkerRequest,
+  validateBuildWorkerReceipt,
+} from "../src/runtime/buildWorker.js";
 import { applyWorkflowTransition } from "../src/adapters/piWorkflow/graphExecution.js";
 import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
 import {
@@ -109,6 +126,7 @@ import {
   writeGraphMutationArtifact,
   type GraphCheckpointLease,
 } from "../src/runtime/graphCheckpoint.js";
+import { buildWorkspaceWriteFingerprint } from "../src/lifecycle/piBuildCoordinatorAdapter.js";
 
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
@@ -130,10 +148,12 @@ type StandaloneStage = "spec" | "plan" | "build" | "test" | "debug" | "review" |
 interface PendingDiagnosis {
   rootCause: string;
   evidence: string;
+  rootCauseCategory: FailureCategory;
   confidence: "low" | "medium" | "high";
   recommendedFix: string;
   filesLikelyAffected: string[];
   validationCommands: string[];
+  topologyAssessment: "preserve" | "structural";
 }
 
 type PendingVerdict =
@@ -156,6 +176,7 @@ interface Runtime {
   attemptedModels: string[];
   leaseOwner: GraphCheckpointLease;
   buildLease?: GraphCheckpointLease;
+  buildLeasePlanVersion?: number;
   trustedRecoveryRequestRef?: string;
   lastUsage?: {
     inputTokens: number;
@@ -513,6 +534,17 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         }
         const reference = writeImmutableBuildPlan(runtime!.paths, compiled, { owner: runtime!.leaseOwner });
         const markdown = readFileSync(reference.markdownPath, "utf8");
+        if (runtime!.state.recovery &&
+            currentLifecycleRecoveryState(runtime!.state.recovery).status === "waiting-successor-artifact") {
+          runtime!.state.recovery = recordLifecycleRecoverySuccessorArtifacts(
+            runtime!.paths,
+            runtime!.leaseOwner,
+            runtime!.state.recovery,
+            compiled,
+            Buffer.from(markdown, "utf8"),
+          );
+          writeRuntimeState();
+        }
         assertRunPathsSafe(runtime!.paths);
         writeFileSync(runtime!.paths.plan, markdown);
         appendRuntimeJournal(runtime!, `Structured BUILD plan v${reference.planVersion} checkpointed: ${reference.planHash}`);
@@ -569,20 +601,38 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       parameters: Type.Object({
         rootCause: Type.String(),
         evidence: Type.String(),
+        rootCauseCategory: StringEnum(FAILURE_CATEGORIES),
         confidence: StringEnum(["low", "medium", "high"] as const),
         recommendedFix: Type.String(),
         filesLikelyAffected: Type.Array(Type.String()),
         validationCommands: Type.Array(Type.String()),
+        topologyAssessment: StringEnum(["preserve", "structural"] as const),
       }),
       async execute(_id, params) {
         requireToolPhase("debugging", "debug_diagnosis");
         const diagnosis = params as PendingDiagnosis;
+        ensureLifecycleRecoveryForLatestRejection();
+        if (!runtime!.state.recovery) throw new Error("DEBUG recovery authority was not initialized");
+        const diagnosisBytes = Buffer.from(formatDiagnosis(diagnosis), "utf8");
+        runtime!.state.recovery = recordLifecycleRecoveryDiagnosis(
+          runtime!.paths,
+          runtime!.leaseOwner,
+          runtime!.state.recovery,
+          {
+            rootCauseCategory: diagnosis.rootCauseCategory,
+            confidence: diagnosis.confidence,
+            repairScope: diagnosis.filesLikelyAffected,
+            validationRequirements: diagnosis.validationCommands.map(recoveryValidationRequirement),
+            topologyAssessment: diagnosis.topologyAssessment,
+            diagnosisBytes,
+          },
+        );
         runtime!.pendingDiagnosis = diagnosis;
         runtime!.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
         runtime!.state.reminder = undefined;
-        writeRuntimeState();
         assertRunPathsSafe(runtime!.paths);
-        writeFileSync(runtime!.paths.debug, formatDiagnosis(diagnosis));
+        writeFileSync(runtime!.paths.debug, diagnosisBytes);
+        writeRuntimeState();
         appendRuntimeJournal(runtime!, `DEBUG diagnosis recorded: ${truncate(diagnosis.rootCause, 160)}`);
         persistMirror(runtime!.state);
         return { content: [{ type: "text", text: "Recorded DEBUG diagnosis." }], details: diagnosis, terminate: true };
@@ -1409,6 +1459,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
     runtime.pendingDiagnosis = undefined;
+    ensureRecoveryRetryDispatched();
     switch (runtime.state.phase) {
       case "defining":
         if (!(await enterRoutedStage("define", "spec", ctx))) return;
@@ -1428,7 +1479,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         const spec = readRequired(runtime.paths.spec, "spec");
         recoverIncompleteBuildPlan(runtime.paths, { owner: runtime.leaseOwner });
         const latestVersion = latestBuildPlanVersion(runtime.paths);
-        if (latestVersion !== undefined) {
+        const recoveryState = runtime.state.recovery
+          ? currentLifecycleRecoveryState(runtime.state.recovery)
+          : undefined;
+        const requiredSuccessorVersion = recoveryState?.status === "waiting-successor-artifact"
+          ? recoveryState.successor?.targetPlanVersion
+          : undefined;
+        if (latestVersion !== undefined &&
+            (requiredSuccessorVersion === undefined || latestVersion === requiredSuccessorVersion)) {
           const latest = readImmutableBuildPlan(runtime.paths, latestVersion);
           const latestMarkdown = readFileSync(join(runtime.paths.root, "build", "plan-versions", String(latestVersion), "plan.md"), "utf8");
           if (runtime.state.planFingerprint !== convergenceFingerprint(latestMarkdown)) {
@@ -1485,13 +1543,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         break;
       }
       case "debugging": {
+        ensureLifecycleRecoveryForLatestRejection();
         const rejectionIndex = latestRejectionIndex();
         if (runtime.state.debugDiagnosisVerdictIndex === rejectionIndex && isNonEmpty(runtime.paths.debug)) {
-          await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "Recovered durable DEBUG diagnosis", ctx);
-          if (!runtime) return;
-          const recoveredPhase = runtime.state.phase as LifecyclePhase;
-          if (recoveredPhase === "failed") await finishRun(ctx);
-          else await continueOrPause(ctx, nextStandaloneForPhase(recoveredPhase));
+          await transitionAfterDebugRecovery(ctx, "Recovered durable DEBUG diagnosis");
           break;
         }
         const spec = readRequired(runtime.paths.spec, "spec");
@@ -1572,6 +1627,10 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const active = runtime;
     const runId = active.state.runId;
     const stillOwnsBuild = (): boolean => runtime === active && ownsRun(runId, "building");
+    if (active.state.recovery?.action?.action === "repair") {
+      await enterRecoveryRepair(ctx);
+      return;
+    }
     const breaker = convergenceBreakerReason(active.state, active.config);
     if (breaker) {
       await interruptRun(ctx, `Lifecycle BUILD paused by convergence circuit breaker: ${breaker}`);
@@ -1579,14 +1638,21 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     const plan = readRequired(active.paths.plan, "plan");
     const compiled = ensureImmutableBuildPlanForExecution(plan);
+    if (active.buildLease && active.buildLeasePlanVersion !== compiled.plan.planVersion) {
+      releaseBuildGraphExecution(active.paths, active.buildLease, active.buildLeasePlanVersion);
+      active.buildLease = undefined;
+      active.buildLeasePlanVersion = undefined;
+    }
     const graphOwner = active.buildLease ??= acquireBuildGraphExecutionLease(
       active.paths,
       active.leaseOwner,
       {
         now: new Date().toISOString(),
         pid: process.pid,
+        planVersion: compiled.plan.planVersion,
       },
     );
+    active.buildLeasePlanVersion = compiled.plan.planVersion;
     const buildState = initializeBuildGraphExecution(active.paths, compiled, {
       owner: active.leaseOwner,
       graphOwner,
@@ -1835,6 +1901,140 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime || runtime !== active || !ownsRun(active.state.runId, "building")) return;
     persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
     await transition({ type: "build_produced" }, "BUILD DAG completed; entering VERIFY", ctx);
+    await continueOrPause(ctx, "test");
+  }
+
+  async function enterRecoveryRepair(ctx: ExtensionContext): Promise<void> {
+    const active = runtime;
+    const recovery = active?.state.recovery;
+    const action = recovery?.action;
+    if (!active || !recovery || !action || action.action !== "repair") {
+      throw new Error("Lifecycle BUILD repair requires its typed recovery action");
+    }
+    const runId = active.state.runId;
+    const stillOwnsBuild = (): boolean => runtime === active && ownsRun(runId, "building");
+    if (action.status === "completed") {
+      persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
+      await transition({ type: "build_produced" }, "Recovered completed typed BUILD repair; entering VERIFY", ctx);
+      await continueOrPause(ctx, "test");
+      return;
+    }
+    const directive = latestLifecycleRecoveryDirective(recovery);
+    if (!directive) throw new Error("Lifecycle BUILD repair is missing its typed DEBUG directive");
+    const planVersion = currentLifecycleRecoveryState(recovery).sourcePlanVersion;
+    const compiled = readImmutableBuildPlan(active.paths, planVersion);
+    if (!(await enterModelStage("build", "coder", ctx))) return;
+    if (!stillOwnsBuild()) return;
+    const selection = [...active.state.modelSelections].reverse().find(({ stage }) => stage === "build");
+    if (!selection?.routing) throw new Error("Recovery BUILD routing completed without a persisted maker decision");
+    const selectedModel = ctx.modelRegistry.find(selection.provider, selection.model) as PiBuildModel | undefined;
+    if (!selectedModel) throw new Error("Recovery BUILD maker model disappeared before dispatch");
+    const purpose = `model:building:recovery-repair:${action.failureFingerprint}`;
+    const buildingNode = active.state.graphExecution?.nodeStates.building;
+    if (!buildingNode) throw new Error("Recovery BUILD graph node is unavailable");
+    const ordinal = buildingNode.sideEffect?.status === "intent_recorded" || buildingNode.sideEffect?.status === "unknown"
+      ? buildingNode.sideEffect.ordinal
+      : buildingNode.sideEffectOrdinal + 1;
+    const outerEffectRequestRef = phaseEffectRequestRef(active.state, purpose, ordinal);
+    const request = createRecoveryBuildWorkerRequest({
+      runId,
+      planVersion,
+      planHash: compiled.hash,
+      directive,
+      outerEffectRequestRef,
+      timeoutMs: Math.max(1, Math.min(
+        active.state.graphExecution!.effectiveLimits.maxWallTimeMs,
+        10 * 60 * 1_000,
+      )),
+    });
+    const intentBytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-recovery-repair-request",
+      request,
+    })}\n`, "utf8");
+    const intentHash = createHash("sha256").update(intentBytes).digest("hex");
+    const intentRef = writeGraphMutationArtifact(active.paths, {
+      owner: active.leaseOwner,
+      mutationId: intentHash,
+      bytes: intentBytes,
+    });
+    beginCurrentPhaseEffect(purpose, "model", ctx, intentRef, selection.routing.decisionId);
+    active.state.recovery = startLifecycleRecoveryAction(
+      recovery,
+      outerEffectRequestRef,
+      intentRef,
+    );
+    writeRuntimeState();
+
+    const git = createLocalGitRunner({ timeoutMs: request.timeoutMs });
+    const before = buildWorkspaceWriteFingerprint(active.cwd, directive.repairScope, git);
+    const worker = createPiBuildWorkerAdapter({
+      repositoryRoot: realpathSync(active.cwd),
+      model: selectedModel,
+      thinkingLevel: selection.thinking,
+      modelRegistry: ctx.modelRegistry,
+      now: () => new Date().toISOString(),
+      protectedWorkspacePaths: [active.config.lifecycle.artifactsDir],
+      ...(selection.family === undefined ? {} : { family: selection.family }),
+    });
+    const workerSignal = ctx.signal ?? new AbortController().signal;
+    const receipt = validateBuildWorkerReceipt(
+      await worker.invoke(request, { signal: workerSignal }),
+      request,
+    );
+    if (!stillOwnsBuild()) return;
+    const after = buildWorkspaceWriteFingerprint(active.cwd, directive.repairScope, git);
+    const resultBytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-recovery-repair-result",
+      runId,
+      failureFingerprint: action.failureFingerprint,
+      requestRef: outerEffectRequestRef,
+      workerRequestRef: request.requestRef,
+      workspaceBeforeSha256: before,
+      workspaceAfterSha256: after,
+      validationRequirements: directive.validationRequirements,
+      receipt,
+    })}\n`, "utf8");
+    const resultHash = createHash("sha256").update(resultBytes).digest("hex");
+    const resultRef = writeGraphMutationArtifact(active.paths, {
+      owner: active.leaseOwner,
+      mutationId: resultHash,
+      bytes: resultBytes,
+    });
+    active.state.recovery = completeLifecycleRecoveryAction(
+      active.state.recovery,
+      outerEffectRequestRef,
+      resultRef,
+    );
+    active.lastUsage = {
+      inputTokens: typeof receipt.usage.inputTokens === "number" ? receipt.usage.inputTokens : 0,
+      outputTokens: typeof receipt.usage.outputTokens === "number" ? receipt.usage.outputTokens : 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      observedUsd: typeof receipt.usage.observedUsd === "number" ? receipt.usage.observedUsd : 0,
+    };
+    writeRuntimeState();
+    appendRuntimeJournal(
+      active,
+      `Typed BUILD repair ${receipt.outcome}: ${truncate(receipt.summary, 160)}; workspace ${before} -> ${after}`,
+    );
+    if (receipt.outcome !== "succeeded" || before === after) {
+      persistRoutingStageOutcome("build", { structuredToolCompliance: receipt.outcome === "succeeded", verdict: "unknown" });
+      await transition(
+        { type: "recovery_failed" },
+        receipt.outcome === "failed"
+          ? "Typed BUILD repair reported failure"
+          : "Typed BUILD repair produced no trusted change in its declared scope",
+        ctx,
+      );
+      await finishRun(ctx);
+      return;
+    }
+    await recordBuildEvidenceFingerprint(ctx);
+    if (!stillOwnsBuild()) return;
+    persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
+    await transition({ type: "build_produced" }, "Typed BUILD repair completed; entering VERIFY", ctx);
     await continueOrPause(ctx, "test");
   }
 
@@ -2455,6 +2655,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     runtime.state.reminder = undefined;
     if (runtime.state.revisionFeedback?.artifact === artifact) runtime.state.revisionFeedback = undefined;
     writeRuntimeState();
+    if (artifact === "plan" && runtime.state.recovery &&
+        currentLifecycleRecoveryState(runtime.state.recovery).status === "waiting-successor-approval" &&
+        (runtime.state.yolo || !loopConfigFrom(runtime.config).requirePlanApproval)) {
+      activateRecoverySuccessorApproval("yolo-policy");
+    }
     await transition(
       artifact === "spec"
         ? { type: "spec_produced", specPath: rel(path) }
@@ -2473,6 +2678,18 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const expected = artifact === "spec" ? "awaiting_spec_approval" : "awaiting_plan_approval";
     const runId = runtime.state.runId;
+    if (runtime.state.phase !== expected) {
+      throw new Error(`${artifact.toUpperCase()} approval is not active in phase ${runtime.state.phase}`);
+    }
+    ensureCurrentPhaseEntered(ctx);
+    if (artifact === "plan" && runtime.state.recovery) {
+      const recovery = currentLifecycleRecoveryState(runtime.state.recovery);
+      if (recovery.status === "released" && recovery.successor?.status === "activated") {
+        await transition({ type: "plan_approved" }, "Recovered durable successor-plan approval", ctx);
+        await continueOrPause(ctx, "build");
+        return;
+      }
+    }
     if (!ctx.hasUI) {
       await interruptRun(ctx, `${artifact} approval requires interactive mode. Resume with --yolo only by starting a new yolo run.`);
       return;
@@ -2481,11 +2698,23 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const choice = await ctx.ui.select(`${artifact.toUpperCase()} ready`, ["Approve", "Revise", "Cancel"]);
     if (!ownsRun(runId, expected)) return;
     if (choice === "Approve") {
+      if (artifact === "plan" && runtime.state.recovery &&
+          currentLifecycleRecoveryState(runtime.state.recovery).status === "waiting-successor-approval") {
+        activateRecoverySuccessorApproval("interactive-user");
+      }
       await transition({ type: artifact === "spec" ? "spec_approved" : "plan_approved" }, `${artifact.toUpperCase()} approved`, ctx);
       await continueOrPause(ctx, artifact === "spec" ? "plan" : "build");
       return;
     }
     if (choice === "Revise") {
+      if (artifact === "plan" && runtime.state.recovery &&
+          currentLifecycleRecoveryState(runtime.state.recovery).status === "waiting-successor-approval") {
+        await interruptRun(
+          ctx,
+          "The immutable successor plan version is already reserved. Revision cannot overwrite it; the prior approved plan remains authoritative and the recovery stays paused.",
+        );
+        return;
+      }
       const feedback = await ctx.ui.editor(`How should ${artifact} change?`, "");
       if (!ownsRun(runId, expected)) return;
       if (!feedback?.trim()) {
@@ -2505,6 +2734,36 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       return;
     }
     await stopRun(ctx, `${artifact.toUpperCase()} approval cancelled.`);
+  }
+
+  function activateRecoverySuccessorApproval(kind: "interactive-user" | "yolo-policy"): void {
+    if (!runtime?.state.recovery) throw new Error("Successor-plan approval requires recovery authority");
+    const recovery = currentLifecycleRecoveryState(runtime.state.recovery);
+    if (recovery.status === "released" && recovery.successor?.status === "activated") return;
+    if (recovery.status !== "waiting-successor-approval" || !recovery.successor) {
+      throw new Error("Recovery successor is not waiting for approval");
+    }
+    const approvalBytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-successor-plan-approval",
+      runId: runtime.state.runId,
+      failureFingerprint: recovery.fingerprint,
+      sourcePlanVersion: recovery.sourcePlanVersion,
+      targetPlanVersion: recovery.successor.targetPlanVersion,
+      graphHash: recovery.successor.graphHash,
+      planHash: recovery.successor.planHash,
+      approval: "approved",
+      provenance: kind,
+      recordedAt: new Date().toISOString(),
+    })}\n`, "utf8");
+    runtime.state.recovery = approveAndActivateLifecycleRecoverySuccessor(
+      runtime.paths,
+      runtime.leaseOwner,
+      runtime.state.recovery,
+      approvalBytes,
+    );
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, `Recovery successor plan v${recovery.successor.targetPlanVersion} approved and activated via ${kind}`);
   }
 
   async function checkerStageEnded(ctx: ExtensionContext, stage: "verify" | "review" | "ship"): Promise<void> {
@@ -2549,6 +2808,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }, `${stage.toUpperCase()} ${verdict.verdict}: ${truncate(verdict.reasons, 160)}`, ctx);
 
     if (!runtime) return;
+    if (verdict.verdict === "reject" && (stage === "verify" || stage === "review")) {
+      ensureLifecycleRecoveryForLatestRejection();
+    }
     runtime.state.pendingCheckerVerdict = undefined;
     writeRuntimeState();
     if (runtime.state.phase === "awaiting_ship_approval") {
@@ -2560,6 +2822,29 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     } else {
       await continueOrPause(ctx, nextStandaloneForPhase(runtime.state.phase));
     }
+  }
+
+  async function transitionAfterDebugRecovery(ctx: ExtensionContext, journal: string): Promise<void> {
+    if (!runtime?.state.recovery) throw new Error("DEBUG completion requires durable recovery authority");
+    const decision = latestLifecycleRecoveryDecision(runtime.state.recovery);
+    if (decision.action === "pause") {
+      await interruptRun(
+        ctx,
+        `Lifecycle recovery paused: ${decision.reason}. Change the blocking condition and resume with explicit evidence; no BUILD or re-plan action ran.`,
+      );
+      return;
+    }
+    const recoveryAction = decision.action === "retry" || decision.action === "repair" ||
+      decision.action === "replan" ? decision.action : "fail";
+    await transition({
+      type: "debug_produced",
+      debugPath: rel(runtime.paths.debug),
+      recoveryAction,
+      ...(recoveryAction === "retry" ? { retryPhase: runtime.state.recovery.failurePhase } : {}),
+    }, `${journal}; recovery ${decision.action}/${decision.reason}`, ctx);
+    if (!runtime) return;
+    if (runtime.state.phase === "failed") await finishRun(ctx);
+    else await continueOrPause(ctx, nextStandaloneForPhase(runtime.state.phase));
   }
 
   async function debugStageEnded(ctx: ExtensionContext): Promise<void> {
@@ -2577,25 +2862,40 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       const synthesized: PendingDiagnosis = {
         rootCause: "The debugger did not return a structured diagnosis.",
         evidence: rejection.reasons,
+        rootCauseCategory: "unknown",
         confidence: "low",
         recommendedFix: rejection.requiredFixes ?? "Reproduce the rejection and address its concrete findings.",
         filesLikelyAffected: [],
         validationCommands: [],
+        topologyAssessment: "preserve",
       };
+      ensureLifecycleRecoveryForLatestRejection();
+      if (!runtime.state.recovery) throw new Error("Synthesized DEBUG recovery authority is missing");
+      const diagnosisBytes = Buffer.from(formatDiagnosis(synthesized), "utf8");
+      runtime.state.recovery = recordLifecycleRecoveryDiagnosis(
+        runtime.paths,
+        runtime.leaseOwner,
+        runtime.state.recovery,
+        {
+          rootCauseCategory: synthesized.rootCauseCategory,
+          confidence: synthesized.confidence,
+          repairScope: synthesized.filesLikelyAffected,
+          validationRequirements: synthesized.validationCommands.map(recoveryValidationRequirement),
+          topologyAssessment: synthesized.topologyAssessment,
+          diagnosisBytes,
+        },
+      );
       runtime.pendingDiagnosis = synthesized;
       runtime.state.debugDiagnosisVerdictIndex = latestRejectionIndex();
       runtime.state.reminder = undefined;
-      writeRuntimeState();
       assertRunPathsSafe(runtime.paths);
-      writeFileSync(runtime.paths.debug, formatDiagnosis(synthesized));
+      writeFileSync(runtime.paths.debug, diagnosisBytes);
+      writeRuntimeState();
       appendRuntimeJournal(runtime, "Synthesized DEBUG diagnosis after missing structured output");
     }
     runtime.pendingDiagnosis = undefined;
     persistRoutingStageOutcome("debug", { structuredToolCompliance, verdict: "unknown" });
-    await transition({ type: "debug_produced", debugPath: rel(runtime.paths.debug) }, "DEBUG diagnosis produced", ctx);
-    if (!runtime) return;
-    if (runtime.state.phase === "failed") await finishRun(ctx);
-    else await continueOrPause(ctx, nextStandaloneForPhase(runtime.state.phase));
+    await transitionAfterDebugRecovery(ctx, "DEBUG diagnosis produced");
   }
 
   async function requestShipApproval(ctx: ExtensionContext): Promise<void> {
@@ -3241,9 +3541,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     if (event.type === "debug_produced") {
       return runtime.state.phase === "debugging" && runtime.state.debugDiagnosisVerdictIndex === latestRejectionIndex() &&
-        isNonEmpty(runtime.paths.debug);
+        isNonEmpty(runtime.paths.debug) && runtime.state.recovery !== undefined &&
+        currentLifecycleRecoveryState(runtime.state.recovery).status !== "waiting-diagnosis";
     }
     if (event.type === "finalize_complete") return runtime.state.phase === "finalizing";
+    if (event.type === "plan_approved" && runtime.state.recovery) {
+      const recovery = currentLifecycleRecoveryState(runtime.state.recovery);
+      return recovery.status === "released" && recovery.successor?.status === "activated";
+    }
     if ((event.type === "spec_produced" || event.type === "plan_produced") && runtime.trustedRecoveryRequestRef) {
       return runtime.state.graphExecution?.nodeStates[runtime.state.phase]?.sideEffect?.requestRef === runtime.trustedRecoveryRequestRef;
     }
@@ -3313,7 +3618,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   function releaseRuntimeLease(): void {
     if (runtime) {
       try {
-        if (runtime.buildLease) releaseBuildGraphExecution(runtime.paths, runtime.buildLease);
+        if (runtime.buildLease) {
+          releaseBuildGraphExecution(runtime.paths, runtime.buildLease, runtime.buildLeasePlanVersion);
+        }
       } finally {
         releaseRunLease(runtime.paths, runtime.leaseOwner);
       }
@@ -3341,6 +3648,109 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     writeRuntimeState();
     appendRuntimeJournal(runtime, `Model ${stage}: ${selection.provider}/${selection.model} failed during provider execution; fallback required`);
     persistMirror(runtime.state);
+  }
+
+  function ensureLifecycleRecoveryForLatestRejection(): void {
+    if (!runtime?.state.graphExecution || runtime.state.phase !== "debugging") {
+      throw new Error("Lifecycle recovery can be initialized only for the active DEBUG rejection");
+    }
+    const rejectionIndex = latestRejectionIndex();
+    const rejection = runtime.state.verdicts[rejectionIndex]!;
+    const failurePhase = rejection.stage === "verify" ? "verifying" : rejection.stage === "review" ? "reviewing" : undefined;
+    if (!failurePhase) throw new Error("Lifecycle recovery supports VERIFY and REVIEW failures only");
+    const planVersion = latestBuildPlanVersion(runtime.paths) ?? runtime.state.graphExecution.planVersion;
+    const evidenceBytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-checker-rejection",
+      runId: runtime.state.runId,
+      failurePhase,
+      planVersion,
+      rejectionIndex,
+      verdict: rejection,
+    })}\n`, "utf8");
+    const evidenceHash = createHash("sha256").update(evidenceBytes).digest("hex");
+    const attempt = runtime.state.verdicts
+      .slice(0, rejectionIndex + 1)
+      .filter((candidate) => candidate.stage === rejection.stage && candidate.verdict === "reject")
+      .length;
+    const common = {
+      paths: runtime.paths,
+      owner: runtime.leaseOwner,
+      graph: COMPILED_LIFECYCLE_GRAPH,
+      schedulerState: runtime.state.graphExecution,
+      failurePhase,
+      activePlanVersion: planVersion,
+      activePlanBytes: Buffer.from(readRequired(runtime.paths.plan, "plan"), "utf8"),
+      attempt,
+      contractId: `${rejection.stage}-verdict`,
+      evidenceBytes,
+    } as const;
+    const currentRegistration = runtime.state.recovery
+      ? [...runtime.state.recovery.ledger.records].reverse().find((record) => record.kind === "registration")
+      : undefined;
+    if (currentRegistration?.kind === "registration" &&
+        currentRegistration.failure.artifactHashes.includes(evidenceHash)) {
+      return;
+    }
+    runtime.state.recovery = runtime.state.recovery
+      ? registerLifecycleRecoveryOccurrence({
+          ...common,
+          envelope: runtime.state.recovery,
+        })
+      : createLifecycleRecoveryEnvelope(common);
+    writeRuntimeState();
+    appendRuntimeJournal(
+      runtime,
+      `Recovery occurrence anchored for ${failurePhase} rejection ${rejectionIndex} at scheduler revision ${runtime.state.recovery.occurrenceBindings.at(-1)!.anchor.schedulerRevision}`,
+    );
+  }
+
+  function ensureRecoveryRetryDispatched(): void {
+    const recovery = runtime?.state.recovery;
+    const action = recovery?.action;
+    if (!runtime || !recovery || !action || action.action !== "retry" ||
+        runtime.state.phase !== action.failurePhase || action.status === "completed") {
+      return;
+    }
+    const intentBytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-recovery-retry-intent",
+      runId: runtime.state.runId,
+      failureFingerprint: action.failureFingerprint,
+      targetPhase: action.failurePhase,
+      planVersion: currentLifecycleRecoveryState(recovery).sourcePlanVersion,
+    })}\n`, "utf8");
+    const requestRef = createHash("sha256").update(intentBytes).digest("hex");
+    const intentRef = writeGraphMutationArtifact(runtime.paths, {
+      owner: runtime.leaseOwner,
+      mutationId: requestRef,
+      bytes: intentBytes,
+    });
+    if (!action.requestRef) {
+      runtime.state.recovery = startLifecycleRecoveryAction(recovery, requestRef, intentRef);
+      writeRuntimeState();
+    }
+    const resultBytes = Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      kind: "lifecycle-recovery-retry-dispatched",
+      runId: runtime.state.runId,
+      failureFingerprint: action.failureFingerprint,
+      requestRef,
+      targetPhase: action.failurePhase,
+    })}\n`, "utf8");
+    const resultHash = createHash("sha256").update(resultBytes).digest("hex");
+    const resultRef = writeGraphMutationArtifact(runtime.paths, {
+      owner: runtime.leaseOwner,
+      mutationId: resultHash,
+      bytes: resultBytes,
+    });
+    runtime.state.recovery = completeLifecycleRecoveryAction(
+      runtime.state.recovery!,
+      requestRef,
+      resultRef,
+    );
+    writeRuntimeState();
+    appendRuntimeJournal(runtime, `Recovery retry dispatched to ${action.failurePhase} with request ${requestRef}`);
   }
 
   function latestRejectionIndex(): number {
@@ -3660,6 +4070,10 @@ function formatDiagnosis(diagnosis: PendingDiagnosis): string {
     "## Root Cause",
     diagnosis.rootCause,
     "",
+    `## Root Cause Category\n${diagnosis.rootCauseCategory}`,
+    "",
+    `## Topology Assessment\n${diagnosis.topologyAssessment}`,
+    "",
     "## Evidence",
     diagnosis.evidence,
     "",
@@ -3675,6 +4089,10 @@ function formatDiagnosis(diagnosis: PendingDiagnosis): string {
     diagnosis.validationCommands.length > 0 ? diagnosis.validationCommands.map((command) => `- \`${command}\``).join("\n") : "- Re-run the checker validation",
     "",
   ].join("\n");
+}
+
+function recoveryValidationRequirement(command: string): string {
+  return `validation-command-${createHash("sha256").update(command.normalize("NFC"), "utf8").digest("hex")}`;
 }
 
 function finalSummary(state: LifecycleState, paths: RunPaths): string {

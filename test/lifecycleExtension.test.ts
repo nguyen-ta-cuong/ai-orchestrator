@@ -7,6 +7,9 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { afterEach, describe, expect, it, vi } from "vitest";
 import lifecycleExtension from "../extensions/lifecycle.js";
 import { DEFAULT_CONFIG } from "../src/core/config.js";
+import { compileBuildPlan } from "../src/core/buildPlan.js";
+import { writeImmutableBuildPlan } from "../src/lifecycle/buildArtifacts.js";
+import { currentLifecycleRecoveryState } from "../src/lifecycle/recoveryExecution.js";
 import {
   acquireRunLease,
   checkpointLifecycleGraphEvent,
@@ -913,25 +916,36 @@ describe("lifecycle Pi extension safety", () => {
   });
 
   it("reconciles a durable DEBUG diagnosis before taking the terminal failure edge", async () => {
-    const run = makeRun("debugging");
+    const run = makeRun("verifying");
     const prepared = readState(run.paths)!;
     prepared.buildIterations = DEFAULT_CONFIG.loop.maxCoderIterations;
-    prepared.consecutiveRejections = 1;
-    prepared.verdicts = [{ stage: "verify", verdict: "reject", reasons: "tests still fail", requiredFixes: "repair the defect" }];
     writeFixtureState(run.paths, prepared);
 
     const first = extensionHarness(run.cwd);
     await first.commands.get("lifecycle")!("resume", first.ctx);
+    const verifyTool = vi.mocked(first.pi.registerTool).mock.calls.find(([tool]) => (tool as { name?: string }).name === "verify_verdict")?.[0] as {
+      execute: (id: string, params: unknown) => Promise<unknown>;
+    };
+    await verifyTool.execute("verdict", {
+      verdict: "reject",
+      reasons: "tests still fail",
+      requiredFixes: "repair the defect",
+    });
+    await first.events.get("agent_end")!({ messages: [{ role: "assistant", content: "verification rejected" }] }, first.ctx as unknown as ExtensionContext);
+    await first.events.get("agent_settled")!({}, first.ctx as unknown as ExtensionContext);
+    expect(readState(run.paths)?.phase).toBe("debugging");
     const debugTool = vi.mocked(first.pi.registerTool).mock.calls.find(([tool]) => (tool as { name?: string }).name === "debug_diagnosis")?.[0] as {
       execute: (id: string, params: unknown) => Promise<unknown>;
     };
     await debugTool.execute("diagnosis", {
       rootCause: "The retry budget is exhausted by the same defect",
       evidence: "The final verification still fails",
+      rootCauseCategory: "implementation-defect",
       confidence: "high",
       recommendedFix: "Re-plan before another build",
       filesLikelyAffected: ["src/feature.ts"],
       validationCommands: ["npm test"],
+      topologyAssessment: "preserve",
     });
     await first.events.get("session_shutdown")!({}, first.ctx as unknown as ExtensionContext);
     expect(readState(run.paths)?.graphExecution?.nodeStates.debugging?.sideEffect?.status).toBe("unknown");
@@ -954,6 +968,84 @@ describe("lifecycle Pi extension safety", () => {
     expect(resumed.pi.sendUserMessage).not.toHaveBeenCalled();
     expect(existsSync(run.paths.executionLease)).toBe(false);
   });
+
+  it("materializes and activates exactly the approved N plus 1 plan after a typed structural DEBUG diagnosis", async () => {
+    const run = makeRun("verifying");
+    const owner = acquireRunLease(run.paths, "fixture-structural-replan");
+    try {
+      writeImmutableBuildPlan(run.paths, compileBuildPlan(structuredPlan(1)), { owner });
+    } finally {
+      releaseRunLease(run.paths, owner);
+    }
+
+    const verifying = extensionHarness(run.cwd);
+    await verifying.commands.get("test")!("", verifying.ctx);
+    const verifyTool = vi.mocked(verifying.pi.registerTool).mock.calls.find(([tool]) =>
+      (tool as { name?: string }).name === "verify_verdict")?.[0] as {
+        execute: (id: string, params: unknown) => Promise<unknown>;
+      };
+    await verifyTool.execute("verdict", {
+      verdict: "reject",
+      reasons: "The implementation graph omits a required dependency.",
+      requiredFixes: "Create a successor plan with the missing dependency.",
+    });
+    await verifying.events.get("agent_end")!({
+      messages: [{ role: "assistant", content: "verification rejected" }],
+    }, verifying.ctx as unknown as ExtensionContext);
+    await verifying.events.get("agent_settled")!({}, verifying.ctx as unknown as ExtensionContext);
+    expect(readState(run.paths)?.phase).toBe("debugging");
+
+    const debugging = extensionHarness(run.cwd);
+    await debugging.commands.get("debug")!("", debugging.ctx);
+    expect(debugging.activeTools()).toContain("debug_diagnosis");
+    expect(debugging.activeTools()).not.toContain("edit");
+    expect(debugging.activeTools()).not.toContain("write");
+    const debugTool = vi.mocked(debugging.pi.registerTool).mock.calls.find(([tool]) =>
+      (tool as { name?: string }).name === "debug_diagnosis")?.[0] as {
+        execute: (id: string, params: unknown) => Promise<unknown>;
+      };
+    await debugTool.execute("diagnosis", {
+      rootCause: "The approved BUILD DAG omitted a prerequisite edge.",
+      evidence: "VERIFY observed the dependent output before its prerequisite existed.",
+      rootCauseCategory: "missing-dependency",
+      confidence: "high",
+      recommendedFix: "Create plan version 2 with the prerequisite represented explicitly.",
+      filesLikelyAffected: [],
+      validationCommands: ["npm test"],
+      topologyAssessment: "structural",
+    });
+    await debugging.events.get("agent_end")!({
+      messages: [{ role: "assistant", content: "structural diagnosis complete" }],
+    }, debugging.ctx as unknown as ExtensionContext);
+    await debugging.events.get("agent_settled")!({}, debugging.ctx as unknown as ExtensionContext);
+    expect(readState(run.paths)?.phase).toBe("planning");
+    expect(currentLifecycleRecoveryState(readState(run.paths)!.recovery!)).toMatchObject({
+      status: "waiting-successor-artifact",
+      sourcePlanVersion: 1,
+      successor: { targetPlanVersion: 2 },
+    });
+
+    const planning = extensionHarness(run.cwd);
+    await planning.commands.get("plan")!("", planning.ctx);
+    await submittedPlanTool(planning).execute("plan-v2", { plan: structuredPlan(2) });
+    await planning.events.get("agent_end")!({
+      messages: [{ role: "assistant", content: "successor plan submitted" }],
+    }, planning.ctx as unknown as ExtensionContext);
+    await planning.events.get("agent_settled")!({}, planning.ctx as unknown as ExtensionContext);
+
+    const state = readState(run.paths)!;
+    expect(state.phase).toBe("building");
+    expect(currentLifecycleRecoveryState(state.recovery!)).toMatchObject({
+      status: "released",
+      approvedPlanVersion: 2,
+      successor: { status: "activated", targetPlanVersion: 2 },
+    });
+    expect(JSON.parse(readFileSync(
+      join(run.paths.root, "build", "plan-versions", "2", "plan.graph.json"),
+      "utf8",
+    ))).toMatchObject({ planVersion: 2 });
+    expect(readFileSync(run.paths.journal, "utf8")).toContain("Recovery successor plan v2 approved and activated");
+  }, 10_000);
 
   it("restores tools, model, and lease after a non-human execution ceiling rejects entry", async () => {
     const run = makeRun("building");

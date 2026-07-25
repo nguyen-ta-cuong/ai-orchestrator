@@ -78,6 +78,9 @@ describe("fastWorkflowGraph", () => {
       { type: "verdict", verdict: "reject" },
       "build-cap-exhausted",
     );
+    for (const phase of ["planning", "replanning", "judging"] as const) {
+      record(fastState(phase), { type: "provider_failed" }, "provider-failed");
+    }
     for (const phase of ["planning", "awaiting_approval", "coding", "judging", "replanning"] as const) {
       record(fastState(phase), { type: "cancelled" }, "run-cancelled");
     }
@@ -93,14 +96,15 @@ describe("fastWorkflowGraph", () => {
       { type: "plan_rejected_by_user" },
       { type: "code_produced" },
       { type: "verdict", verdict: "approve" },
+      { type: "provider_failed" },
     ];
     const allowed: Record<Phase, Set<LoopEvent["type"]>> = {
       idle: new Set(["start"]),
-      planning: new Set(["plan_produced"]),
+      planning: new Set(["plan_produced", "provider_failed"]),
       awaiting_approval: new Set(["plan_approved", "plan_rejected_by_user"]),
       coding: new Set(["code_produced"]),
-      judging: new Set(["verdict"]),
-      replanning: new Set(["plan_produced"]),
+      judging: new Set(["verdict", "provider_failed"]),
+      replanning: new Set(["plan_produced", "provider_failed"]),
       done: new Set(["start"]),
       failed: new Set(["start"]),
     };
@@ -158,6 +162,17 @@ describe("lifecycleWorkflowGraph", () => {
     record(lifecycleState("debugging", { buildIterations: 1, consecutiveRejections: 1 }), { type: "debug_produced" }, "build-retry");
     record(lifecycleState("debugging", { buildIterations: 2, consecutiveRejections: 2 }), { type: "debug_produced" }, "build-replan");
     record(lifecycleState("debugging", { buildIterations: 3, consecutiveRejections: 1 }), { type: "debug_produced" }, "build-cap-exhausted");
+    record(lifecycleState("debugging"), {
+      type: "debug_produced",
+      recoveryAction: "retry",
+      retryPhase: "verifying",
+    }, "verify-retry");
+    record(lifecycleState("debugging"), {
+      type: "debug_produced",
+      recoveryAction: "retry",
+      retryPhase: "reviewing",
+    }, "review-retry");
+    record(lifecycleState("building"), { type: "recovery_failed" }, "recovery-action-failed");
     record(lifecycleState("shipping"), approve("ship"), "ship-go");
     record(lifecycleState("shipping", { yolo: true }), approve("ship"), "ship-go-yolo");
     record(lifecycleState("shipping", { buildIterations: 1 }), reject("ship"), "ship-no-go-retry");
@@ -192,6 +207,7 @@ describe("lifecycleWorkflowGraph", () => {
       { type: "plan_approved" },
       { type: "plan_rejected_by_user" },
       { type: "build_produced" },
+      { type: "recovery_failed" },
       { type: "debug_produced" },
       approve("verify"),
       approve("review"),
@@ -206,7 +222,7 @@ describe("lifecycleWorkflowGraph", () => {
       awaiting_spec_approval: new Set(["spec_approved", "spec_rejected_by_user"]),
       planning: new Set(["plan_produced"]),
       awaiting_plan_approval: new Set(["plan_approved", "plan_rejected_by_user"]),
-      building: new Set(["build_produced"]),
+      building: new Set(["build_produced", "recovery_failed"]),
       verifying: new Set(["verdict"]),
       reviewing: new Set(["verdict"]),
       debugging: new Set(["debug_produced"]),

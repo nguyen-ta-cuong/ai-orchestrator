@@ -9,23 +9,18 @@ For non-trivial implementation work, keep planning, implementation, and checking
 
 ## With orchestrator MCP tools
 
-Use this path when `orchestrator_plan`, `orchestrator_models`, and `orchestrator_judge` are available.
+Use this path when the `orchestrator_run_*` tools are available.
 
-1. Call `orchestrator_models` with `stage: "plan"` and the task. Inspect the ranked trusted **server-side** planner candidates. This preview invokes no model and does not imply that those identities exist in Cursor's picker.
-2. Call `orchestrator_plan` with the task, repository context, and structured task features when known. Record its returned routing metadata in run notes or repository-defined run artifacts.
-3. Show the plan to the user and wait for explicit approval before editing.
-4. Select a configured coding-capable model in Cursor, and record its exact host `provider/model` identity as `coderIdentity`. The MCP server does not select or switch this coder.
-5. Implement the approved plan, run relevant tests, and gather `git diff` plus `git diff --staged`. For the first judge call use `iteration: 1` and `consecutiveRejections: 0`.
-6. Call `orchestrator_models` with `stage: "fast-judge"` and `coderIdentity`. Confirm that the trusted server-side catalog has an eligible checker independent of the declared coder.
-7. Call `orchestrator_judge` with `{ task, plan, diff, testOutput, iteration, consecutiveRejections, coderIdentity }`. Record the actual checker identity and fallback history from its routing metadata. If strict separation fails, stop rather than self-approving.
-8. Append `{ verdict, reasons, requiredFixes }` to `judgeReports`. Use `nextIteration` and `nextConsecutiveRejections` exactly as returned; do not invent counter changes.
-9. Obey `nextAction`:
-   - `done`: summarize the independently approved result and recorded model identities.
-   - `retry_coding`: address all required fixes with the Cursor coder, rerun tests, refresh the diff, and call the server-side independent judge with the returned counters.
-   - `replan`: call `orchestrator_plan` with `previousPlan`, full `judgeReports`, and the last `diffSummary`; obtain approval for the revision before implementation.
-   - `stop_failed`: stop, report remaining fixes, and leave the working tree unchanged for the user.
+1. Optionally call `orchestrator_models` with `stage: "plan"` to preview trusted **server-side** candidates. Select the Cursor host coder separately and record its exact `provider/model` identity as `coderIdentity`.
+2. Call `orchestrator_run_start` with a fresh bounded `requestId`, the task, optional repository context/features, and `coderIdentity`. Record the returned opaque `runId` and `revision`.
+3. Show the returned plan and wait for explicit approval. Advance with a new `requestId`, the exact returned `expectedRevision`, and `event: { type: "plan_approved" }`. For revision feedback use `plan_revision_requested` instead and approve the replacement plan separately.
+4. Implement only while `currentNode` is `coding`, run relevant tests, and gather `git diff` plus `git diff --staged`.
+5. Call `orchestrator_run_advance` with a fresh `requestId`, the exact current revision, and `code_result_submitted` containing the diff and test output. The server selects an independent checker and owns every counter, retry, re-plan, and stop decision.
+6. Follow `currentNode`, `permittedEvents`, `requiredAction`, and `remaining` exactly. On a rejection, address every returned fix and submit refreshed evidence. When a re-plan returns to `awaiting_approval`, obtain approval again. Stop on `done`, `failed`, `cancelled`, or `blocked`.
+7. After the server durably closes a provider failure or checker rejection, call `orchestrator_run_recover` with a new request ID and exact revision. Never submit a category or diagnosis; those require durable server evidence and independent read-only DEBUG. Follow only returned `permittedEvents`: repair code when requested, approve a returned immutable successor plan, or leave blocked/terminal authority untouched.
+8. Reuse a `requestId` only to retry the identical mutation after a lost response. If a revision conflicts, call `orchestrator_run_get`, reconcile the current state, and use a new request ID for any changed body. Use `orchestrator_run_cancel` for explicit cancellation.
 
-The MCP server owns loop counters and routes only its planner/judge calls within the trusted user MCP catalog. Routing metadata is evidence, not permission to skip approval or publication gates.
+The user-owned durable store, not Cursor notes or client-supplied counters, is run authority. Cursor remains the coder; MCP routes only its planner/checker calls. The stateless `orchestrator_plan` and `orchestrator_judge` tools remain available only for compatibility. Routing metadata never permits skipping approval or publication gates.
 
 ## Without orchestrator MCP tools
 

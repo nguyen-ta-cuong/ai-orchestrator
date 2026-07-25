@@ -81,6 +81,12 @@ export interface RoutingEvidenceConfig {
   minRecommendationSamples: number;
 }
 
+export interface McpRunStorageConfig {
+  userStoreDir: string;
+  projectMirror: boolean;
+  terminalRetentionDays: number;
+}
+
 export interface OrchestratorConfig {
   execution: ExecutionConfig;
   roles: Record<RoleName, RoleConfig>;
@@ -110,6 +116,7 @@ export interface OrchestratorConfig {
   mcp: {
     providers: Record<string, ProviderConfig>;
     models: McpModelConfig[];
+    runs: McpRunStorageConfig;
   };
 }
 
@@ -139,7 +146,11 @@ type ConfigPatch = Partial<{
     stages?: Partial<Record<RoutingStage, Partial<StageRoutingPolicy>>>;
   };
   ship: Partial<OrchestratorConfig["ship"]>;
-  mcp: Partial<{ providers: Record<string, Partial<ProviderConfig>>; models: McpModelConfig[] }>;
+  mcp: Partial<{
+    providers: Record<string, Partial<ProviderConfig>>;
+    models: McpModelConfig[];
+    runs: Partial<McpRunStorageConfig>;
+  }>;
 }>;
 
 export const UNCONFIGURED_FABLE_BASE_URL = "https://example.invalid/fable/v1";
@@ -251,6 +262,11 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   mcp: {
     models: [],
+    runs: {
+      userStoreDir: "mcp-runs",
+      projectMirror: false,
+      terminalRetentionDays: 30,
+    },
     providers: {
       anthropic: {
         baseUrl: "https://api.anthropic.com/v1",
@@ -309,11 +325,14 @@ export function loadConfigWithProvenance(cwd: string, options: LoadConfigOptions
   const projectConfig = readJsonIfPresent(projectPath);
   const userMerged = deepMerge(cloneConfig(DEFAULT_CONFIG), sanitizeConfigPatch(userConfig, options.ignoreMcpProviders));
   validateConfig(cloneConfig(userMerged));
-  const projectPatch = sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders || options.ignoreProjectMcpProviders);
+  const projectPatch = options.ignoreProjectMcpProviders && !options.ignoreMcpProviders
+    ? sanitizeProjectMcpPatch(projectConfig)
+    : sanitizeConfigPatch(projectConfig, options.ignoreMcpProviders);
   validateConfig(deepMerge(cloneConfig(userMerged), cloneConfig(projectPatch)));
   constrainProjectExecutionSafetyPatch(projectPatch, userMerged);
   if (options.ignoreProjectMcpProviders) {
     constrainProjectMcpRoles(projectPatch);
+    constrainProjectMcpRunPatch(projectPatch, userMerged.mcp.runs);
     if (projectPatch.routing) constrainProjectMcpRoutingPatch(projectPatch.routing);
   }
   const merged = deepMerge(userMerged, constrainProjectRoutingPatch(projectPatch, userMerged.routing, userConfig.routing));
@@ -416,6 +435,7 @@ function validateConfig(value: unknown): OrchestratorConfig {
   const ship = requirePlainObject(config.ship, "ship");
   const mcp = requirePlainObject(config.mcp, "mcp");
   const providers = requirePlainObject(mcp.providers, "mcp.providers");
+  const mcpRuns = requirePlainObject(mcp.runs, "mcp.runs");
   if (!Array.isArray(mcp.models)) throw new Error("mcp.models must be an array");
 
   for (const roleName of ["planner", "coder", "judge", "spec", "verifier", "reviewer", "debugger", "shipper"] as const) {
@@ -444,6 +464,10 @@ function validateConfig(value: unknown): OrchestratorConfig {
   requireBoolean(build.commitPerTask, "build.commitPerTask");
   requireStringEnum(ship.commit, "ship.commit", ["ask", "never", "auto"] as const);
   requireStringEnum(ship.openPr, "ship.openPr", ["ask", "never"] as const);
+
+  requireUserStoreRelativePath(mcpRuns.userStoreDir, "mcp.runs.userStoreDir");
+  requireBoolean(mcpRuns.projectMirror, "mcp.runs.projectMirror");
+  requirePositiveInteger(mcpRuns.terminalRetentionDays, "mcp.runs.terminalRetentionDays");
 
   for (const [index, value] of mcp.models.entries()) validateMcpModel(value, `mcp.models[${index}]`);
   const identities = (mcp.models as McpModelConfig[]).map((model) => `${model.provider}/${model.model}`);
@@ -731,8 +755,8 @@ function requireUserStoreRelativePath(value: unknown, path: string): void {
   if (isAbsolute(text) || text.startsWith("/") || text.startsWith("\\") || /^[A-Za-z]:/.test(text)) {
     throw new Error(`${path} must be a relative path inside the user ai-orchestrator directory`);
   }
-  for (const part of text.split(/[\\/]+/)) {
-    if (part === ".." || /[\u0000-\u001f\u007f]/.test(part)) {
+  for (const part of text.split(/[\\/]/)) {
+    if (part.length === 0 || part === "." || part === ".." || /[\u0000-\u001f\u007f]/.test(part)) {
       throw new Error(`${path} must be a relative path inside the user ai-orchestrator directory`);
     }
   }
@@ -742,6 +766,26 @@ function sanitizeConfigPatch(patch: ConfigPatch, ignoreMcpProviders?: boolean): 
   if (!ignoreMcpProviders || patch.mcp === undefined) return patch;
   const { mcp: _ignoredMcp, ...rest } = patch;
   return rest;
+}
+
+function sanitizeProjectMcpPatch(patch: ConfigPatch): ConfigPatch {
+  const next = cloneConfig(patch);
+  if (next.mcp === undefined) return next;
+  if (!isPlainObject(next.mcp)) {
+    delete next.mcp;
+    return next;
+  }
+
+  const rawRuns = isPlainObject(next.mcp.runs) ? next.mcp.runs : undefined;
+  const runs: Partial<McpRunStorageConfig> = {};
+  if (rawRuns && Object.hasOwn(rawRuns, "projectMirror")) {
+    runs.projectMirror = cloneConfig(rawRuns.projectMirror) as boolean;
+  }
+  if (rawRuns && Object.hasOwn(rawRuns, "terminalRetentionDays")) {
+    runs.terminalRetentionDays = cloneConfig(rawRuns.terminalRetentionDays) as number;
+  }
+  next.mcp = Object.keys(runs).length > 0 ? { runs } : {};
+  return next;
 }
 
 function constrainProjectExecutionSafetyPatch(patch: ConfigPatch, trusted: OrchestratorConfig): void {
@@ -807,6 +851,17 @@ function constrainProjectMcpRoles(patch: ConfigPatch): void {
   if (!patch.roles) return;
   delete patch.roles.planner;
   delete patch.roles.judge;
+}
+
+function constrainProjectMcpRunPatch(patch: ConfigPatch, trusted: McpRunStorageConfig): void {
+  const runs = patch.mcp?.runs;
+  if (!runs) return;
+  runs.userStoreDir = trusted.userStoreDir;
+  runs.projectMirror = protectedPermission(trusted.projectMirror, runs.projectMirror) as boolean;
+  runs.terminalRetentionDays = protectedMinimum(
+    trusted.terminalRetentionDays,
+    runs.terminalRetentionDays,
+  ) as number;
 }
 
 function constrainProjectMcpRoutingPatch(routing: NonNullable<ConfigPatch["routing"]>): void {

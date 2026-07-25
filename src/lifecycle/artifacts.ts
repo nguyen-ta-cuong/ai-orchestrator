@@ -51,6 +51,11 @@ import {
   type GraphCheckpointPaths,
   MAX_GRAPH_EVENT_LOG_BYTES,
 } from "../runtime/graphCheckpoint.js";
+import {
+  assertLifecycleRecoveryMonotonic,
+  authenticateLifecycleRecoveryEnvelope,
+  validateLifecycleRecoveryEnvelope,
+} from "./recoveryExecution.js";
 
 export interface RunPaths extends GraphCheckpointPaths {
   spec: string;
@@ -339,6 +344,9 @@ function readStateInternal(
   // the compare-and-swap token for that first owned write.
   const hasEnvelopeIdentity = parsed.envelopeRevision !== undefined && parsed.previousEnvelopeHash !== undefined && parsed.envelopeHash !== undefined;
   const snapshot = hasEnvelopeIdentity ? migratedSnapshot : withLegacyEnvelopeIdentity(migratedSnapshot);
+  if (snapshot.recovery && snapshot.graphExecution) {
+    snapshot.recovery = authenticateLifecycleRecoveryEnvelope(paths, graph, snapshot.graphExecution, snapshot.recovery);
+  }
   validateLifecycleGraphPrefix(paths, snapshot, graph);
   const migrated = replayEvents ? replayLifecycleEvents(paths, snapshot) : snapshot;
   return cloneLifecycleEnvelope(migrated);
@@ -917,6 +925,7 @@ function cloneLifecycleEnvelope(state: LifecycleState): LifecycleState {
     baselineStagedPaths: state.baselineStagedPaths ? [...state.baselineStagedPaths] : undefined,
     finalization: state.finalization ? { ...state.finalization } : undefined,
     originalModel: state.originalModel ? { ...state.originalModel } : undefined,
+    recovery: state.recovery ? structuredClone(state.recovery) : undefined,
     graphExecution: state.graphExecution ? structuredClone(state.graphExecution) : undefined,
     revisionFeedback: state.revisionFeedback ? { ...state.revisionFeedback } : undefined,
     reminder: state.reminder ? { ...state.reminder } : undefined,
@@ -986,6 +995,10 @@ function writeLifecycleEnvelopeAtomic(
     }
   } else if (expectedRevision !== undefined || expectedHash !== undefined || migrated.previousEnvelopeHash !== undefined) {
     throw new Error("Initial lifecycle envelope cannot carry a prior compare-and-swap identity");
+  }
+  assertLifecycleRecoveryMonotonic(disk?.recovery, migrated.recovery);
+  if (migrated.recovery && migrated.graphExecution) {
+    migrated.recovery = authenticateLifecycleRecoveryEnvelope(paths, graph, migrated.graphExecution, migrated.recovery);
   }
   if (options) {
     if (!ownsRunLease(paths, options.owner)) {
@@ -1786,10 +1799,20 @@ function isLifecycleStateEnvelope(value: unknown): value is LifecycleState {
     isLifecycleRevisionFeedback(candidate.revisionFeedback) &&
     isLifecycleReminder(candidate.reminder) &&
     isLifecycleOriginalModel(candidate.originalModel) &&
+    (candidate.recovery === undefined || isLifecycleRecovery(candidate.recovery)) &&
     isLifecycleFinalization(candidate.finalization) &&
     (candidate.version === 1 ? candidate.graphExecution === undefined : !!candidate.graphExecution && typeof candidate.graphExecution === "object") &&
     typeof candidate.yolo === "boolean"
   );
+}
+
+function isLifecycleRecovery(value: unknown): boolean {
+  try {
+    validateLifecycleRecoveryEnvelope(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isLifecycleRevisionFeedback(value: unknown): boolean {
