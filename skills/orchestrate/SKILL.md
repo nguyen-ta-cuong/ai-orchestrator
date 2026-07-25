@@ -21,16 +21,16 @@ Pi performs configured model switching and records routing evidence. Capability-
 
 ## Cursor with MCP tools
 
-When `orchestrator_plan`, `orchestrator_models`, and `orchestrator_judge` are available:
+When `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, and `orchestrator_run_cancel` are available:
 
-1. Call `orchestrator_models` for `plan` and inspect the trusted server-side route. It does not select a Cursor host model.
-2. Call `orchestrator_plan`, record its actual routing metadata, show the plan, and wait for explicit approval.
-3. Manually select and record a configured coding-capable Cursor model as exact `coderIdentity`, then implement and test the approved plan.
-4. Gather `git diff`, `git diff --staged`, and test output. Call `orchestrator_models` for `fast-judge` with `coderIdentity` to confirm an eligible server-side independent checker.
-5. Call `orchestrator_judge` with `coderIdentity`, then record its selected checker and fallback history. If strict separation has no eligible checker, stop; do not self-approve.
-6. Follow `nextAction`, `nextIteration`, and `nextConsecutiveRejections` exactly. Maintain the full `judgeReports` list. For `replan`, send the original task, `previousPlan`, the latest `diffSummary`, and all reports, then obtain approval for the revision.
+1. Select and record the Cursor host coder as exact `coderIdentity`; `orchestrator_models` may preview server-side routes but cannot select the host coder.
+2. Start with a fresh `requestId`. Keep the returned opaque `runId` and exact `revision`, show the proposed plan, and wait for explicit approval.
+3. Advance approval with a new request ID and the exact revision. Implement only when the server returns `currentNode: "coding"`.
+4. Gather unstaged/staged diff and test output, then submit `code_result_submitted` at the exact current revision. The server owns iteration/rejection counters, independent checker routing, re-plans, and caps.
+5. Follow `currentNode`, `permittedEvents`, `requiredAction`, and terminal/blocked status exactly. Approve every replacement plan separately and address all required fixes before resubmission.
+6. Reuse a request ID only for the identical body after a lost response. On conflict, read the run and reconcile before issuing a changed mutation under a new ID. Cancel explicitly with `orchestrator_run_cancel`.
 
-Cursor instructions and MCP cannot switch Cursor's host model. MCP routes only its own planner/judge API calls from the trusted user catalog and never exposes endpoints or key state. Named models are examples or configured preferences, not universal requirements.
+Cursor instructions and MCP cannot switch Cursor's host model. Durable user-owned run authority survives MCP restart and exposes no provider endpoints or key state. The stateless plan/judge tools remain compatibility-only. Named models are configured preferences, not universal requirements.
 
 ## Without orchestrator tools
 

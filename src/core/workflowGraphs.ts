@@ -6,7 +6,7 @@ export function fastWorkflowGraph(): GraphDefinition {
   return {
     schemaVersion: 1,
     id: "fast-workflow",
-    version: "1.0.0",
+    version: "1.1.0",
     kind: "state-machine",
     entry: "idle",
     nodes: [
@@ -16,8 +16,8 @@ export function fastWorkflowGraph(): GraphDefinition {
       node("coding", "produce-code", "write", ["plan"], ["source-changes"]),
       node("judging", "judge-code", "read", ["source-changes"], ["judge-report"]),
       node("replanning", "revise-plan", "write", ["judge-report"], ["plan"]),
-      node("done", "finish-run", "none", [], ["run-result"], true),
-      node("failed", "fail-run", "none", [], ["run-failure"], true),
+      node("done", "finish-run", "none", [], [], true),
+      node("failed", "fail-run", "none", [], [], true),
     ],
     edges: withRunBounds([
       edge("idle", "planning", "start", "start-new-run"),
@@ -34,7 +34,10 @@ export function fastWorkflowGraph(): GraphDefinition {
       edge("judging", "coding", "verdict", "judge-retry"),
       edge("judging", "replanning", "verdict", "judge-replan"),
       edge("judging", "failed", "verdict", "build-cap-exhausted"),
-      ...cancellationEdges(["planning", "awaiting_approval", "coding", "judging", "replanning", "done", "failed"]),
+      edge("planning", "failed", "provider_failed", "provider-failed"),
+      edge("replanning", "failed", "provider_failed", "provider-failed"),
+      edge("judging", "failed", "provider_failed", "provider-failed"),
+      ...cancellationEdges(["planning", "awaiting_approval", "coding", "judging", "replanning"]),
     ]),
   };
 }
@@ -43,7 +46,7 @@ export function lifecycleWorkflowGraph(): GraphDefinition {
   return {
     schemaVersion: 1,
     id: "lifecycle-workflow",
-    version: "1.0.0",
+    version: "1.1.0",
     kind: "state-machine",
     entry: "idle",
     nodes: [
@@ -59,8 +62,8 @@ export function lifecycleWorkflowGraph(): GraphDefinition {
       node("shipping", "decide-shipping", "read", ["review-verdict"], ["ship-decision"]),
       node("awaiting_ship_approval", "request-publication-consent", "external", ["ship-decision"], ["approval-decision"]),
       node("finalizing", "finalize-run", "external", ["approval-decision"], ["finalization-result"]),
-      node("done", "finish-lifecycle-run", "none", [], ["run-result"], true),
-      node("failed", "fail-lifecycle-run", "none", [], ["run-failure"], true),
+      node("done", "finish-lifecycle-run", "none", [], [], true),
+      node("failed", "fail-lifecycle-run", "none", [], [], true),
     ],
     edges: withRunBounds([
       edge("idle", "defining", "start", "start-new-run"),
@@ -102,8 +105,6 @@ export function lifecycleWorkflowGraph(): GraphDefinition {
         "shipping",
         "awaiting_ship_approval",
         "finalizing",
-        "done",
-        "failed",
       ]),
     ]),
   };
