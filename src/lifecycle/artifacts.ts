@@ -132,6 +132,11 @@ interface BoundedFileIdentity {
   ino: number;
 }
 
+interface BoundedFileObservation {
+  identity: BoundedFileIdentity;
+  close(): void;
+}
+
 interface ActiveRunRegistry {
   runId: string;
   artifactsDir: string;
@@ -1122,6 +1127,29 @@ function readActiveRunRegistry(cwd: string): ActiveRunRegistry | undefined {
   } catch (error) {
     throw new Error(`Lifecycle active-run registry cannot be read safely: ${errorMessage(error)}; explicit recovery is required`);
   }
+  return parseActiveRunRegistry(cwd, identity);
+}
+
+function observeActiveRunRegistry(cwd: string): Readonly<{
+  registry: ActiveRunRegistry | undefined;
+  close(): void;
+}> {
+  const path = repositoryActiveRunPath(cwd);
+  assertNoSymlinkComponents(path);
+  if (!existsSync(path)) return { registry: undefined, close() {} };
+  let observation: BoundedFileObservation;
+  try {
+    observation = observeBoundedFile(path, 64 * 1024, "lifecycle active-run registry");
+  } catch (error) {
+    throw new Error(`Lifecycle active-run registry cannot be read safely: ${errorMessage(error)}; explicit recovery is required`);
+  }
+  return {
+    registry: parseActiveRunRegistry(cwd, observation.identity),
+    close: observation.close,
+  };
+}
+
+function parseActiveRunRegistry(cwd: string, identity: BoundedFileIdentity): ActiveRunRegistry | undefined {
   try {
     const value = JSON.parse(identity.bytes.toString("utf8")) as { runId?: unknown; artifactsDir?: unknown; runCwd?: unknown };
     if (typeof value.runId !== "string" || !isRunId(value.runId) || typeof value.artifactsDir !== "string") return undefined;
@@ -1144,6 +1172,28 @@ function readCurrentRunPointer(path: string): { runId: string; identity: Bounded
   } catch (error) {
     throw new Error(`Lifecycle current pointer cannot be read safely: ${errorMessage(error)}; explicit recovery is required`);
   }
+  return parseCurrentRunPointer(identity);
+}
+
+function observeCurrentRunPointer(path: string): Readonly<{
+  pointer: { runId: string; identity: BoundedFileIdentity } | undefined;
+  close(): void;
+}> {
+  assertNoSymlinkComponents(path);
+  if (!existsSync(path)) return { pointer: undefined, close() {} };
+  let observation: BoundedFileObservation;
+  try {
+    observation = observeBoundedFile(path, 1024, "lifecycle current pointer");
+  } catch (error) {
+    throw new Error(`Lifecycle current pointer cannot be read safely: ${errorMessage(error)}; explicit recovery is required`);
+  }
+  return {
+    pointer: parseCurrentRunPointer(observation.identity),
+    close: observation.close,
+  };
+}
+
+function parseCurrentRunPointer(identity: BoundedFileIdentity): { runId: string; identity: BoundedFileIdentity } | undefined {
   const runId = identity.bytes.toString("utf8").trim();
   return isRunId(runId) ? { runId, identity } : undefined;
 }
@@ -1154,25 +1204,35 @@ function releaseCurrentPointerIfMatches(
   runId: string,
   options: ReleaseRunOptions = {},
 ): boolean {
-  const registry = readActiveRunRegistry(cwd);
-  const registryPath = repositoryActiveRunPath(cwd);
-  if (!registry && existsSync(registryPath)) return false;
-  if (registry && registry.runId !== runId) return false;
-  const currentPath = currentRunPath(registry?.runCwd ?? cwd, registry?.artifactsDir ?? artifactsDir);
-  const pointer = readCurrentRunPointer(currentPath);
-  if (!pointer) {
-    if (!registry || existsSync(currentPath)) return false;
-    const state = readState(pathsForRun(registry.runCwd, registry.artifactsDir, registry.runId));
-    if (!state || state.runId !== registry.runId) return false;
-    options.beforeRegistryRemove?.();
-    return removeBoundedFileIfUnchanged(registryPath, registry.identity, 64 * 1024, "registry-release");
+  const registryObservation = observeActiveRunRegistry(cwd);
+  try {
+    const registry = registryObservation.registry;
+    const registryPath = repositoryActiveRunPath(cwd);
+    if (!registry && existsSync(registryPath)) return false;
+    if (registry && registry.runId !== runId) return false;
+    const currentPath = currentRunPath(registry?.runCwd ?? cwd, registry?.artifactsDir ?? artifactsDir);
+    const pointerObservation = observeCurrentRunPointer(currentPath);
+    try {
+      const pointer = pointerObservation.pointer;
+      if (!pointer) {
+        if (!registry || existsSync(currentPath)) return false;
+        const state = readState(pathsForRun(registry.runCwd, registry.artifactsDir, registry.runId));
+        if (!state || state.runId !== registry.runId) return false;
+        options.beforeRegistryRemove?.();
+        return removeBoundedFileIfUnchanged(registryPath, registry.identity, 64 * 1024, "registry-release");
+      }
+      if (pointer.runId !== runId) return false;
+      options.beforeCurrentPointerRemove?.();
+      if (!removeBoundedFileIfUnchanged(currentPath, pointer.identity, 1024, "pointer-release")) return false;
+      if (registry?.runId !== runId) return true;
+      options.beforeRegistryRemove?.();
+      return removeBoundedFileIfUnchanged(registryPath, registry.identity, 64 * 1024, "registry-release");
+    } finally {
+      pointerObservation.close();
+    }
+  } finally {
+    registryObservation.close();
   }
-  if (pointer.runId !== runId) return false;
-  options.beforeCurrentPointerRemove?.();
-  if (!removeBoundedFileIfUnchanged(currentPath, pointer.identity, 1024, "pointer-release")) return false;
-  if (registry?.runId !== runId) return true;
-  options.beforeRegistryRemove?.();
-  return removeBoundedFileIfUnchanged(registryPath, registry.identity, 64 * 1024, "registry-release");
 }
 
 function ensureArtifactsExcludedFromGit(cwd: string, artifactsDir: string): void {
@@ -1386,8 +1446,18 @@ function readFileBoundedWithIdentity(
   limit: number,
   label: string,
 ): { bytes: Buffer; dev: number; ino: number } {
+  const observation = observeBoundedFile(path, limit, label);
+  try {
+    return observation.identity;
+  } finally {
+    observation.close();
+  }
+}
+
+function observeBoundedFile(path: string, limit: number, label: string): BoundedFileObservation {
   assertNoSymlinkComponents(path);
   const file = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let completed = false;
   try {
     const before = fstatSync(file);
     if (!before.isFile() || before.size > limit) throw new Error(`${label} is oversized and exceeds its limit`);
@@ -1405,9 +1475,18 @@ function readFileBoundedWithIdentity(
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || total !== after.size) {
       throw new Error(`${label} changed while it was read; explicit recovery is required`);
     }
-    return { bytes: Buffer.concat(chunks, total), dev: after.dev, ino: after.ino };
+    let closed = false;
+    completed = true;
+    return {
+      identity: { bytes: Buffer.concat(chunks, total), dev: after.dev, ino: after.ino },
+      close() {
+        if (closed) return;
+        closed = true;
+        closeSync(file);
+      },
+    };
   } finally {
-    closeSync(file);
+    if (!completed) closeSync(file);
   }
 }
 
