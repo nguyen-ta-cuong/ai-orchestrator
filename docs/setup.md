@@ -5,6 +5,7 @@ This guide installs AI Orchestrator for Pi, Cursor with MCP, or Cursor without M
 ## Requirements
 
 - Node.js 20 or newer.
+- Ripgrep (`rg`) for bounded nested BUILD-worker search.
 - Pi workflows: Pi installed, with the models you intend to use authenticated in Pi's local registry.
 - Cursor with MCP: trusted provider credentials and at least one trusted planner/checker model.
 - Git is recommended. The lifecycle coordinates one active run per Git worktree and checker prompts use the current diff.

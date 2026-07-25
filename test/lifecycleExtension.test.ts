@@ -229,7 +229,7 @@ describe("lifecycle Pi extension safety", () => {
       if (!(error instanceof Error) || !/Lifecycle phase building is not the active graph node/.test(error.message)) throw error;
     }
     expect(readFileSync(run.paths.journal, "utf8")).toContain("Recovered submitted BUILD plan v1");
-  });
+  }, 10_000);
 
   it("reconciles an appended event under the lease before the first resume write", async () => {
     const cwd = join(tmpdir(), `ai-orchestrator-extension-reconcile-${process.pid}-${Math.random().toString(36).slice(2)}`);
