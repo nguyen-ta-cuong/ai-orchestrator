@@ -80,6 +80,7 @@ AI Orchestrator preserves those ownership boundaries but deliberately uses host-
 ## Requirements
 
 - Node.js 20 or newer.
+- Ripgrep (`rg`) for bounded nested BUILD-worker search.
 - Pi workflows: Pi with the intended models authenticated in its local registry.
 - MCP workflows: trusted user provider credentials and, for capability routing, a trusted user model catalog and capability profiles.
 - Git is recommended because checkers review diffs and lifecycle runs record per-worktree evidence.

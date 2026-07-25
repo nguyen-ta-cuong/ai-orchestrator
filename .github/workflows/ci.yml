@@ -31,6 +31,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
       - name: Install locked dependencies
         run: npm ci
       - name: Run tests
