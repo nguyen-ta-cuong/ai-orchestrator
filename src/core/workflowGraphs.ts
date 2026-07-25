@@ -34,6 +34,9 @@ export function fastWorkflowGraph(): GraphDefinition {
       edge("judging", "coding", "verdict", "judge-retry"),
       edge("judging", "replanning", "verdict", "judge-replan"),
       edge("judging", "failed", "verdict", "build-cap-exhausted"),
+      edge("planning", "failed", "provider_failed", "provider-failed"),
+      edge("replanning", "failed", "provider_failed", "provider-failed"),
+      edge("judging", "failed", "provider_failed", "provider-failed"),
       ...cancellationEdges(["planning", "awaiting_approval", "coding", "judging", "replanning"]),
     ]),
   };
