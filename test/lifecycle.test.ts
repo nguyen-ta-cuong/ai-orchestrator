@@ -5,6 +5,9 @@ import {
   nextStage,
   type LifecycleState,
 } from "../src/core/lifecycle.js";
+import { compileGraph } from "../src/core/graph.js";
+import { DEFAULT_EXECUTION_LIMITS, createGraphExecutionState } from "../src/core/scheduler.js";
+import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
 
 const config: LoopConfig = {
   maxCoderIterations: 3,
@@ -134,6 +137,41 @@ describe("nextStage", () => {
     );
     expect(reviewing.phase).toBe("reviewing");
     expect(reviewing.consecutiveRejections).toBe(0);
+  });
+
+  it("applies typed recovery routes without re-deriving legacy counter policy", () => {
+    const debugging = createIdleLifecycleState({
+      phase: "debugging",
+      task: "recover",
+      buildIterations: 1,
+      consecutiveRejections: 1,
+    });
+
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "retry",
+      retryPhase: "reviewing",
+    }, config).phase).toBe("reviewing");
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "repair",
+    }, config).phase).toBe("building");
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "replan",
+    }, config)).toMatchObject({ phase: "planning", consecutiveRejections: 0 });
+    expect(nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "fail",
+    }, config).phase).toBe("failed");
+    expect(() => nextStage(debugging, {
+      type: "debug_produced",
+      recoveryAction: "retry",
+    }, config)).toThrow(/exact checker phase/i);
+    expect(nextStage(createIdleLifecycleState({
+      phase: "building",
+      task: "recover",
+    }), { type: "recovery_failed" }, config).phase).toBe("failed");
   });
 
   it("escalates two consecutive review rejections to planning while preserving build iterations", () => {
@@ -300,7 +338,7 @@ describe("nextStage", () => {
     ).toThrow("loop.plannerEscalationAfterRejections must be a positive integer");
   });
 
-  it("cancels back to idle while preserving original model for restoration", () => {
+  it("cancels back to idle while preserving the complete audit envelope", () => {
     const building = approvedPlan();
     const withOriginal = {
       ...building,
@@ -311,10 +349,43 @@ describe("nextStage", () => {
     expect(idle).toMatchObject({
       phase: "idle",
       runId: "run-1",
-      task: "",
+      task: "add a lifecycle feature",
+      planPath: ".ai-orchestrator/runs/run-1/plan.md",
       buildIterations: 0,
       consecutiveRejections: 0,
       originalModel: { provider: "anthropic", id: "claude", thinking: "high" },
     });
+  });
+
+  it("preserves v2 graph evidence through clones and cancellation and rejects same-run terminal restart", () => {
+    const graph = compileGraph(lifecycleWorkflowGraph());
+    const graphExecution = createGraphExecutionState(graph, {
+      runId: "run-1",
+      now: "2026-07-22T00:00:00.000Z",
+      limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: { "run-transition-budget": 8 } },
+      currentNodeId: "building",
+    });
+    const state: LifecycleState = {
+      ...approvedPlan(),
+      version: 2,
+      graphExecution,
+      verdicts: [{ stage: "verify", verdict: "reject", reasons: "evidence" }],
+    };
+    const cloned = nextStage(state, { type: "debug_produced", debugPath: "ignored" }, config);
+    expect(cloned.graphExecution).toEqual(graphExecution);
+    expect(cloned.graphExecution).not.toBe(graphExecution);
+
+    const cancelled = nextStage(state, { type: "cancelled" }, config);
+    expect(cancelled).toMatchObject({ phase: "idle", version: 2, task: state.task, verdicts: state.verdicts });
+    expect(cancelled.graphExecution).toEqual(graphExecution);
+
+    const terminalGraph = createGraphExecutionState(graph, {
+      runId: "run-1",
+      now: "2026-07-22T00:00:00.000Z",
+      limits: { ...DEFAULT_EXECUTION_LIMITS, backEdgeBudgets: { "run-transition-budget": 8 } },
+      currentNodeId: "done",
+    });
+    const done = { ...state, phase: "done" as const, graphExecution: terminalGraph };
+    expect(nextStage(done, { type: "start", task: "must use a new run", yolo: false }, config)).toEqual(done);
   });
 });

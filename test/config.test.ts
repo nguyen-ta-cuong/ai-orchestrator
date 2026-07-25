@@ -2,7 +2,15 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG, UNCONFIGURED_FABLE_BASE_URL, loadConfig, loadConfigWithProvenance, loopConfigFrom } from "../src/core/config.js";
+import {
+  DEFAULT_CONFIG,
+  UNCONFIGURED_FABLE_BASE_URL,
+  executionLimitsFrom,
+  loadConfig,
+  loadConfigWithProvenance,
+  loopConfigFrom,
+} from "../src/core/config.js";
+import { DEFAULT_EXECUTION_LIMITS } from "../src/core/scheduler.js";
 
 const tempDirs: string[] = [];
 
@@ -68,6 +76,11 @@ describe("loadConfig", () => {
 
     const config = loadConfig(project);
 
+    expect(config.execution).toEqual({
+      engine: "graph-shadow",
+      allowProjectGraph: false,
+      limits: DEFAULT_EXECUTION_LIMITS,
+    });
     expect(config.roles.planner).toEqual({
       provider: DEFAULT_CONFIG.roles.planner.provider,
       model: "project-planner",
@@ -82,6 +95,138 @@ describe("loadConfig", () => {
     expect(config.loop.plannerEscalationAfterRejections).toBe(2);
     expect(config.approval.requirePlanApproval).toBe(true);
     expect(config.judge.runTests).toBe(false);
+  });
+
+  it("allows repositories to activate graph execution only with user consent", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(project, ".ai-orchestrator.json"), { execution: { engine: "graph", allowProjectGraph: true } });
+
+    expect(loadConfig(project).execution).toEqual({
+      engine: "graph-shadow",
+      allowProjectGraph: false,
+      limits: DEFAULT_EXECUTION_LIMITS,
+    });
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), { execution: { allowProjectGraph: true } });
+    expect(loadConfig(project).execution).toEqual({
+      engine: "graph",
+      allowProjectGraph: true,
+      limits: DEFAULT_EXECUTION_LIMITS,
+    });
+  });
+
+  it("loads validated scheduler ceilings and returns an isolated effective policy", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      execution: {
+        limits: {
+          maxGraphSteps: 64,
+          maxEstimatedCostUsd: 5,
+          humanWait: "deny",
+          backEdgeBudgets: { "run-transition-budget": 12 },
+        },
+      },
+    });
+
+    const config = loadConfig(project);
+    const limits = executionLimitsFrom(config);
+    expect(limits).toMatchObject({
+      maxGraphSteps: 64,
+      maxEstimatedCostUsd: 5,
+      humanWait: "deny",
+      backEdgeBudgets: { "run-transition-budget": 12 },
+    });
+    expect(limits).not.toBe(config.execution.limits);
+    expect(limits.backEdgeBudgets).not.toBe(config.execution.limits.backEdgeBudgets);
+  });
+
+  it("lets project config tighten but never raise scheduler ceilings", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      execution: {
+        limits: {
+          maxGraphSteps: 100,
+          maxOutputTokens: 50_000,
+          maxEstimatedCostUsd: 10,
+          humanWait: "allow",
+          backEdgeBudgets: { "run-transition-budget": 20, "user-loop": 4 },
+        },
+      },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      execution: {
+        limits: {
+          maxGraphSteps: 200,
+          maxOutputTokens: 20_000,
+          maxEstimatedCostUsd: 2,
+          humanWait: "deny",
+          backEdgeBudgets: {
+            "run-transition-budget": 30,
+            "user-loop": 2,
+            "project-invented-loop": 1,
+          },
+        },
+      },
+    });
+
+    expect(executionLimitsFrom(loadConfig(project))).toMatchObject({
+      maxGraphSteps: 100,
+      maxOutputTokens: 20_000,
+      maxEstimatedCostUsd: 2,
+      humanWait: "deny",
+      backEdgeBudgets: { "run-transition-budget": 20, "user-loop": 2 },
+    });
+    expect(loadConfig(project).execution.limits.backEdgeBudgets).not.toHaveProperty("project-invented-loop");
+  });
+
+  it("does not let project config re-enable human waits denied by trusted config", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      execution: { limits: { humanWait: "deny" } },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      execution: { limits: { humanWait: "allow" } },
+    });
+
+    expect(loadConfig(project).execution.limits.humanWait).toBe("deny");
+  });
+
+  it.each([
+    [{ maxGraphSteps: 0 }, "execution.limits.maxGraphSteps must be a positive integer"],
+    [{ maxEstimatedCostUsd: -1 }, "execution.limits.maxEstimatedCostUsd must be a non-negative number"],
+    [{ humanWait: "sometimes" }, "execution.limits.humanWait must be one of"],
+    [{ futureUnboundedField: 1 }, "execution.limits.futureUnboundedField is not recognized"],
+    [{ backEdgeBudgets: { "run-transition-budget": null } }, "execution.limits.backEdgeBudgets.run-transition-budget must be a positive integer"],
+  ])("rejects invalid scheduler execution policy %#", (limits, message) => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    vi.stubEnv("HOME", home);
+    writeJson(join(project, ".ai-orchestrator.json"), { execution: { limits } });
+
+    expect(() => loadConfig(project)).toThrow(message);
+  });
+
+  it("accepts user-selected legacy and active graph engines and rejects unknown engines", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+    writeJson(join(home, ".ai-orchestrator", "config.json"), { execution: { engine: "graph" } });
+    expect(loadConfig(project).execution.engine).toBe("graph");
+    writeJson(join(home, ".ai-orchestrator", "config.json"), { execution: { engine: "automatic" } });
+    expect(() => loadConfig(project)).toThrow("execution.engine must be one of");
   });
 
   it("interpolates mcp provider apiKey values from environment variables only", () => {
@@ -232,6 +377,98 @@ describe("loadConfig", () => {
       apiKey: "user-secret",
     });
   });
+
+  it("keeps MCP run authority user-owned while project config may only tighten mirror and retention", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+
+    expect(loadConfig(project, { ignoreProjectMcpProviders: true }).mcp.runs).toEqual({
+      userStoreDir: "mcp-runs",
+      projectMirror: false,
+      terminalRetentionDays: 30,
+    });
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: {
+        runs: {
+          userStoreDir: "trusted-mcp-state",
+          projectMirror: true,
+          terminalRetentionDays: 60,
+        },
+      },
+    });
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: {
+        runs: {
+          userStoreDir: "../../attacker-state",
+          authorityRoot: "/future/attacker-authority",
+          providerCredentialPath: "../../future-secret",
+          projectMirror: false,
+          terminalRetentionDays: 7,
+        },
+      },
+    });
+
+    const constrained = loadConfig(project, { ignoreProjectMcpProviders: true }).mcp.runs;
+    expect(constrained).toEqual({
+      userStoreDir: "trusted-mcp-state",
+      projectMirror: false,
+      terminalRetentionDays: 7,
+    });
+    expect(constrained).not.toHaveProperty("authorityRoot");
+    expect(constrained).not.toHaveProperty("providerCredentialPath");
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {});
+    writeJson(join(project, ".ai-orchestrator.json"), {
+      mcp: {
+        runs: {
+          userStoreDir: "../../attacker-state",
+          projectMirror: true,
+          terminalRetentionDays: 365,
+        },
+      },
+    });
+    expect(loadConfig(project, { ignoreProjectMcpProviders: true }).mcp.runs).toEqual({
+      userStoreDir: "mcp-runs",
+      projectMirror: false,
+      terminalRetentionDays: 30,
+    });
+  });
+
+  it("validates trusted MCP run storage configuration", () => {
+    const home = makeTempDir();
+    const project = makeTempDir();
+    mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+    vi.stubEnv("HOME", home);
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: { runs: { userStoreDir: "../outside" } },
+    });
+    expect(() => loadConfig(project, { ignoreProjectMcpProviders: true }))
+      .toThrow("mcp.runs.userStoreDir must be a relative path inside the user ai-orchestrator directory");
+
+    writeJson(join(home, ".ai-orchestrator", "config.json"), {
+      mcp: { runs: { terminalRetentionDays: 0 } },
+    });
+    expect(() => loadConfig(project, { ignoreProjectMcpProviders: true }))
+      .toThrow("mcp.runs.terminalRetentionDays must be a positive integer");
+  });
+
+  it.each([".", "./mcp-runs", "mcp-runs/.", "mcp-runs//nested", "mcp-runs/", "mcp-runs\u0000nested"]) (
+    "rejects non-canonical MCP run storage path %j",
+    (userStoreDir) => {
+      const home = makeTempDir();
+      const project = makeTempDir();
+      mkdirSync(join(home, ".ai-orchestrator"), { recursive: true });
+      vi.stubEnv("HOME", home);
+      writeJson(join(home, ".ai-orchestrator", "config.json"), { mcp: { runs: { userStoreDir } } });
+
+      expect(() => loadConfig(project, { ignoreProjectMcpProviders: true }))
+        .toThrow("mcp.runs.userStoreDir must be a relative path inside the user ai-orchestrator directory");
+    },
+  );
 
   it("does not merge prototype-pollution keys from config files", () => {
     const home = makeTempDir();

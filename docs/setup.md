@@ -5,6 +5,7 @@ This guide installs AI Orchestrator for Pi, Cursor with MCP, or Cursor without M
 ## Requirements
 
 - Node.js 20 or newer.
+- Ripgrep (`rg`) for bounded nested BUILD-worker search.
 - Pi workflows: Pi installed, with the models you intend to use authenticated in Pi's local registry.
 - Cursor with MCP: trusted provider credentials and at least one trusted planner/checker model.
 - Git is recommended. The lifecycle coordinates one active run per Git worktree and checker prompts use the current diff.
@@ -86,8 +87,15 @@ npx @miracle3010/ai-orchestrator install-cursor --no-mcp
 Restart or reload Cursor after installation. For MCP mode, enable the `ai-orchestrator` server and confirm that these tools are available:
 
 - `orchestrator_models`
+- `orchestrator_run_start`
+- `orchestrator_run_get`
+- `orchestrator_run_advance`
+- `orchestrator_run_cancel`
+- `orchestrator_run_recover`
 - `orchestrator_plan`
 - `orchestrator_judge`
+
+Prefer the stateful `orchestrator_run_*` tools. The plan/judge tools remain available for clients that still manage their own compatibility loop.
 
 ### Configure trusted MCP providers and models
 
@@ -103,6 +111,8 @@ chmod 600 ~/.ai-orchestrator/config.json
 ```
 
 Edit `~/.ai-orchestrator/config.json`. Provider endpoints, API keys, model catalogs, profiles, and the active MCP routing engine belong in this trusted user file—not in repository config.
+
+Durable MCP authority defaults to `~/.ai-orchestrator/mcp-runs/`, partitioned by the canonical repository digest. Configure `mcp.runs.userStoreDir` only in trusted user config. `projectMirror` defaults to `false`; when the user enables it, a repository may disable it but cannot enable or redirect it. The mirror contains status/digests only. `terminalRetentionDays` defaults to 30 and a repository may only shorten it; terminal authority remains inspectable and is not automatically deleted by this release.
 
 The following is a minimal capability-routing shape. Replace the provider URL, API type, model metadata, prices, and capability claims with values verified for your provider:
 

@@ -9,7 +9,9 @@ import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstim
 import type { ModelSelectionIdentity, RoutingStage, TaskFeatures } from "../src/core/modelRouting.js";
 import { coderPrompt, judgePrompt, plannerPrompt, replanPrompt } from "../src/core/prompts.js";
 import { detectTestCommand } from "../src/core/tests.js";
-import { createIdleState, nextPhase, type OrchestratorState, type Verdict } from "../src/core/loop.js";
+import { createIdleState, nextPhase, type LoopEvent, type OrchestratorState, type Verdict } from "../src/core/loop.js";
+import { applyWorkflowTransition, type GraphTransitionTrace } from "../src/adapters/piWorkflow/graphExecution.js";
+import { fastWorkflowGraph } from "../src/core/workflowGraphs.js";
 import { currentRun, readState } from "../src/lifecycle/artifacts.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
 import {
@@ -74,6 +76,8 @@ interface RuntimeState extends OrchestratorState {
     cacheWriteTokens: number;
     observedUsd: number;
   };
+  graphTrace?: GraphTransitionTrace[];
+  graphWarnings?: string[];
 }
 
 interface RuntimeConfig {
@@ -357,7 +361,15 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const yolo = parsed.yolo || pi.getFlag("orchestrate-yolo") === true;
     const currentThinking = pi.getThinkingLevel();
     state = {
-      ...(nextPhase(createIdleState(), { type: "start", task: parsed.task, yolo }, loopConfigFrom(config)) as RuntimeState),
+      ...(await applyWorkflowTransition({
+        definition: fastWorkflowGraph(),
+        engine: config.execution.engine,
+        state: createIdleState(),
+        event: { type: "start", task: parsed.task, yolo } as LoopEvent,
+        reduce: (current, event) => nextPhase(current, event, loopConfigFrom(config)),
+        ownsState: () => true,
+        onShadowMismatch: (message) => notifyUser(ctx, message, "warning"),
+      }) as RuntimeState),
       runId: createRunId(),
       cwd: ctx.cwd,
       originalModel: ctx.model
@@ -399,7 +411,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     const nextPlanFingerprint = fastConvergenceFingerprint(planText);
     const changedPlan = Boolean(state.planFingerprint && state.planFingerprint !== nextPlanFingerprint);
     state = {
-      ...(nextPhase(state, { type: "plan_produced", plan: planText }, loopConfig()) as RuntimeState),
+      ...(await transitionFast({ type: "plan_produced", plan: planText })),
       judgeReminderSent: false,
       plannerReminderSent: false,
       latestJudgeFeedback: wasReplanning ? undefined : state.latestJudgeFeedback,
@@ -439,7 +451,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     if (!isSameApprovalRun(approvalRunId)) return;
 
     if (choice === "Approve and code") {
-      state = nextPhase(state, { type: "plan_approved" }, loopConfig()) as RuntimeState;
+      state = await transitionFast({ type: "plan_approved" });
       persist();
       if (state.phase === "coding") {
         await enterCoding(ctx);
@@ -455,7 +467,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      state = nextPhase(state, { type: "plan_rejected_by_user" }, loopConfig()) as RuntimeState;
+      state = await transitionFast({ type: "plan_rejected_by_user" });
       persist();
       if (state.phase !== "planning") return;
       const ok = await switchToRole("planner", ctx);
@@ -491,7 +503,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
     await recordFastBuildFingerprint(ctx);
     if (state.phase !== "coding") return;
     persistFastStageOutcome("build", "unknown", "unknown");
-    state = nextPhase(state, { type: "code_produced" }, loopConfig()) as RuntimeState;
+    state = await transitionFast({ type: "code_produced" });
     state.judgeReminderSent = false;
     state.pendingVerdict = undefined;
     persist();
@@ -538,17 +550,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
       persist();
     }
     persistFastStageOutcome("fast-judge", verdict.verdict, true);
-    const stateForTransition: OrchestratorState = { ...state };
-    state = nextPhase(
-      stateForTransition,
+    const stateForTransition: RuntimeState = { ...state };
+    state = await transitionFast(
       {
         type: "verdict",
         verdict: verdict.verdict,
         reasons: verdict.reasons,
         requiredFixes: verdict.requiredFixes,
       },
-      loopConfig(),
-    ) as RuntimeState;
+      stateForTransition,
+    );
     state.pendingVerdict = undefined;
     state.judgeReminderSent = false;
     state.latestJudgeFeedback = formatJudgeFeedback(verdict);
@@ -634,7 +645,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
         ctx.abort();
       }
       restoreRunTools(stoppedState);
-      state = nextPhase(stoppedState, { type: "cancelled" }, loopConfig()) as RuntimeState;
+      state = await transitionFast({ type: "cancelled" }, stoppedState);
       state.runId = undefined;
       persist();
 
@@ -1067,6 +1078,27 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
   function loopConfig() {
     return loopConfigFrom(runtime?.config ?? DEFAULT_CONFIG);
+  }
+
+  async function transitionFast(event: LoopEvent, source: RuntimeState = state): Promise<RuntimeState> {
+    if (!runtime) throw new Error("Fast-path runtime is unavailable during graph transition");
+    let trace: GraphTransitionTrace | undefined;
+    let graphWarning: string | undefined;
+    const next = await applyWorkflowTransition({
+      definition: fastWorkflowGraph(),
+      engine: runtime.config.execution.engine,
+      state: source,
+      event,
+      reduce: (current, selectedEvent) => nextPhase(current, selectedEvent, loopConfig()) as RuntimeState,
+      ownsState: (candidate) => candidate.runId === state.runId && candidate.phase === state.phase,
+      onTrace: (value) => { trace = value; },
+      onShadowMismatch: (message) => { graphWarning = message; },
+    });
+    return {
+      ...next,
+      ...(trace ? { graphTrace: [...(source.graphTrace ?? []), trace] } : {}),
+      ...(graphWarning ? { graphWarnings: [...(source.graphWarnings ?? []), graphWarning] } : {}),
+    };
   }
 
   function updateUi(ctx: ExtensionContext): void {

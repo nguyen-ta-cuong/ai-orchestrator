@@ -2,13 +2,18 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: ai-orchestrator install-cursor [--no-mcp] [--global]\n\nInstalls Cursor rule, skill, and optionally MCP assets for the Plan → Code → Judge workflow.\n`);
+  stream.write(
+    "Usage:\n"
+    + "  ai-orchestrator install-cursor [--no-mcp] [--global]\n"
+    + "  ai-orchestrator graph-rollout-report <release-version>\n\n"
+    + "Installs Cursor assets or verifies and reports canonical graph rollout evidence from the trusted user store.\n",
+  );
   process.exit(exitCode);
 }
 
@@ -16,55 +21,65 @@ const [, , command, ...args] = process.argv;
 if (!command || command === "--help" || command === "-h") {
   usage(0);
 }
-if (command !== "install-cursor") {
+if (command === "graph-rollout-report") {
+  await reportGraphRollout(args);
+} else if (command !== "install-cursor") {
   process.stderr.write(`Unknown command: ${command}\n`);
   usage(1);
-}
-
-const noMcp = args.includes("--no-mcp");
-const globalInstall = args.includes("--global");
-const unknown = args.find((arg) => arg !== "--no-mcp" && arg !== "--global");
-if (unknown) {
-  process.stderr.write(`Unknown option: ${unknown}\n`);
-  usage(1);
-}
-
-const requestedBase = globalInstall ? homedir() : process.cwd();
-if (globalInstall) mkdirSync(requestedBase, { recursive: true });
-const installBase = realpathSync(requestedBase);
-const cursorDir = join(installBase, ".cursor");
-assertContainedWithoutSymlinks(installBase, cursorDir);
-const rulesDir = join(cursorDir, "rules");
-const skillsDir = join(cursorDir, "skills", "orchestrate");
-assertContainedWithoutSymlinks(installBase, rulesDir);
-assertContainedWithoutSymlinks(installBase, skillsDir);
-mkdirSync(rulesDir, { recursive: true });
-mkdirSync(dirname(skillsDir), { recursive: true });
-assertContainedWithoutSymlinks(installBase, rulesDir);
-assertContainedWithoutSymlinks(installBase, dirname(skillsDir));
-
-const ruleTarget = join(rulesDir, "ai-orchestrator.mdc");
-const skillTarget = join(skillsDir, "SKILL.md");
-reportCopy("Cursor rule", copyIfAbsentOrIdentical(join(root, "cursor", "rules", "ai-orchestrator.mdc"), ruleTarget), ruleTarget);
-assertContainedWithoutSymlinks(installBase, skillsDir);
-mkdirSync(skillsDir, { recursive: true });
-reportCopy("Cursor skill", copyIfAbsentOrIdentical(join(root, "skills", "orchestrate", "SKILL.md"), skillTarget), skillTarget);
-
-if (noMcp) {
-  process.stdout.write("Skipped MCP config because --no-mcp was supplied. Cursor will use the manual no-tool workflow from the installed skill.\n");
 } else {
-  const portableNpx = isEphemeralNpxExecution();
-  const snippet = portableNpx ? portableMcpSnippet() : localMcpSnippet();
-  const mcpPath = join(cursorDir, "mcp.json");
-  const portabilityNote = portableNpx
-    ? "Installed the version-pinned portable npx MCP command so npm cache cleanup cannot invalidate an absolute package path.\n"
-    : "Note: this local-package snippet uses machine-specific absolute paths. Do not commit it unchanged for teammates; use cursor/mcp.json as the portable pinned-npx example after publishing.\n";
-  if (existsSync(mcpPath)) {
-    process.stdout.write(`\nMCP config already exists at ${mcpPath}; it was not modified. Merge this local-package snippet manually:\n\n${snippet}\n${portabilityNote}`);
+  const noMcp = args.includes("--no-mcp");
+  const globalInstall = args.includes("--global");
+  const unknown = args.find((arg) => arg !== "--no-mcp" && arg !== "--global");
+  if (unknown) {
+    process.stderr.write(`Unknown option: ${unknown}\n`);
+    usage(1);
+  }
+
+  const requestedBase = globalInstall ? homedir() : process.cwd();
+  if (globalInstall) mkdirSync(requestedBase, { recursive: true });
+  const installBase = realpathSync(requestedBase);
+  const cursorDir = join(installBase, ".cursor");
+  assertContainedWithoutSymlinks(installBase, cursorDir);
+  const rulesDir = join(cursorDir, "rules");
+  const skillsDir = join(cursorDir, "skills", "orchestrate");
+  assertContainedWithoutSymlinks(installBase, rulesDir);
+  assertContainedWithoutSymlinks(installBase, skillsDir);
+  mkdirSync(rulesDir, { recursive: true });
+  mkdirSync(dirname(skillsDir), { recursive: true });
+  assertContainedWithoutSymlinks(installBase, rulesDir);
+  assertContainedWithoutSymlinks(installBase, dirname(skillsDir));
+
+  const ruleTarget = join(rulesDir, "ai-orchestrator.mdc");
+  const skillTarget = join(skillsDir, "SKILL.md");
+  reportCopy(
+    "Cursor rule",
+    copyIfAbsentOrIdentical(installBase, join(root, "cursor", "rules", "ai-orchestrator.mdc"), ruleTarget),
+    ruleTarget,
+  );
+  assertContainedWithoutSymlinks(installBase, skillsDir);
+  mkdirSync(skillsDir, { recursive: true });
+  reportCopy(
+    "Cursor skill",
+    copyIfAbsentOrIdentical(installBase, join(root, "skills", "orchestrate", "SKILL.md"), skillTarget),
+    skillTarget,
+  );
+
+  if (noMcp) {
+    process.stdout.write("Skipped MCP config because --no-mcp was supplied. Cursor will use the manual no-tool workflow from the installed skill.\n");
   } else {
-    assertContainedWithoutSymlinks(installBase, mcpPath);
-    writeFileSync(mcpPath, `${snippet}\n`, { flag: "wx" });
-    process.stdout.write(`Wrote MCP config: ${mcpPath}\n${portabilityNote}`);
+    const portableNpx = isEphemeralNpxExecution();
+    const snippet = portableNpx ? portableMcpSnippet() : localMcpSnippet();
+    const mcpPath = join(cursorDir, "mcp.json");
+    const portabilityNote = portableNpx
+      ? "Installed the version-pinned portable npx MCP command so npm cache cleanup cannot invalidate an absolute package path.\n"
+      : "Note: this local-package snippet uses machine-specific absolute paths. Do not commit it unchanged for teammates; use cursor/mcp.json as the portable pinned-npx example after publishing.\n";
+    if (existsSync(mcpPath)) {
+      process.stdout.write(`\nMCP config already exists at ${mcpPath}; it was not modified. Merge this local-package snippet manually:\n\n${snippet}\n${portabilityNote}`);
+    } else {
+      assertContainedWithoutSymlinks(installBase, mcpPath);
+      writeFileSync(mcpPath, `${snippet}\n`, { flag: "wx" });
+      process.stdout.write(`Wrote MCP config: ${mcpPath}\n${portabilityNote}`);
+    }
   }
 }
 
@@ -91,7 +106,7 @@ function localMcpSnippet() {
   );
 }
 
-function copyIfAbsentOrIdentical(source, target) {
+function copyIfAbsentOrIdentical(installBase, source, target) {
   assertContainedWithoutSymlinks(installBase, target);
   const content = readFileSync(source, "utf8");
   if (existsSync(target)) {
@@ -131,5 +146,28 @@ function reportCopy(label, status, target) {
     process.stdout.write(`${label} already up to date: ${target}\n`);
   } else {
     process.stdout.write(`Installed ${label}: ${target}\n`);
+  }
+}
+
+async function reportGraphRollout(args) {
+  if (args.length !== 1 || args[0].startsWith("-")) {
+    process.stderr.write("graph-rollout-report requires exactly one semantic release version.\n");
+    usage(1);
+  }
+  const verifierPath = join(root, "dist", "src", "lifecycle", "graphReleaseEvidenceStore.js");
+  if (!existsSync(verifierPath)) {
+    process.stderr.write(
+      `ai-orchestrator build output is missing at ${verifierPath}. Run \`npm run build\` before reporting from a source checkout.\n`,
+    );
+    process.exit(1);
+  }
+  try {
+    const { verifyGraphReleaseRecord } = await import(pathToFileURL(verifierPath).href);
+    const assessment = verifyGraphReleaseRecord({ releaseVersion: args[0] });
+    process.stdout.write(`${JSON.stringify(assessment, null, 2)}\n`);
+    process.exitCode = assessment.eligible ? 0 : 2;
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
   }
 }

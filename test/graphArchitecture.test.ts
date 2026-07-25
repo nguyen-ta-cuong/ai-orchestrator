@@ -69,11 +69,11 @@ describe("structured graph architecture documentation", () => {
     }
   });
 
-  it("contains the three approved program canvases and marks target-only files", () => {
+  it("contains the approved program canvases and names the versioned recovery contract", () => {
     expect(architecture.match(/```mermaid/g)).toHaveLength(4);
     expect(architecture).toContain("0010 canvases");
     expect(architecture).toContain("Graph compiler and validator");
     expect(architecture).toContain("Immutable BUILD DAG vN");
-    expect(architecture).toContain("The exact schemas and filenames become contracts only when their owning plans land.");
+    expect(architecture).toContain("The owning plans have landed their schemas and validation contracts.");
   });
 });
