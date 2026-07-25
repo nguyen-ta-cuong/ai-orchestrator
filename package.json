@@ -1,6 +1,6 @@
 {
   "name": "@miracle3010/ai-orchestrator",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "Plan-code-judge AI orchestration for Pi and Cursor.",
   "type": "module",
   "engines": {
@@ -34,6 +34,8 @@
     "docs/graph-architecture.md",
     "docs/setup.md",
     "docs/user-guide.md",
+    "docs/images/ai-orchestrator-run-flow.mmd",
+    "docs/images/ai-orchestrator-run-flow.png",
     "docs/images/ai-orchestrator-workflow.svg",
     "docs/images/ai-orchestrator-workflow.png"
   ],

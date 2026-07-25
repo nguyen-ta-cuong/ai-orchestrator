@@ -23,40 +23,7 @@ Then start with:
 
 ## How a run works
 
-```mermaid
-flowchart TD
-    T["Your task"] --> C{"How much control does it need?"}
-
-    C -->|"Focused change"| FP["PLAN"]
-    FP --> FA{"Approve plan?"}
-    FA -->|"Revise"| FP
-    FA -->|"Approve"| FB["BUILD<br/>maker edits code"]
-    FB --> FJ["JUDGE<br/>independent checker"]
-    FJ -->|"Approve"| FD["Done"]
-    FJ -->|"Fix within budget"| FB
-    FJ -->|"Repeated rejection"| FP
-    FJ -->|"Attempt cap reached"| FF["Stop failed<br/>working tree preserved"]
-
-    C -->|"Durable, risky, or multi-part work"| LD["DEFINE"]
-    LD --> LS{"Approve specification?"}
-    LS -->|"Revise"| LD
-    LS -->|"Approve"| LP["PLAN<br/>immutable BUILD DAG"]
-    LP --> LA{"Approve plan?"}
-    LA -->|"Revise"| LP
-    LA -->|"Approve"| LB["BUILD<br/>sequential or isolated worktrees"]
-    LB --> LV["VERIFY"]
-    LV -->|"Approve"| LR["REVIEW"]
-    LV -->|"Reject"| LG["DEBUG<br/>read-only diagnosis"]
-    LR -->|"Reject"| LG
-    LG -->|"Retry checker"| LV
-    LG -->|"Repair"| LB
-    LG -->|"Structural re-plan"| LP
-    LR -->|"Approve"| LH["SHIP<br/>GO / NO-GO + rollback plan"]
-    LH -->|"GO"| LC{"Confirm configured final action?"}
-    LC -->|"Confirm or decline"| LDone["Done"]
-    LH -->|"NO-GO within budget"| LB
-    LG -->|"Budget or safety stop"| LF["Stop failed or blocked<br/>artifacts preserved"]
-```
+![AI Orchestrator run flow](https://cdn.jsdelivr.net/npm/@miracle3010/ai-orchestrator/docs/images/ai-orchestrator-run-flow.png)
 
 The fast path is available in Pi and through Cursor’s durable MCP workflow. The full lifecycle runs in Pi. Cursor can also use the same Plan → Code → Judge controls manually when MCP is unavailable.
 
