@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -21,7 +21,6 @@ import { createPiRoutingPlan, piRoutingRunVersion, type PiRoutingCandidate, type
 import { enforceRoutingBudget, type RoutingBudgetSnapshot, type RoutingCostEstimate } from "../src/core/routingBudget.js";
 import {
   debugPrompt,
-  buildPrompt,
   reviewPrompt,
   shipPrompt,
   specPrompt,
@@ -45,8 +44,16 @@ import {
   type SideEffectExecutionState,
 } from "../src/core/scheduler.js";
 import { recommendRoutingPolicyChanges } from "../src/core/routingEvidence.js";
+import {
+  buildPlanContentFingerprint,
+  compileBuildPlan,
+  compileLegacySequentialBuildPlan,
+  type CompiledBuildPlan,
+} from "../src/core/buildPlan.js";
+import { requireBuildRepositoryPath } from "../src/core/repositoryPath.js";
 import { detectTestCommand } from "../src/core/tests.js";
 import { isReadOnlyLifecycleCommand } from "../src/lifecycle/readOnlyPolicy.js";
+import { createReviewedCommandRegistry, executeReviewedCommand } from "../src/lifecycle/reviewedCommandRegistry.js";
 import {
   acquireRunLease,
   appendJournal,
@@ -75,6 +82,26 @@ import {
   readRoutingEvidenceEvents,
   resolveUserEvidenceRoot,
 } from "../src/lifecycle/routingEvidenceStore.js";
+import {
+  buildPlanVersionForSubmission,
+  latestBuildPlanVersion,
+  readImmutableBuildPlan,
+  recoverIncompleteBuildPlan,
+  writeImmutableBuildPlan,
+} from "../src/lifecycle/buildArtifacts.js";
+import {
+  acquireBuildGraphExecutionLease,
+  initializeBuildGraphExecution,
+  releaseBuildGraphExecution,
+} from "../src/lifecycle/buildGraphExecution.js";
+import { executeBuildGraphLifecycle } from "../src/lifecycle/piBuildGraphLifecycle.js";
+import {
+  completeBuildHumanIntegration,
+  prepareBuildHumanIntegrationReview,
+  type BuildHumanIntegrationReview,
+} from "../src/lifecycle/buildHumanIntegration.js";
+import { createLocalGitRunner } from "../src/lifecycle/worktreeExecution.js";
+import type { PiBuildModel } from "../src/runtime/piBuildWorker.js";
 import { applyWorkflowTransition } from "../src/adapters/piWorkflow/graphExecution.js";
 import { lifecycleWorkflowGraph } from "../src/core/workflowGraphs.js";
 import {
@@ -86,10 +113,9 @@ import {
 const ENTRY_TYPE = "ai-orchestrator-lifecycle";
 const STATUS_KEY = ENTRY_TYPE;
 const WIDGET_KEY = ENTRY_TYPE;
-const VERDICT_TOOLS = new Set(["verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
+const VERDICT_TOOLS = new Set(["submit_build_plan", "verify_verdict", "review_verdict", "debug_diagnosis", "ship_decision"]);
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 const READ_TOOLS = ["read", "grep", "find", "ls", "bash"];
-const BUILD_TOOL_ALLOWLIST = new Set(["read", "grep", "find", "ls", "edit", "write"]);
 const COMPILED_LIFECYCLE_GRAPH = compileGraph(lifecycleWorkflowGraph());
 const PUBLICATION_COMMAND = /\bgit\b[\s\S]*?\b(?:add|commit|push|tag)\b|\bgh\b[\s\S]*?\bpr\b[\s\S]*?\bcreate\b|\b(?:npm|pnpm|yarn)\b[\s\S]*?\bpublish\b/i;
 const DESTRUCTIVE_GIT_COMMAND = /\bgit\b[\s\S]*?\b(?:clean|reset|checkout|restore)\b/i;
@@ -126,8 +152,10 @@ interface Runtime {
   invocationOriginal?: LifecycleState["originalModel"];
   pendingVerdict?: PendingVerdict;
   pendingDiagnosis?: PendingDiagnosis;
+  pendingBuildPlanVersion?: number;
   attemptedModels: string[];
   leaseOwner: GraphCheckpointLease;
+  buildLease?: GraphCheckpointLease;
   trustedRecoveryRequestRef?: string;
   lastUsage?: {
     inputTokens: number;
@@ -250,12 +278,16 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       if (!protectedRoots.some((root) => requestedPath === root || requestedPath.startsWith(`${root}/`))) return;
       return { block: true, reason: "BUILD may edit source files but orchestrator metadata and lifecycle artifacts are orchestrator-owned." };
     }
-    if (state.phase === "defining" || state.phase === "planning") {
+    if (state.phase === "defining") {
       const input = event.input as { path?: unknown };
       const requestedPath = typeof input.path === "string" ? resolve(activeRuntime.cwd, input.path.replace(/^@/, "")) : "";
-      const allowedPath = resolve(state.phase === "defining" ? activeRuntime.paths.spec : activeRuntime.paths.plan);
+      const allowedPath = resolve(activeRuntime.paths.spec);
       if (requestedPath === allowedPath) return;
       return { block: true, reason: `${stageLabel(state.phase)} may write only ${allowedPath}.` };
+    }
+
+    if (state.phase === "planning") {
+      return { block: true, reason: "PLAN files are extension-owned; finish with submit_build_plan instead of edit/write." };
     }
 
     return { block: true, reason: `${stageLabel(state.phase)} is read-only; edit/write are blocked.` };
@@ -414,6 +446,84 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   });
 
   function registerVerdictTools(): void {
+    const buildOutputContract = Type.Object({
+      id: Type.String(),
+      kind: StringEnum(["artifact", "file-set", "evidence"] as const),
+      validation: StringEnum(["exists", "sha256", "structured", "reviewed-command", "human-review"] as const),
+      validatorRef: Type.Optional(Type.String()),
+    });
+    const buildResourceLock = Type.Object({
+      kind: StringEnum(["path", "logical"] as const),
+      value: Type.String(),
+      mode: StringEnum(["shared", "exclusive"] as const),
+    });
+    const buildNode = Type.Object({
+      id: Type.String(),
+      handler: StringEnum(["inspect", "design", "implement", "validate", "integrate"] as const),
+      priority: Type.Integer(),
+      objective: Type.String(),
+      instructions: Type.Array(Type.String()),
+      acceptanceCriteria: Type.Array(Type.String()),
+      verificationCommands: Type.Array(Type.String()),
+      inputContracts: Type.Array(Type.String()),
+      outputContracts: Type.Array(buildOutputContract),
+      toolPolicy: StringEnum(["read-only", "declared-writes", "reviewed-validation", "human-integration"] as const),
+      sideEffect: StringEnum(["none", "read", "write", "external", "irreversible"] as const),
+      workspace: StringEnum(["shared", "isolated-worktree"] as const),
+      targetWorktreeNodeId: Type.Optional(Type.String()),
+      idempotency: StringEnum(["none", "keyed", "read-replay-safe"] as const),
+      resourceLocks: Type.Array(buildResourceLock),
+      writeSet: Type.Array(Type.String()),
+      retryLimit: Type.Integer({ minimum: 0 }),
+      timeoutMs: Type.Integer({ minimum: 1 }),
+    });
+
+    pi.registerTool({
+      name: "submit_build_plan",
+      label: "Submit BUILD Plan",
+      description: "Validate and durably submit the structured immutable lifecycle BUILD DAG.",
+      promptSnippet: "Submit the lifecycle PLAN as a validated immutable BUILD DAG",
+      promptGuidelines: ["Use submit_build_plan exactly once as the final action during lifecycle PLAN; never write plan files directly."],
+      parameters: Type.Object({
+        plan: Type.Object({
+          schemaVersion: Type.Literal(1),
+          id: Type.String(),
+          planVersion: Type.Integer({ minimum: 1 }),
+          summary: Type.String(),
+          entry: Type.String(),
+          exit: Type.String(),
+          nodes: Type.Array(buildNode),
+          dependencies: Type.Array(Type.Object({
+            from: Type.String(),
+            to: Type.String(),
+            contracts: Type.Array(Type.String()),
+          })),
+          joins: Type.Array(Type.Object({
+            nodeId: Type.String(),
+            mode: StringEnum(["all_of"] as const),
+          })),
+        }),
+      }),
+      async execute(_id, params) {
+        requireToolPhase("planning", "submit_build_plan");
+        const compiled = compileBuildPlan(params.plan);
+        const expectedVersion = runtime!.pendingBuildPlanVersion ?? buildPlanVersionForSubmission(runtime!.paths);
+        if (compiled.plan.planVersion !== expectedVersion) {
+          throw new Error(`submit_build_plan expected planVersion ${expectedVersion}, received ${compiled.plan.planVersion}`);
+        }
+        const reference = writeImmutableBuildPlan(runtime!.paths, compiled, { owner: runtime!.leaseOwner });
+        const markdown = readFileSync(reference.markdownPath, "utf8");
+        assertRunPathsSafe(runtime!.paths);
+        writeFileSync(runtime!.paths.plan, markdown);
+        appendRuntimeJournal(runtime!, `Structured BUILD plan v${reference.planVersion} checkpointed: ${reference.planHash}`);
+        return {
+          content: [{ type: "text", text: `Recorded immutable BUILD plan v${reference.planVersion} (${reference.planHash}).` }],
+          details: { planVersion: reference.planVersion, planHash: reference.planHash },
+          terminate: true,
+        };
+      },
+    });
+
     pi.registerTool({
       name: "verify_verdict",
       label: "Verify Verdict",
@@ -1223,6 +1333,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const record = parsed as Record<string, unknown>;
     const before = record.artifactBefore;
     const route = record.route;
+    const submittedPlanVersion = artifact === "plan" ? latestBuildPlanVersion(runtime.paths) : undefined;
     const selection = runtime.state.modelSelections.find((candidate) =>
       candidate.routing?.decisionId === effect.routingDecisionId);
     const path = artifact === "spec" ? runtime.paths.spec : runtime.paths.plan;
@@ -1235,6 +1346,11 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         (route as Record<string, unknown>).provider !== selection.provider ||
         (route as Record<string, unknown>).model !== selection.model ||
         (route as Record<string, unknown>).thinking !== selection.thinking ||
+        (artifact === "plan" && (
+          !Number.isSafeInteger(record.expectedBuildPlanVersion) ||
+          (record.expectedBuildPlanVersion as number) < 1 ||
+          submittedPlanVersion !== record.expectedBuildPlanVersion
+        )) ||
         !before || typeof before !== "object" || Array.isArray(before)) {
       throw new Error(`Lifecycle ${artifact} request checkpoint does not match the active effect`);
     }
@@ -1244,6 +1360,7 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     }
     const current = boundedArtifactIdentity(path);
     if (current.sizeBytes === 0 || current.sha256 === baseline.sha256 && current.sizeBytes === baseline.sizeBytes) return undefined;
+    if (artifact === "plan") runtime.pendingBuildPlanVersion = submittedPlanVersion;
     return effect.requestRef;
   }
 
@@ -1266,6 +1383,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     const artifact = runtime.state.phase === "defining" ? "spec" : runtime.state.phase === "planning" ? "plan" : undefined;
     const artifactRequest = artifact ? recoverableArtifactRequest(artifact) : undefined;
     if (artifact && artifactRequest) {
+      if (artifact === "plan" && runtime.pendingBuildPlanVersion !== undefined) {
+        appendRuntimeJournal(runtime, `Recovered submitted BUILD plan v${runtime.pendingBuildPlanVersion} before PLAN transition`);
+      }
       runtime.trustedRecoveryRequestRef = artifactRequest;
       try {
         await artifactStageEnded(ctx, artifact);
@@ -1306,13 +1426,29 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
         break;
       case "planning": {
         const spec = readRequired(runtime.paths.spec, "spec");
+        recoverIncompleteBuildPlan(runtime.paths, { owner: runtime.leaseOwner });
+        const latestVersion = latestBuildPlanVersion(runtime.paths);
+        if (latestVersion !== undefined) {
+          const latest = readImmutableBuildPlan(runtime.paths, latestVersion);
+          const latestMarkdown = readFileSync(join(runtime.paths.root, "build", "plan-versions", String(latestVersion), "plan.md"), "utf8");
+          if (runtime.state.planFingerprint !== convergenceFingerprint(latestMarkdown)) {
+            runtime.pendingBuildPlanVersion = latest.plan.planVersion;
+            writeFileSync(runtime.paths.plan, latestMarkdown);
+            appendRuntimeJournal(runtime, `Recovered submitted BUILD plan v${latest.plan.planVersion} before PLAN transition`);
+            await artifactStageEnded(ctx, "plan");
+            break;
+          }
+        }
         if (!(await enterRoutedStage("plan", "planner", ctx))) return;
-        activateArtifactTools();
+        runtime.pendingBuildPlanVersion = buildPlanVersionForSubmission(runtime.paths);
+        activatePlanningTools();
         updateUi(ctx);
         sendPhasePrompt(taskPlanPrompt(
           spec,
           rel(runtime.paths.plan),
           runtime.state.revisionFeedback?.artifact === "plan" ? runtime.state.revisionFeedback.feedback : replanFeedback(),
+          runtime.pendingBuildPlanVersion,
+          runtime.config.judge.runTests ? detectTestCommand(runtime.cwd) : undefined,
         ), ctx);
         break;
       }
@@ -1433,16 +1569,328 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
 
   async function enterBuild(ctx: ExtensionContext): Promise<void> {
     if (!runtime) return;
-    const breaker = convergenceBreakerReason(runtime.state, runtime.config);
+    const active = runtime;
+    const runId = active.state.runId;
+    const stillOwnsBuild = (): boolean => runtime === active && ownsRun(runId, "building");
+    const breaker = convergenceBreakerReason(active.state, active.config);
     if (breaker) {
       await interruptRun(ctx, `Lifecycle BUILD paused by convergence circuit breaker: ${breaker}`);
       return;
     }
-    const plan = readRequired(runtime.paths.plan, "plan");
-    restoreBuildTools();
+    const plan = readRequired(active.paths.plan, "plan");
+    const compiled = ensureImmutableBuildPlanForExecution(plan);
+    const graphOwner = active.buildLease ??= acquireBuildGraphExecutionLease(
+      active.paths,
+      active.leaseOwner,
+      {
+        now: new Date().toISOString(),
+        pid: process.pid,
+      },
+    );
+    const buildState = initializeBuildGraphExecution(active.paths, compiled, {
+      owner: active.leaseOwner,
+      graphOwner,
+      now: new Date().toISOString(),
+      pid: process.pid,
+      limits: executionLimitsFrom(active.config),
+    });
+    appendRuntimeJournal(
+      active,
+      `BUILD DAG checkpoint ready for immutable plan v${compiled.plan.planVersion} (${compiled.hash}); revision ${buildState.revision}`,
+    );
+    const cancelledIntegration = compiled.plan.nodes.find((node) =>
+      node.handler === "integrate" && buildState.nodeStates[node.id]?.status === "cancelled");
+    if (cancelledIntegration) {
+      await stopRun(
+        ctx,
+        `BUILD candidate integration ${cancelledIntegration.id} was durably declined. Candidate worktrees and branches remain preserved.`,
+      );
+      return;
+    }
+    const isolatedWriters = compiled.plan.nodes.filter((node) =>
+      node.handler === "implement" && node.workspace === "isolated-worktree");
+    const repositoryRoot = realpathSync(active.cwd);
+    const candidateRoot = join(active.paths.root, "build", "worktrees");
+    mkdirSync(candidateRoot, { recursive: true, mode: 0o700 });
+    const git = createLocalGitRunner({ timeoutMs: Math.max(...compiled.plan.nodes.map(({ timeoutMs }) => timeoutMs)) });
+    const waitingIntegration = compiled.plan.nodes.find((node) =>
+      node.handler === "integrate" && buildState.nodeStates[node.id]?.status === "waiting_human");
+    let resumedHumanIntegration = false;
+    if (waitingIntegration) {
+      if (!ctx.hasUI) {
+        await interruptRun(ctx, "BUILD human integration requires interactive review; candidate worktrees remain preserved.");
+        return;
+      }
+      const review = prepareBuildHumanIntegrationReview(active.paths, compiled, buildState, {
+        owner: active.leaseOwner,
+        repositoryRoot,
+        git,
+        now: () => new Date().toISOString(),
+      });
+      const choice = await ctx.ui.select(
+        `BUILD integration: ${review.nodeId}`,
+        ["Record manual integration", "Decline all candidates", "Keep waiting"],
+      );
+      if (!stillOwnsBuild()) return;
+      if (choice === "Keep waiting" || choice === undefined) {
+        await interruptRun(ctx, `${formatBuildHumanReview(review)}\n\nNo integration decision was recorded. Candidate worktrees remain preserved.`);
+        return;
+      }
+      if (choice === "Decline all candidates") {
+        const confirmed = await ctx.ui.confirm(
+          "Decline all BUILD candidates?",
+          "This records a durable decline and cancels the lifecycle. Candidate worktrees and branches remain preserved; no cleanup runs.",
+        );
+        if (!stillOwnsBuild()) return;
+        if (!confirmed) {
+          await interruptRun(ctx, "BUILD integration decline was not confirmed; candidate worktrees remain preserved.");
+          return;
+        }
+        await completeBuildHumanIntegration(active.paths, compiled, buildState, {
+          decision: "declined",
+          selectedCandidateNodeIds: [],
+          confirmedByUser: true,
+        }, {
+          owner: active.leaseOwner,
+          graphOwner,
+          repositoryRoot,
+          git,
+          now: () => new Date().toISOString(),
+        });
+        appendRuntimeJournal(active, `BUILD human integration declined for ${review.candidates.map(({ nodeId }) => nodeId).join(", ")}`);
+        await stopRun(ctx, "BUILD candidate integration was explicitly declined. Candidate worktrees and branches were preserved; recording the decline performed no merge, commit, checkout, cleanup, push, or publication action.");
+        return;
+      }
+
+      const selectedCandidateNodeIds: string[] = [];
+      for (const candidate of review.candidates) {
+        const selected = await ctx.ui.confirm(
+          `Confirm candidate ${candidate.nodeId} was integrated?`,
+          `${candidate.worktreePath}\nChanged: ${candidate.changedPaths.join(", ")}\nValidation artifacts: ${candidate.validationArtifactSha256.length}`,
+        );
+        if (!stillOwnsBuild()) return;
+        if (selected) selectedCandidateNodeIds.push(candidate.nodeId);
+      }
+      if (selectedCandidateNodeIds.length === 0) {
+        await interruptRun(ctx, "No BUILD candidate was selected; the integration gate remains waiting and all candidates are preserved.");
+        return;
+      }
+      const confirmed = await ctx.ui.confirm(
+        "Record the manual BUILD integration?",
+        `Confirm you manually integrated and committed ${selectedCandidateNodeIds.join(", ")} into the main workspace. The runtime will only inspect Git and record evidence; it will not merge, commit, or clean anything.`,
+      );
+      if (!stillOwnsBuild()) return;
+      if (!confirmed) {
+        await interruptRun(ctx, "BUILD manual integration was not confirmed; the gate remains waiting.");
+        return;
+      }
+      const completed = await completeBuildHumanIntegration(active.paths, compiled, buildState, {
+        decision: "integrated",
+        selectedCandidateNodeIds,
+        confirmedByUser: true,
+      }, {
+        owner: active.leaseOwner,
+        graphOwner,
+        repositoryRoot,
+        git,
+        now: () => new Date().toISOString(),
+      });
+      appendRuntimeJournal(
+        active,
+        `BUILD human integration recorded for ${completed.decision.selectedCandidateNodeIds.join(", ")}; main HEAD ${completed.decision.mainWorkspaceHeadBefore} -> ${completed.decision.mainWorkspaceHeadAfter}`,
+      );
+      resumedHumanIntegration = true;
+    }
+
     if (!(await enterModelStage("build", "coder", ctx))) return;
-    updateUi(ctx);
-    sendPhasePrompt(buildPrompt(plan, buildFeedback(), runtime.config.build.commitPerTask), ctx);
+    if (!stillOwnsBuild()) return;
+    const selection = [...active.state.modelSelections].reverse().find(({ stage }) => stage === "build");
+    if (!selection) throw new Error("BUILD routing completed without a selected maker model");
+    const selectedModel = ctx.modelRegistry.find(selection.provider, selection.model) as PiBuildModel | undefined;
+    if (!selectedModel) throw new Error("BUILD selected maker model disappeared before nested dispatch");
+
+    let allowWorktreeCreation = false;
+    let trustRepositoryCheckout = false;
+    let allowParallelWrites = false;
+    if (resumedHumanIntegration) {
+      // These permissions were already evidenced by the owned candidate
+      // worktrees. No writer action remains after the integration event.
+      allowWorktreeCreation = true;
+      trustRepositoryCheckout = true;
+    } else if (isolatedWriters.length > 0) {
+      if (!ctx.hasUI) {
+        await interruptRun(ctx, "BUILD requires explicit interactive worktree-creation and repository-checkout trust confirmations.");
+        return;
+      }
+      allowWorktreeCreation = await ctx.ui.confirm(
+        "Create isolated BUILD worktrees?",
+        `Create ${isolatedWriters.length} contained branch worktree candidate(s)? No merge, commit, cleanup, push, or publication will run automatically.`,
+      );
+      if (!stillOwnsBuild()) return;
+      if (!allowWorktreeCreation) {
+        await interruptRun(ctx, "BUILD paused because isolated worktree creation was not approved.");
+        return;
+      }
+      trustRepositoryCheckout = await ctx.ui.confirm(
+        "Trust repository checkout behavior?",
+        "Git worktree checkout can invoke repository-configured filters and related checkout behavior. Continue only if this repository is trusted.",
+      );
+      if (!stillOwnsBuild()) return;
+      if (!trustRepositoryCheckout) {
+        await interruptRun(ctx, "BUILD paused because repository checkout behavior was not trusted.");
+        return;
+      }
+      if (isolatedWriters.length > 1) {
+        allowParallelWrites = await ctx.ui.confirm(
+          "Run isolated writers concurrently?",
+          "This may reduce elapsed time, but every candidate still stops at explicit human integration review.",
+        );
+        if (!stillOwnsBuild()) return;
+      }
+    }
+
+    const limits = executionLimitsFrom(active.config);
+    const reviewedCommands = createReviewedCommandRegistry(
+      active.config.judge.runTests ? detectTestCommand(active.cwd) : undefined,
+    );
+    const result = await executeBuildGraphLifecycle({
+      compiled,
+      paths: active.paths,
+      owner: active.leaseOwner,
+      graphOwner,
+      repositoryRoot,
+      candidateRoot,
+      protectedWorkspacePaths: [active.config.lifecycle.artifactsDir],
+      model: selectedModel,
+      thinkingLevel: selection.thinking,
+      modelRegistry: ctx.modelRegistry,
+      ...(selection.family === undefined ? {} : { family: selection.family }),
+      now: () => new Date().toISOString(),
+      pid: process.pid,
+      limits,
+      policy: {
+        unattended: !ctx.hasUI,
+        maxReadOnlyFanOut: Math.max(1, Math.min(limits.maxModelConcurrency, limits.maxConcurrency)),
+        allowParallelWrites,
+        allowWorktreeCreation,
+        trustRepositoryCheckout,
+      },
+      maxActionConcurrency: Math.max(1, Math.min(limits.maxModelConcurrency, limits.maxConcurrency)),
+      routingDecisionId: selection.routing!.decisionId,
+      budgetForNode: () => ({
+        estimatedCostUsd: "unknown",
+        observedCostUsd: 0,
+        inputTokens: "unknown",
+        outputTokens: "unknown",
+      }),
+      runReviewedCommand: async (command, options) => {
+        const execution = await executeReviewedCommand(reviewedCommands, pi.exec.bind(pi), command, {
+          ...options,
+          signal: options.signal ?? ctx.signal,
+        });
+        return {
+          code: execution.code,
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+          ...(execution.killed === undefined ? {} : { killed: execution.killed }),
+        };
+      },
+      validateReviewedCommands: ({ validatorRef, commands }) =>
+        validatorRef === "verification-commands" && reviewedCommands.allows(commands),
+      validateStructuredOutput: ({ validatorRef, value }) =>
+        validatorRef === "json-object" && value !== null && typeof value === "object" && !Array.isArray(value),
+      git,
+      ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+    });
+    if (!runtime || runtime !== active || !ownsRun(active.state.runId, "building")) return;
+    appendRuntimeJournal(active, `BUILD coordinator ${result.status}: ${result.reason ?? "durable graph complete"}`);
+    if (result.status === "waiting-human") {
+      const review = prepareBuildHumanIntegrationReview(active.paths, compiled, result.state, {
+        owner: active.leaseOwner,
+        repositoryRoot,
+        git,
+        now: () => new Date().toISOString(),
+      });
+      await interruptRun(
+        ctx,
+        `${formatBuildHumanReview(review)}\n\nIntegrate the selected candidate changes manually and commit the main workspace, then run /lifecycle resume to record trusted evidence. The orchestrator performed no merge, commit, user-worktree checkout, cleanup, push, or publication action.`,
+      );
+      return;
+    }
+    if (result.status !== "completed") {
+      await interruptRun(ctx, `BUILD paused because the durable coordinator is blocked: ${result.reason ?? "unknown reason"}.`);
+      return;
+    }
+    const observed = result.state.guard.observedCostUsd;
+    const inputTokens = result.state.guard.inputTokens;
+    const outputTokens = result.state.guard.outputTokens;
+    active.lastUsage = {
+      inputTokens: typeof inputTokens === "number" ? inputTokens : 0,
+      outputTokens: typeof outputTokens === "number" ? outputTokens : 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      observedUsd: typeof observed === "number" ? observed : 0,
+    };
+    await recordBuildEvidenceFingerprint(ctx);
+    if (!runtime || runtime !== active || !ownsRun(active.state.runId, "building")) return;
+    persistRoutingStageOutcome("build", { structuredToolCompliance: true, verdict: "unknown" });
+    await transition({ type: "build_produced" }, "BUILD DAG completed; entering VERIFY", ctx);
+    await continueOrPause(ctx, "test");
+  }
+
+  function formatBuildHumanReview(review: Readonly<BuildHumanIntegrationReview>): string {
+    const candidates = review.candidates.map((candidate) =>
+      `- ${candidate.nodeId}: ${candidate.worktreePath}\n  Changes: ${candidate.changedPaths.join(", ")}\n  Validations: ${candidate.validationArtifactSha256.length} durable artifact(s)`).join("\n");
+    return `BUILD candidate worktrees are validated and preserved. Human integration node ${review.nodeId} is waiting.\n${candidates}`;
+  }
+
+  function ensureImmutableBuildPlanForExecution(planText: string): CompiledBuildPlan {
+    if (!runtime) throw new Error("lifecycle runtime is unavailable");
+    recoverIncompleteBuildPlan(runtime.paths, { owner: runtime.leaseOwner });
+    const latestVersion = latestBuildPlanVersion(runtime.paths);
+    if (latestVersion !== undefined) {
+      const compiled = readImmutableBuildPlan(runtime.paths, latestVersion);
+      const generated = readFileSync(join(runtime.paths.root, "build", "plan-versions", String(latestVersion), "plan.md"), "utf8");
+      if (compiled.plan.id.startsWith("legacy-")) {
+        const migrated = compileLegacySequentialBuildPlan(
+          planText,
+          compiled.plan.planVersion,
+          compiled.plan.nodes[0]?.writeSet ?? [],
+        );
+        if (migrated.hash !== compiled.hash) {
+          throw new Error("Approved prose plan no longer matches its immutable legacy BUILD plan");
+        }
+      } else if (generated !== readFileSync(runtime.paths.plan, "utf8")) {
+        throw new Error("Approved plan Markdown no longer matches its immutable structured BUILD plan");
+      }
+      return compiled;
+    }
+    const protectedTopLevel = new Set([
+      ".git",
+      ".ai-orchestrator",
+      runtime.config.lifecycle.artifactsDir.split(/[\\/]/).filter(Boolean)[0] ?? ".ai-orchestrator",
+      "node_modules",
+      "dist",
+    ]);
+    const writableRoots = readdirSync(runtime.cwd, { withFileTypes: true })
+      .filter((entry) => !entry.isSymbolicLink() && !protectedTopLevel.has(entry.name))
+      .map((entry) => {
+        try {
+          return requireBuildRepositoryPath(entry.name, "legacy BUILD write scope");
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((entry): entry is string => entry !== undefined)
+      .sort();
+    const compiled = compileLegacySequentialBuildPlan(
+      planText,
+      buildPlanVersionForSubmission(runtime.paths),
+      writableRoots,
+    );
+    writeImmutableBuildPlan(runtime.paths, compiled, { owner: runtime.leaseOwner });
+    appendRuntimeJournal(runtime, `Migrated approved prose-only plan to deterministic sequential BUILD v${compiled.plan.planVersion}: ${compiled.hash}`);
+    return compiled;
   }
 
   async function enterRoutedStage(stage: LifecycleRoutedStage, role: RoleName, ctx: ExtensionContext): Promise<boolean> {
@@ -1953,15 +2401,35 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     if (!runtime) return;
     const path = artifact === "spec" ? runtime.paths.spec : runtime.paths.plan;
     const artifactText = readLifecycleArtifactText(path);
-    if (!artifactText?.trim()) {
+    let structuredPlanSubmitted = true;
+    if (artifact === "plan") {
+      const latestVersion = latestBuildPlanVersion(runtime.paths);
+      const expectedVersion = runtime.pendingBuildPlanVersion;
+      const expectedMarkdown = latestVersion === undefined
+        ? undefined
+        : readFileSync(join(runtime.paths.root, "build", "plan-versions", String(latestVersion), "plan.md"), "utf8");
+      structuredPlanSubmitted = latestVersion !== undefined && latestVersion === expectedVersion && expectedMarkdown !== undefined &&
+        existsSync(path) && readFileSync(path, "utf8") === expectedMarkdown;
+    }
+    if (!artifactText?.trim() || !structuredPlanSubmitted) {
       reconcileUnfinishedCurrentEffect();
       if (runtime.state.reminder?.phase !== runtime.state.phase || runtime.state.reminder.kind !== "artifact") {
         runtime.state.reminder = { phase: runtime.state.phase, kind: "artifact", recordedAt: new Date().toISOString() };
         writeRuntimeState();
-        sendPhasePrompt(`Write the required ${artifact} artifact to exactly ${rel(path)} before finishing. Do not perform another stage.`, ctx);
+        sendPhasePrompt(
+          artifact === "plan"
+            ? `Finish PLAN by calling submit_build_plan exactly once with planVersion ${String(runtime.pendingBuildPlanVersion ?? "from the planning input")}. Do not write plan files directly or perform another stage.`
+            : `Write the required ${artifact} artifact to exactly ${rel(path)} before finishing. Do not perform another stage.`,
+          ctx,
+        );
         return;
       }
-      await interruptRun(ctx, `${artifact.toUpperCase()} stopped because ${rel(path)} remained empty after a reminder.`);
+      await interruptRun(
+        ctx,
+        artifact === "plan"
+          ? "PLAN stopped because submit_build_plan remained missing after one reminder."
+          : `${artifact.toUpperCase()} stopped because ${rel(path)} remained empty after a reminder.`,
+      );
       return;
     }
 
@@ -1971,7 +2439,14 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     });
     if (artifact === "plan") {
       const nextPlanFingerprint = convergenceFingerprint(artifactText);
-      if (runtime.state.planFingerprint && runtime.state.planFingerprint !== nextPlanFingerprint) {
+      const latestVersion = latestBuildPlanVersion(runtime.paths);
+      const structuredPlanChanged = latestVersion !== undefined && latestVersion > 1
+        ? buildPlanContentFingerprint(readImmutableBuildPlan(runtime.paths, latestVersion - 1)) !==
+          buildPlanContentFingerprint(readImmutableBuildPlan(runtime.paths, latestVersion))
+        : undefined;
+      const planChanged = structuredPlanChanged ??
+        (runtime.state.planFingerprint !== undefined && runtime.state.planFingerprint !== nextPlanFingerprint);
+      if (planChanged) {
         runtime.state.rejectionFingerprints = [];
         runtime.state.buildEvidenceFingerprints = [];
       }
@@ -2800,14 +3275,15 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
     pi.setActiveTools(unique([...READ_TOOLS, "edit", "write", ...optionalQuestions]));
   }
 
+  function activatePlanningTools(): void {
+    if (!runtime) return;
+    const optionalQuestions = runtime.toolsBeforeRun.filter((name) => name === "ask_user_question" || name === "questionnaire");
+    pi.setActiveTools(unique([...READ_TOOLS, "submit_build_plan", ...optionalQuestions]));
+  }
+
   function activateReadOnlyTools(verdictTool?: string): void {
     if (!runtime) return;
     pi.setActiveTools(unique([...READ_TOOLS, ...(verdictTool ? [verdictTool] : [])]));
-  }
-
-  function restoreBuildTools(): void {
-    if (!runtime) return;
-    pi.setActiveTools(runtime.toolsBeforeRun.filter((tool) => BUILD_TOOL_ALLOWLIST.has(tool)));
   }
 
   function restoreTools(): void {
@@ -2835,7 +3311,13 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   }
 
   function releaseRuntimeLease(): void {
-    if (runtime) releaseRunLease(runtime.paths, runtime.leaseOwner);
+    if (runtime) {
+      try {
+        if (runtime.buildLease) releaseBuildGraphExecution(runtime.paths, runtime.buildLease);
+      } finally {
+        releaseRunLease(runtime.paths, runtime.leaseOwner);
+      }
+    }
   }
 
   function writeRuntimeState(state?: LifecycleState): void {
@@ -2872,18 +3354,6 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
   function latestRejection(): LifecycleStageVerdict {
     const index = latestRejectionIndex();
     return runtime!.state.verdicts[index];
-  }
-
-  function buildFeedback(): string | undefined {
-    if (!runtime) return undefined;
-    const rejection = [...runtime.state.verdicts].reverse().find((verdict) => verdict.verdict === "reject");
-    if (!rejection) return undefined;
-    const diagnosis = readLifecycleArtifactText(runtime.paths.debug)?.trim() || undefined;
-    return [
-      `${rejection.stage.toUpperCase()} rejection: ${rejection.reasons}`,
-      rejection.requiredFixes ? `Required fixes: ${rejection.requiredFixes}` : undefined,
-      diagnosis ? `Independent DEBUG diagnosis:\n${diagnosis}` : undefined,
-    ].filter(Boolean).join("\n\n");
   }
 
   function replanFeedback(): string | undefined {
@@ -3030,6 +3500,9 @@ export default function lifecycleExtension(pi: ExtensionAPI): void {
       requestRef,
       promptSha256: createHash("sha256").update(prompt, "utf8").digest("hex"),
       routingDecisionId: selection.routing.decisionId,
+      ...(runtime.state.phase === "planning" ? {
+        expectedBuildPlanVersion: runtime.pendingBuildPlanVersion,
+      } : {}),
       route: {
         provider: boundedRequestIdentity(selection.provider, "provider"),
         model: boundedRequestIdentity(selection.model, "model"),
