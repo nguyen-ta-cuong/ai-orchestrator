@@ -1,212 +1,377 @@
 # Structured graph architecture
 
-This document is the durable architecture canvas for AI Orchestrator's migration from implicit control flow to explicit, inspectable graphs. It separates shipped runtime behavior from release-gated rollout work so operators do not mistake verifier coverage for production evidence.
+AI Orchestrator uses explicit graphs to make workflow state, BUILD dependencies, retries, side effects, and recovery inspectable. The graph runtime does not move product policy into model prose: pure reducers still decide business transitions, typed contracts validate outputs, and durable storage records what actually happened.
 
-The pure reducers `nextPhase()` in `src/core/loop.ts` and `nextStage()` in `src/core/lifecycle.ts` remain the business-policy authorities for workflow transitions. The Pi extensions adapt those decisions to models, tools, approvals, and disk. The graph contracts, runner, durable scheduler, stateful MCP authority, immutable BUILD-graph execution, and scheduler-anchored DEBUG/BUILD/successor-plan recovery executors have landed. Fresh installs still use `execution.engine: "graph-shadow"`: compiled graph edges check reducer decisions while the reducer result remains active.
+Fresh installs use `execution.engine: "graph-shadow"`. The compiled graph checks each reducer-selected transition while `nextPhase()` and `nextStage()` remain authoritative. Active graph execution is a trusted-user opt-in until representative field evidence and a released compatibility window satisfy the rollout gate.
 
 ## User flow canvas
 
-The product is intentionally hierarchical. A focused task uses the small bounded loop. A durable or risky task uses a lifecycle state graph. An approved BUILD plan contains an immutable directed acyclic graph, or DAG, whose dependency edges allow conflict-free work to become ready concurrently.
+A focused task uses the bounded fast loop. Work that needs a specification, durable resume, independent VERIFY and REVIEW, or a multi-node BUILD uses the lifecycle. The lifecycle PLAN produces an immutable BUILD DAG whose dependency edges determine which nodes are ready.
 
 ```mermaid
 flowchart TB
-    U["User task"] --> R{"Complexity and risk route"}
-    R -->|"small and low risk"| F["Bounded fast loop"]
-    R -->|"durable, risky, or parallel"| D["Durable lifecycle graph"]
-    F --> FP["Plan"] --> FG["Approval gate"] --> FB["Build"] --> FJ["Independent judge"]
+    U["User task"] --> C{"Choose control level"}
+
+    C -->|"Focused"| F["Fast state graph"]
+    F --> FP["PLAN"] --> FA{"Approval"} --> FB["BUILD"] --> FJ["Independent JUDGE"]
     FJ -->|"approve"| FD["Done"]
-    FJ -->|"reject with budget"| FB
-    FJ -->|"replan threshold"| FP
-    D --> DE["DEFINE"] --> DG1["Specification approval"] --> DP["PLAN"] --> DG2["Plan approval"]
-    DG2 --> BDAG["Immutable BUILD DAG vN"] --> DV["VERIFY"] --> DR["REVIEW"] --> DS["SHIP"] --> PUB{"Publication consent"}
-    DV -->|"reject"| DD["DEBUG diagnosis"]
-    DR -->|"reject"| DD
-    DD -->|"L2 local repair"| BDAG
-    DD -->|"L3 structural replan"| NV["Plan DAG vN+1"] --> BDAG
-    PUB -->|"decline"| DONE["Done without publication"]
-    PUB -->|"approve configured action"| FIN["Checkpointed finalization"] --> DONE
+    FJ -->|"repair budget"| FB
+    FJ -->|"re-plan threshold"| FP
+    FJ -->|"cap reached"| FX["Failed"]
+
+    C -->|"Durable, risky, or multi-part"| L["Lifecycle state graph"]
+    L --> LD["DEFINE"] --> LS{"Spec approval"} --> LP["PLAN"] --> LA{"Plan approval"}
+    LA --> BD["Immutable BUILD DAG vN"] --> LV["VERIFY"] --> LR["REVIEW"] --> SH["SHIP"]
+    LV -->|"reject"| DG["Read-only DEBUG"]
+    LR -->|"reject"| DG
+    DG -->|"L1 retry"| LV
+    DG -->|"L2 repair"| BD
+    DG -->|"L3 structural re-plan"| PN["Immutable BUILD DAG vN+1"] --> LA
+    SH -->|"GO"| PG{"Publication / final-action consent"}
+    PG -->|"confirm or decline"| DONE["Done"]
+    SH -->|"NO-GO within budget"| BD
+    DG -->|"safety or budget stop"| LX["Failed or blocked"]
 ```
 
-The recovery controller names its ordered levels L1 bounded retry, L2 local repair, and L3 structural replan. L1 repeats only the failed node within its attempt budget and therefore does not need an outer-lifecycle edge in this canvas. L2 sends typed, read-only DEBUG evidence to BUILD without changing graph topology. L3 creates and validates a new immutable plan version and returns to approval. Budget, authorization, maker/checker-separation, policy, and irreversible-side-effect failures stop or pause outside this ladder; recovery is never a way around a safety gate.
+L1 retries the exact failed action within its frozen budget. L2 keeps the approved topology and sends typed diagnosis evidence to BUILD. L3 reserves a successor plan version, authenticates its artifacts, and returns to approval. Authorization, policy, configuration, uncertain-side-effect, and global-budget failures stop or pause outside the recovery ladder.
 
 ## Runtime architecture canvas
 
-Solid arrows describe the automated flow. The dotted Cursor edge remains a manual adapter. Every box under “Pure core policy” is project-owned even if a third-party graph framework is later used to execute compiled definitions.
-
 ```mermaid
 flowchart LR
-    subgraph Surfaces["Product surfaces"]
-      PI["Pi commands"]
-      MCP["Stateful MCP tools"]
-      CUR["Cursor instructions"]
+    subgraph Surface["Product surfaces"]
+        PI["Pi commands and structured tools"]
+        MCP["Stateful MCP tools"]
+        CUR["Cursor manual adapter"]
     end
-    subgraph Policy["Pure core policy"]
-      GD["Graph definitions"]
-      GC["Graph compiler and validator"]
-      TR["Transition reducers"]
-      RP["Routing and recovery policy"]
-      GUARD["Global execution guard"]
+
+    subgraph Core["Pure core policy"]
+        DEF["Graph definitions"]
+        COMP["Graph compiler and validator"]
+        RED["Transition reducers"]
+        ROUTE["Model routing and recovery policy"]
+        GUARD["Execution guard and budgets"]
     end
-    subgraph Runtime["Execution runtime"]
-      RUN["Graph runner"]
-      READY["Ready-set scheduler"]
-      HANDLERS["Typed node handlers"]
-      VALID["Output-contract validators"]
-      SIDE["Side-effect and resource locks"]
+
+    subgraph Run["Execution runtime"]
+        GR["Graph runner"]
+        READY["Ready-set scheduler"]
+        NODE["Typed node handlers"]
+        VALID["Output-contract validators"]
+        LOCK["Resource and side-effect locks"]
     end
-    subgraph Durable["Durable run state"]
-      GRAPH["graph.json: immutable plan version"]
-      STATE["state.json: authoritative snapshot"]
-      WAL["events.jsonl: append-only transition log"]
-      ART["spec.md, plan.md, debug.md, node artifacts"]
-      ROUTE["routing, budget, and evidence logs"]
+
+    subgraph State["Durable authority"]
+        G["graph.json"]
+        S["state.json"]
+        E["events.jsonl"]
+        A["spec, plan, debug, nodes, mutations"]
+        R["routing and evidence logs"]
     end
-    PI --> RUN
-    MCP --> RUN
-    CUR -. "manual adapter" .-> MCP
-    RUN --> GC --> GD
-    RUN --> TR
-    RUN --> RP
-    RUN --> GUARD
-    RUN --> READY --> HANDLERS --> VALID
-    READY --> SIDE
-    RUN <--> STATE
-    RUN --> WAL
-    RUN --> GRAPH
-    HANDLERS <--> ART
-    RUN --> ROUTE
+
+    PI --> GR
+    MCP --> GR
+    CUR -. "manual host workflow" .-> MCP
+    GR --> COMP --> DEF
+    GR --> RED
+    GR --> ROUTE
+    GR --> GUARD
+    GR --> READY --> NODE --> VALID
+    READY --> LOCK
+    GR <--> S
+    GR --> E
+    GR --> G
+    NODE <--> A
+    GR --> R
 ```
 
-Graph definitions say what may happen, reducers select valid business transitions, and the scheduler says what is ready to run. Typed handlers perform host work; output-contract validators decide whether their structured results are admissible. A global guard checks attempts, time, cost, graph size, no-progress fingerprints, and side-effect limits before another call begins. Resource locks prevent concurrently ready nodes from writing the same declared resource.
+The layers have different jobs:
 
-`state.json` remains the authoritative resumable snapshot. `events.jsonl` is a write-ahead log: a bounded structured event is appended before the corresponding atomic snapshot update so interrupted work can be replayed idempotently. Conversation and session entries remain a display mirror, never lifecycle truth.
+- **Graph definitions** enumerate nodes, edges, guards, contracts, retry budgets, timeouts, and side-effect classes.
+- **Reducers** choose the next valid business transition.
+- **The scheduler** computes readiness and enforces the frozen execution envelope.
+- **Handlers** adapt a typed node to Pi, MCP, Git, filesystem, or human-gate work.
+- **Validators** accept or reject structured outputs before a transition can commit.
+- **Checkpoints** bind effects, outputs, and state changes to an append-only event head.
+
+The core is pure. Filesystem, Pi, MCP, and Git adapters may import it; core modules never import those surfaces.
+
+## Three graph levels
+
+### Workflow state graph
+
+The outer fast and lifecycle graphs describe legal phases and transitions. They make approval, checker, DEBUG, SHIP, cancellation, retry, and terminal edges explicit.
+
+### Immutable BUILD DAG
+
+Lifecycle PLAN submits schema-versioned nodes and dependencies through `submit_build_plan`. Compilation rejects:
+
+- duplicate or missing node and contract references;
+- cycles and unreachable nodes;
+- invalid entry, exit, join, side-effect, or tool policies;
+- unsafe shared writers;
+- isolated writers without declared write sets, validation, and human integration;
+- unbounded retry, timeout, graph-size, or concurrency declarations.
+
+Plan version N is immutable after submission. L2 repair can generate new node outputs but cannot rewrite its topology. L3 creates N+1 and requires separate approval.
+
+### Recovery graph
+
+Recovery authority is derived from durable failure evidence and the exact scheduler event head. One frozen lineage tracks consumed retry, repair, and re-plan budgets across plan versions. A client or model cannot author its own failure category to gain a recovery action.
 
 ## Program dependency canvas
 
+The graph program landed in dependency order. The plan names below are historical implementation slices; local plan files are not package documentation.
+
 ```mermaid
 flowchart LR
-    P10["0010 canvases"] --> P11["0011 graph contracts"] --> P12["0012 Pi graph runtime"] --> P13["0013 durable scheduler"]
+    P10["0010 canvases"] --> P11["0011 graph contracts"] --> P12["0012 Pi graph runtime"]
+    P12 --> P13["0013 durable scheduler"]
     P13 --> P14["0014 stateful MCP runs"]
-    P13 --> P15["0015 BUILD DAG and parallelism"]
+    P13 --> P15["0015 immutable BUILD DAGs"]
     P14 --> P16["0016 versioned recovery"]
     P15 --> P16
-    P16 --> P17["0017 shadow rollout and metrics"]
+    P16 --> P17["0017 shadow rollout and evidence gates"]
 ```
 
-Plans 0011 through 0013 are serial because they establish shared types, execution semantics, and persistence. After 0013, stateful MCP work and BUILD-DAG work have distinct surface ownership and may proceed in separate branch worktrees. Plan 0016 integrates both, and Plan 0017 is the final serial rollout and retirement gate. Plans are local execution records and are deliberately excluded from the npm package; this document is the packaged operator-facing program index.
+The owning plans have landed their schemas and validation contracts. Their implementation added:
 
-## What exists today
+1. graph definitions, compilation, and reducer characterization;
+2. Pi graph adapters;
+3. generation-bound leases, a write-ahead event chain, atomic snapshots, and replay;
+4. durable server-owned MCP runs with optimistic concurrency and request receipts;
+5. immutable BUILD plans, ready-set scheduling, isolated worktrees, and manual integration;
+6. typed retry, repair, successor-plan recovery, and authenticated lineage;
+7. privacy-minimal release evidence, trust-aware execution routing, and a deterministic rollout verifier.
 
-The fast reducer uses these internal states: `idle`, `planning`, `awaiting_approval`, `coding`, `judging`, `replanning`, `done`, and `failed`. Its Pi entry points are `/orchestrate` and `/orchestrate-stop`. `judge_verdict` is the terminating structured checker tool.
-
-The lifecycle reducer uses `idle`, `defining`, `awaiting_spec_approval`, `planning`, `awaiting_plan_approval`, `building`, `verifying`, `reviewing`, `debugging`, `shipping`, `awaiting_ship_approval`, `finalizing`, `done`, and `failed`. Its main entry points are `/lifecycle` and `/lifecycle-stop`; `/lifecycle resume` is the resumable invocation, and `/lifecycle migrate-routing` explicitly adopts current routing policy for an unfinished phase. Standalone stage commands are `/spec`, `/plan`, `/build`, `/test`, `/debug`, `/review`, and `/ship`. Routing evidence is managed with `/lifecycle-routing-report`, `/lifecycle-routing-apply`, and `/lifecycle-routing-rollback`. Structured terminating tools are `submit_build_plan`, `verify_verdict`, `review_verdict`, `debug_diagnosis`, and `ship_decision`.
-
-The MCP server preserves the compatibility/stateless tools `orchestrator_plan`, `orchestrator_judge`, and `orchestrator_models`. The preferred durable tools are `orchestrator_run_start`, `orchestrator_run_get`, `orchestrator_run_advance`, `orchestrator_run_recover`, and `orchestrator_run_cancel`. Their server-owned transition service uses Plan 0013's generation-bound lease, immutable graph checkpoint, append-only event chain, atomic snapshot CAS, and content-addressed output artifacts under a trusted user root partitioned by canonical repository digest. Recovery freezes one scheduler-issued lineage and cap set, anchors every occurrence to the exact WAL head, runs typed read-only DEBUG, and authenticates plan/graph/diagnosis/approval evidence across restart. Repair requires a scoped client BUILD submission; structural recovery creates immutable N+1 graph/plan bytes and pauses for approval before activation. Exact request receipts and historical revisions replay after restart; project mirrors are optional, status-only, and never authoritative.
-
-The current transition topology is:
+## Exact workflow topology
 
 ```mermaid
-flowchart LR
-    I["idle"] --> P["planning"]
-    P --> A["awaiting approval"] --> B["coding / building"]
-    B --> V["judging / verifying"]
-    V -->|"approve"| N["next checker or done"]
-    V -->|"durable rejection"| D["debugging"]
-    D -->|"retry budget"| B
-    D -->|"replan threshold"| P
-    V -->|"cap reached"| F["failed"]
+flowchart TB
+    subgraph Fast["Fast reducer"]
+        FI["idle"] --> FP["planning"] --> FA["awaiting_approval"] --> FC["coding"] --> FJ["judging"]
+        FJ -->|"approve"| FD["done"]
+        FJ -->|"retry"| FC
+        FJ -->|"re-plan"| FR["replanning"] --> FA
+        FJ -->|"cap/provider failure"| FF["failed"]
+    end
+
+    subgraph Lifecycle["Lifecycle reducer"]
+        LI["idle"] --> LD["defining"] --> LSA["awaiting_spec_approval"] --> LP["planning"]
+        LP --> LPA["awaiting_plan_approval"] --> LB["building"] --> LV["verifying"]
+        LV -->|"approve"| LR["reviewing"] -->|"approve"| LS["shipping"]
+        LV -->|"reject"| LG["debugging"]
+        LR -->|"reject"| LG
+        LG -->|"checker retry"| LV
+        LG -->|"local repair"| LB
+        LG -->|"re-plan"| LP
+        LS -->|"GO"| LAA["awaiting_ship_approval"] --> LF["finalizing"] --> LDone["done"]
+        LS -->|"NO-GO"| LB
+        LG -->|"cap"| LFail["failed"]
+    end
 ```
 
-The labels combine the two reducers only to show their shared bounded-loop shape. They do not replace the exact reducer states listed above.
+The exact fast phases are `idle`, `planning`, `awaiting_approval`, `coding`, `judging`, `replanning`, `done`, and `failed`.
 
-## Rollout status and evidence gate
+The exact lifecycle phases are `idle`, `defining`, `awaiting_spec_approval`, `planning`, `awaiting_plan_approval`, `building`, `verifying`, `reviewing`, `debugging`, `shipping`, `awaiting_ship_approval`, `finalizing`, `done`, and `failed`.
 
-The production decision remains `graph-shadow`. Unit, integration, replay, recovery, BUILD-DAG, and adversarial release-store tests prove implementation contracts; they do not prove that graph execution is non-inferior on real work. The repository contains no real G0–G6 corpus result, paid-provider comparison, or released compatibility window, so it does not authorize a default change or legacy-code removal.
+The diagram compresses revision, yolo, cancellation, checker-retry, SHIP-decline, and finalization edges for readability. The compiled definitions and reducers are the executable source.
 
-The rollout policy requires the complete G0 through G6 matrix across eight representative categories with at least ten distinct, manifest-bound, baseline-paired cases in every cell. Reports use observed executions only. Success, contract satisfaction, first-pass checking, latency, token/cost values, retries, later rejection, recovery, redundant work, and receipt-backed useful parallelism must be replayable from closed-schema events. Unknown or incomplete values remain limitations rather than favorable assumptions.
+## Product entry points
 
-`ai-orchestrator graph-rollout-report <release-version>` reads only canonical fixed files under `~/.ai-orchestrator/graph-releases/<release-version>/`, recomputes the aggregate report, and verifies release-bound coverage, package rollback, config migration, and any claimed compatibility chain. It returns no raw events and performs no network or configuration write. A repository cannot nominate the store root.
+### Pi commands
 
-Promotion choices are limited to keeping shadow mode, enabling sequential graph execution, or enabling graph DAG execution while leaving parallel writes opt-in. Retirement additionally requires at least one later released compatibility window and clean rollback evidence. Until then:
+Fast path:
 
-1. keep `execution.engine: "graph-shadow"`;
-2. keep the reducer/legacy compatibility path;
-3. use trusted-user `"engine": "graph"` only for deliberate evaluation;
-4. roll back to `graph-shadow`, or to `legacy` if the shadow check itself must be disabled.
+- `/orchestrate`
+- `/orchestrate-stop`
 
-## Current artifact layout
+Lifecycle and routing:
 
-By default, one durable run lives under `.ai-orchestrator/runs/<run-id>/`:
+- `/lifecycle`
+- `/lifecycle-stop`
+- `/lifecycle-models`
+- `/lifecycle-routing-report`
+- `/lifecycle-routing-apply`
+- `/lifecycle-routing-rollback`
+- `/spec`
+- `/plan`
+- `/build`
+- `/test`
+- `/debug`
+- `/review`
+- `/ship`
+
+### Pi terminating tools
+
+- `judge_verdict`
+- `submit_build_plan`
+- `verify_verdict`
+- `review_verdict`
+- `debug_diagnosis`
+- `ship_decision`
+
+These tools end their phase with schema-validated output. Verdicts are never parsed from free-form prose.
+
+### MCP tools
+
+Preferred durable protocol:
+
+- `orchestrator_run_start`
+- `orchestrator_run_get`
+- `orchestrator_run_advance`
+- `orchestrator_run_recover`
+- `orchestrator_run_cancel`
+
+Read-only routing preview and compatibility protocol:
+
+- `orchestrator_models`
+- `orchestrator_plan`
+- `orchestrator_judge`
+
+The durable service owns current node, revision, plan version, counters, permitted client events, checker route, provider-attempt receipts, budgets, recovery lineage, and terminal state. Clients submit observations; they do not choose transitions.
+
+## Lifecycle artifact layout
+
+One default run is stored beneath `.ai-orchestrator/runs/<run-id>/`:
 
 ```text
 .ai-orchestrator/
-├── active-run.json        repository/worktree coordination record
-├── current.lock           short-lived coordination lock
+├── active-run.json
+├── current.lock
 └── runs/
-    ├── current            active run-id pointer
+    ├── current
     └── <run-id>/
-        ├── spec.md        DEFINE output
-        ├── plan.md        approved PLAN output
-        ├── debug.md       latest read-only DEBUG diagnosis
-        ├── state.json     authoritative atomic lifecycle snapshot
-        ├── journal.md     append-only human-readable transition journal
-        ├── routing.jsonl  bounded structured routing decisions
-        ├── evidence.jsonl privacy-minimized run evidence
-        ├── graph.json     compiled outer lifecycle graph
-        ├── events.jsonl  structured write-ahead transition events
-        ├── nodes/         immutable node-result artifacts
-        ├── mutations/     immutable side-effect request/result artifacts
-        └── execution.lock active executor lease
-```
-
-`src/lifecycle/artifacts.ts` owns this layout, path containment, symlink rejection, atomic state replacement, the active-run pointer, and execution leases. The run directory is excluded from Git. Source work is never automatically stashed, reset, cleaned, checked out, or reverted.
-
-An execution lease is a generation-bound handle, not merely an owner label. Every WAL append compares the complete expected log head and revalidates that exact lease generation immediately before writing. Model, write, external, and irreversible effects must bind intent and result events to the same immutable mutation checkpoint; if dispatch may have happened but completion is uncertain, the durable outcome is `unknown` and automatic replay stops for reconciliation.
-
-Replay revalidates the bytes behind completion references, successful result receipts, activation evidence, and mutation checkpoints before accepting an event prefix. Plan 0013 fails closed on missing, corrupt, substituted, or truncated evidence and never truncates history automatically. Coordinated operator recovery to a last-known-valid prefix must update the WAL, scheduler snapshot, lifecycle envelope, and referenced evidence as one reviewed operation; that recovery protocol remains an explicit Plan 0016 dependency.
-
-## Versioned BUILD and recovery layout
-
-Plans 0014 through 0016 extend the current layout without silently rewriting historical evidence:
-
-```text
-.ai-orchestrator/runs/<run-id>/
-├── graph.json                  immutable compiled outer graph
-├── state.json                  authoritative graph snapshot, schema v2+
-├── events.jsonl                structured write-ahead transition events
-├── spec.md
-├── plan.md                     current approved human-readable plan
-├── debug.md
-├── routing.jsonl
-├── evidence.jsonl
-├── journal.md
-├── nodes/                      outputs addressed by plan version and node id
-├── mutations/                  side-effect requests and result receipts by content hash
-└── plan-versions/
-    └── <N>/
-        ├── graph.json          immutable BUILD DAG for version N
+        ├── spec.md
         ├── plan.md
-        ├── approval.json
-        └── lineage.json        predecessor and replan reason
+        ├── debug.md
+        ├── state.json
+        ├── journal.md
+        ├── routing.jsonl
+        ├── evidence.jsonl
+        ├── graph.json
+        ├── events.jsonl
+        ├── execution.lock
+        ├── nodes/
+        ├── mutations/
+        └── build/
+            ├── plan-reservations/
+            ├── plan-versions/
+            │   └── <N>/
+            │       ├── plan.graph.json
+            │       ├── plan.md
+            │       └── manifest.json
+            └── execution/
+                └── plan-versions/
 ```
 
-The owning plans have landed their schemas and validation contracts. Version N is frozen after approval. Repair may produce new node outputs but cannot edit its topology; structural replan creates version N+1. A stale output from one version cannot satisfy another version's declared contract.
+The names `spec.md`, `plan.md`, `debug.md`, `state.json`, `journal.md`, `routing.jsonl`, `evidence.jsonl`, `graph.json`, `events.jsonl`, `nodes`, `mutations`, and `execution.lock` are part of the current disk-adapter contract.
+
+`state.json` is the authoritative atomic snapshot. `events.jsonl` is a bounded append-only write-ahead chain. `graph.json` is the compiled outer workflow definition. `nodes/` and `mutations/` store content-addressed output and side-effect evidence. The generated top-level `plan.md` mirrors the active immutable plan version for readers.
+
+`src/lifecycle/artifacts.ts` owns containment, symlink rejection, atomic replacement, current-run coordination, and lease operations. The working tree is never automatically stashed, reset, cleaned, checked out, or reverted.
+
+## Checkpoint and replay semantics
+
+A checkpoint lease contains an owner and generation. Every append verifies:
+
+- the exact expected event head;
+- the same live lease generation immediately before write;
+- canonical bounded event bytes;
+- referenced graph, output, and mutation digests;
+- monotonic scheduler state and frozen execution limits.
+
+Effects use intent/result pairs. Model, write, external, and irreversible effects bind the intent to an immutable request artifact. A successful result references immutable output bytes. If dispatch may have occurred but the result is uncertain, the durable status becomes unknown and automatic replay stops.
+
+Replay does not silently truncate corrupt history. Missing, changed, reordered, substituted, or truncated authority requires reviewed operator recovery.
+
+## BUILD scheduling and worktrees
+
+The ready set contains nodes whose dependencies, contracts, and guards are satisfied. Resource locks and declared write sets decide whether ready nodes may run together.
+
+- Read-only nodes may fan out within global and model concurrency limits.
+- Shared writers remain sequential.
+- Isolated writers require worktree ownership, verified disjoint write sets, and explicit user approval.
+- Each isolated branch uses a deterministic contained `codex/build/...` identity.
+- The runtime never merges, commits, cleans, pushes, or publishes a candidate.
+- A final human-integration node records what the user actually integrated and validates the main workspace afterward.
+
+Worktree isolation prevents file collisions. It does not replace human review or make integration safe by itself.
+
+## Stateful MCP authority
+
+MCP run authority lives under the trusted user store, partitioned by a digest of the canonical repository path. The optional project mirror is status-only.
+
+Every mutation has:
+
+- an opaque server run ID;
+- an exact expected revision;
+- a client idempotency key;
+- a closed-schema client event;
+- a durable request receipt;
+- an atomic next snapshot.
+
+The same request ID and body replays the original response after restart. A changed body under the same key is rejected. A stale revision returns a conflict and the current state.
+
+Provider output is written content-addressed before a successful transition becomes visible. Recovery anchors to the scheduler event head that closed the failure, so a restart cannot swap in different evidence or reset the consumed recovery budget.
+
+## Execution and routing remain separate
+
+Graph execution decides how a valid transition runs. Capability routing decides which eligible model may perform a stage.
+
+| Layer | Compatibility | Shadow | Active |
+| --- | --- | --- | --- |
+| Model routing | `legacy` | `capability-shadow` | `capability` |
+| Graph execution | `legacy` | `graph-shadow` | `graph` |
+
+A routing score cannot grant a tool, skip approval, expand an execution limit, or authorize publication. A graph edge cannot make an untrusted model eligible.
+
+## Rollout status
+
+The current decision is **keep `graph-shadow`**.
+
+The repository has unit, integration, replay, recovery, BUILD-DAG, security-boundary, and adversarial release-store tests. Those tests prove implementation contracts. They do not prove that active graph execution is non-inferior on representative real work.
+
+Promotion requires a complete manifest-bound G0–G6 matrix across eight task categories with at least ten distinct paired cases in every cell. Reports replay observed stage events, accepted checker order, contracts, costs, tokens, retries, recovery, and receipt-backed concurrency. Unknown and incomplete evidence stays negative or unknown; it is never assumed favorable.
+
+`ai-orchestrator graph-rollout-report <release-version>` reads canonical files beneath `~/.ai-orchestrator/graph-releases/<release-version>/`, recomputes the report, and verifies coverage, rollback, migration, and any claimed later compatibility releases. It accepts no caller-selected root, returns no raw events, performs no network call, and changes no configuration.
+
+Valid rollout outcomes are:
+
+1. keep `graph-shadow`;
+2. enable sequential `graph`;
+3. enable graph DAG execution while keeping parallel writes opt-in.
+
+Legacy retirement additionally requires at least one later released compatibility window and clean package/config rollback evidence. Neither condition exists in this repository today.
+
+## Invariants
+
+- The repository remembers; the model does not.
+- `nextPhase()` and `nextStage()` remain business-policy authorities during shadow rollout.
+- A maker cannot approve its own output.
+- DEFINE writes only its specification artifact.
+- PLAN submits only its immutable BUILD plan.
+- BUILD is the only source-mutating lifecycle phase.
+- VERIFY, REVIEW, DEBUG, and SHIP are read-only.
+- Structured tools terminate checker and decision phases.
+- Every loop and recovery edge consumes a finite budget.
+- Durable state changes are atomic and replayable.
+- Publication requires user authority; SHIP never pushes.
 
 ## Glossary
 
-- **Node:** one named unit of work with declared inputs, outputs, tools, model policy, timeout, retry budget, and side-effect class.
-- **Edge:** a permitted state transition or a BUILD data dependency between two nodes.
-- **Conditional route:** an edge selected by a deterministic code guard from validated state or typed output, never from unparsed model prose.
-- **Ready set:** nodes whose dependencies and guards are satisfied. State-machine graphs normally have one ready node; a BUILD DAG may have several.
-- **Plan version:** one immutable approved plan and compiled graph definition. Structural recovery creates a successor version instead of mutating the current version.
-- **Recovery level:** one ordered response to failure: L1 bounded retry, L2 typed local repair through read-only DEBUG and BUILD, or L3 approved structural replan. Safety stops are not recovery levels.
-- **Output contract:** the schema and validation rules a node result must satisfy before any outgoing edge can be selected.
-- **Side-effect class:** a declaration of what a node may change, such as read-only inspection, artifact-only writing, source mutation, or an externally visible action that requires a gate.
-- **Snapshot:** the complete authoritative state needed to resume a run at a durable boundary; today this is `state.json`.
-- **Write-ahead log:** an append-only sequence of structured transition events written before snapshot advancement so replay can recover an interrupted update; the run file is `events.jsonl`.
+- **Node:** one typed unit of work with declared contracts, tools, timeout, retry budget, and side-effect class.
+- **Edge:** a permitted state transition or BUILD dependency.
+- **Ready set:** nodes whose dependencies and guards are satisfied.
+- **Plan version:** one immutable compiled BUILD graph plus human-readable plan and manifest.
+- **Output contract:** validation required before a node result can satisfy a dependency.
+- **Side-effect class:** `none`, read, write, external, or irreversible authority.
+- **Snapshot:** the complete durable state needed to resume; lifecycle uses `state.json`.
+- **Write-ahead log:** events appended before snapshot advancement; lifecycle uses `events.jsonl`.
+- **Recovery lineage:** immutable authority tying one failure and its consumed retry/repair/re-plan budgets across plan versions.
 
-## Invariants across the migration
+## Related documents
 
-The repository, not a model conversation, remembers run state. A model that edits code does not approve its own work. DEFINE and PLAN may write only their declared artifacts; VERIFY, REVIEW, DEBUG, and SHIP are read-only; BUILD alone may edit source. Structured verdict tools end checker turns. Every cycle consumes a monotonic budget. Human approval and publication consent remain explicit, and SHIP never pushes.
-
-Graph libraries may be execution adapters, but they are not policy authorities. In particular, adopting LangGraph would not move graph schemas, transition guards, model separation, side-effect permissions, recovery selection, termination limits, or durable state ownership out of this repository's pure core and adapters.
+- [User guide](user-guide.md)
+- [Configuration reference](configuration.md)
+- [Capability-aware routing](adaptive-capability-model-routing-prd.md)

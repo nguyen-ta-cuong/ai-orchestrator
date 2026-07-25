@@ -1,445 +1,354 @@
-# Adaptive capability-aware model routing
+# Capability-aware model routing
 
-Status: Proposed
+**Status:** Shipped; active routing is opt-in
 
-Date: 2026-07-11
+**Fresh-install default:** `routing.engine: "capability-shadow"`
 
-Owner: ai-orchestrator maintainers
+**Decision authority:** Deterministic local policy, not an extra model call
 
-## Executive summary
+AI Orchestrator chooses models by what a stage requires and what the active surface can prove—not by treating a hardcoded model name as universally best.
 
-ai-orchestrator currently says it selects models from the user's local Pi registry, but it only filters a built-in list of four exact model IDs. The fast `/orchestrate` path is even stricter: planner, coder, and judge are fixed roles whose defaults name Claude Fable 5 and GPT-5.5. A user can have many suitable authenticated models and still receive “no locally configured model” unless they manually rewrite every route.
+The router discovers or loads callable models, applies hard policy, ranks eligible candidates, enforces maker/checker separation, selects a supported thinking level, and returns an ordered fallback list with a complete explanation. Pi can activate the selected local model. MCP can call models from a trusted user catalog. Cursor’s instructions-only workflow can show recommendations but cannot switch the host model.
 
-This PRD replaces model-name-first routing with capability-aware routing. The system will discover models the user can actually call, normalize objective metadata, combine it with explicit capability profiles and user policy, enforce maker/checker separation, and rank candidates for the work a stage must perform. Exact model pins remain supported as overrides and fallbacks, but built-in model IDs stop being the product's definition of “best.”
+## Why this exists
 
-The routing decision remains deterministic, inspectable, and offline. The first release does not spend an extra model call to choose a model. Later releases may classify task features with a model, but the final candidate set and ranking remain constrained by validated local facts and policy. Every decision is journaled with eligible candidates, exclusions, scores, selected reasoning effort, fallback attempts, and policy version.
+Exact global model lists fail in predictable ways:
 
-## Problem statement
+- a user may have capable authenticated models under different providers or aliases;
+- new models otherwise require a package release before they can participate;
+- fixed BUILD selection prevents a team from choosing its preferred coding model;
+- a fixed judge may accidentally match the maker;
+- model names do not prove context capacity, input support, privacy, price, or stage ability;
+- fallback and exclusion decisions become impossible to explain.
 
-The built-in configuration in `src/core/config.ts` defaults planner, judge, specification, verifier, reviewer, debugger, and shipper roles to `anthropic/claude-fable-5` at `xhigh`. BUILD defaults to `openai-codex/gpt-5.5` at `xhigh`. Lifecycle routing recognizes only Fable plus the Sol, Terra, and Luna GPT-5.6 variants. `src/core/lifecycleRouting.ts` filters those exact names through `ModelRegistry.getAvailable()` and preserves their configured order. `extensions/lifecycle.ts` bypasses routing for BUILD, while `extensions/orchestrator.ts` resolves every fast-path role by exact provider and model.
+Capability routing keeps exact pins, but turns them into explicit user policy rather than the definition of suitability.
 
-On the development machine used for this PRD, `pi --list-models` reports authenticated access to many Anthropic, OpenAI Codex, and OpenRouter models. Pi exposes useful objective metadata for each model: provider, API type, reasoning support, accepted input types, context window, maximum output tokens, and cost rates. The current router discards all of that metadata except provider and ID.
+## Decision flow
 
-This creates five product failures:
+```mermaid
+flowchart LR
+    A["Callable surface catalog"] --> N["Normalize model facts"]
+    P["Profiles and user/project policy"] --> E["Hard eligibility"]
+    T["Stage requirements and task features"] --> E
+    N --> E
+    B["Latest BUILD identity"] --> E
+    E -->|"excluded"| X["Typed exclusion reasons"]
+    E -->|"eligible"| S["Deterministic score"]
+    S --> O["Ordered candidates"]
+    O --> C["Select supported thinking"]
+    C --> F["Try bounded fallbacks"]
+    F --> D["Decision, evidence, and explanation"]
+```
 
-1. Availability is local, but suitability is hardcoded globally.
-2. New or aliased models cannot participate until this package ships a code change.
-3. BUILD cannot use a user-preferred coding model without replacing the fixed coder role.
-4. Planner and checker independence is accidental. A fixed default can place the same model family on both sides of the loop.
-5. The journal records the selected model but cannot explain why other available models were excluded or how cost, context, risk, and task type affected selection.
-
-## Research synthesis
-
-Addy Osmani's [Loop Engineering](https://addyosmani.com/blog/loop-engineering/) identifies automation, worktrees, skills, connectors, sub-agents, and durable external state as the practical pieces of a loop. Its strongest architectural constraint for this project is to keep the maker away from the checker and to treat repository state, not conversation memory, as authoritative. It also warns that unattended verification, token cost, comprehension debt, and cognitive surrender become more important as automation improves.
-
-LangChain's [The Art of Loop Engineering](https://www.langchain.com/blog/the-art-of-loop-engineering) describes four nested loops: the agent loop, verification loop, event-driven loop, and hill-climbing improvement loop. The immediate routing change belongs inside the agent and verification loops. Selection traces and outcomes should deliberately prepare for a later hill-climbing loop, but automatic mutation of production routing policy is not part of the first release. Human-reviewed policy promotion is the safe boundary.
-
-The [cobusgreyling/loop-engineering](https://github.com/cobusgreyling/loop-engineering) reference implementation adds operational practices that are directly useful here: readiness levels, report-only rollout before autonomous action, token budgets, append-only run logs, circuit breakers, attempt caps, explicit handoff, and failure catalogs. In particular, “verifier theater,” infinite fix loops, token burn, state rot, and over-reach must be visible routing outcomes rather than only prompt concerns.
-
-The combined implication is that model routing is not a one-time “best model” lookup. It is a policy loop: discover what is available, match it to a stage and task, enforce independence and safety constraints, observe outcomes, and improve the policy through reviewed evidence.
-
-## Goals
-
-After implementation, users can:
-
-- run `/orchestrate` and `/lifecycle` without having the package's preferred model IDs installed;
-- allow the orchestrator to choose among their authenticated models using transparent stage and task requirements;
-- pin, prefer, deny, or profile models without changing source code;
-- choose quality, balanced, economy, or custom routing policy;
-- preserve strict maker/checker separation even when both candidates come from one provider;
-- understand every choice and fallback from UI and durable run artifacts;
-- compare routing quality, cost, latency, and convergence across runs before accepting policy changes;
-- keep MCP credentials and provider endpoints outside repository-controlled configuration.
-
-## Non-goals
-
-The first delivery does not benchmark every model on the public internet, call an LLM solely to choose another LLM, train or fine-tune models, automatically rewrite routing policy, automatically purchase access to a provider, or claim that model names alone prove competence. It does not make SHIP push automatically, relax human publication gates, or allow checkers to edit source files. It does not require OpenRouter; direct Pi providers remain first-class.
-
-## Users and primary workflows
-
-The primary user is a developer with several models configured in Pi who wants reliable stage selection without maintaining exact route arrays. A team maintainer wants project-wide constraints such as allowed providers, minimum context, cost ceilings, and mandatory checker diversity. An advanced operator wants to pin selected stages, add capability profiles for custom models, inspect routing traces, and compare candidate performance. MCP and Cursor users need equivalent policy semantics even though the MCP server cannot inspect Pi's local registry.
-
-The critical workflow is:
-
-    local model registry + user/project policy + stage requirements + task features + run history
-                                      |
-                                      v
-                  hard eligibility -> deterministic scoring -> ordered fallbacks
-                                      |
-                                      v
-                      selected model + explanation + durable trace
-
-## Product principles
-
-The repository remembers; the model does not. Routing inputs, policy version, decisions, fallbacks, and outcomes live in run artifacts.
-
-The maker never grades itself. A checker must differ from the BUILD model according to configured separation rules. Provider-family diversity is preferred and can be required.
-
-Hard facts precede opinions. Authentication, context capacity, tool support, reasoning support, and cost come from the active adapter or explicit configuration. Subjective capabilities such as architecture, coding, debugging, or adversarial review come from versioned profiles and measured local evidence, never from an unvalidated substring alone.
-
-Hard constraints precede scoring. A cheap model that cannot satisfy context, tool, privacy, or separation requirements is ineligible rather than merely penalized.
-
-The router is explainable. Given the same normalized inputs and policy, pure core code returns the same ordered candidates and reasons.
-
-Learning is gated. Runtime evidence may recommend score changes, but a human approves changes to default or project policy.
-
-## Architectural approaches considered
-
-### Exact ordered model lists
-
-This is the current lifecycle design. It is simple and deterministic, but it ages immediately, ignores almost all registry metadata, duplicates configuration across stages, and fails users whose available models have different names or providers. Keep exact lists only as explicit pins and emergency fallback chains.
-
-### Name-based heuristics
-
-This approach infers that strings containing `coder`, `pro`, `opus`, or `mini` indicate capabilities. It works for prototypes but is unsafe as the primary design because naming conventions are provider-specific, aliases drift, and custom models may be mislabeled. Conservative family rules may seed profiles, but every inferred attribute must identify its source and be overridable.
-
-### LLM-as-router
-
-A small model could read the task and select a model. This handles nuanced task descriptions but adds latency and cost, can invent unavailable IDs, is difficult to reproduce, and creates a circular bootstrap problem. It is acceptable later as an optional task-feature classifier whose output is validated against a closed schema. It is not acceptable as the authority for eligibility or final choice.
-
-### External gateway router
-
-OpenRouter and similar gateways can optimize provider availability, cost, throughput, and latency after a model or model set is chosen. That is useful transport routing but does not replace lifecycle role routing. The orchestrator must still decide whether a stage needs architecture, code editing, adversarial review, or diagnosis. Gateway routing may operate beneath this policy when the chosen Pi model represents a gateway model.
-
-### Chosen approach: deterministic policy plus profiles plus evidence
-
-The selected design normalizes adapter metadata, overlays explicit capability profiles, applies stage requirements and task features, filters on hard constraints, then produces an ordered score with a full explanation. Static pins override automatic ranking. Local outcome evidence can contribute a bounded adjustment after enough samples, but it cannot override safety or separation constraints. This approach is portable, testable, and evolvable without pretending that objective registry metadata alone measures model quality.
-
-## Capability model
-
-### Objective model facts
-
-Each adapter normalizes the facts it can prove into a `DiscoveredModel`:
-
-    provider and model ID
-    display name and API family
-    authenticated or otherwise callable
-    reasoning support and supported thinking levels
-    text and image input support
-    context window and maximum output tokens
-    input, output, cache-read, and cache-write cost rates when known
-    provider-auth kind when safely available, such as subscription or API key
-
-No secret, endpoint credential, or raw authentication material enters core routing or run artifacts.
-
-### Subjective capability profile
-
-A `ModelCapabilityProfile` assigns normalized scores from 0 through 100 for:
-
-- `requirements`: turning ambiguity into testable specifications;
-- `architecture`: repository comprehension, decomposition, and trade-off reasoning;
-- `coding`: correct multi-file source edits and test implementation;
-- `debugging`: causal diagnosis from failures, logs, and code;
-- `verification`: deterministic acceptance-criteria checking and test interpretation;
-- `review`: adversarial correctness, security, performance, and maintainability review;
-- `release`: risk synthesis, rollback planning, and ship/no-ship judgment;
-- `structuredOutput`: reliable use of terminating typed tools;
-- `longContext`: effective use of large repository and artifact context;
-- `speed` and `economy`: relative operational preferences, not quality claims.
-
-Profiles also contain confidence, provenance, version, and optional family identity. Provenance is one of `user`, `project`, `builtin`, `observed`, or `inferred`. User and project values override built-in values. Observed adjustments require a minimum sample count and are bounded. Inferred profiles receive low confidence and cannot satisfy a stage's `minimumProfileConfidence` unless policy explicitly allows it.
-
-### Stage requirements
-
-DEFINE emphasizes requirements, long-context exploration, ambiguity detection, and structured artifact production. PLAN emphasizes architecture, dependency ordering, repository comprehension, and validation design. BUILD requires coding, tool use, sufficient context, and mutation permission. VERIFY emphasizes test execution, acceptance-criterion traceability, and structured verdict reliability. DEBUG emphasizes causal reasoning over logs, failures, code, and previous verdicts while remaining read-only. REVIEW emphasizes adversarial comparison of PRD, approved plan, diff, architecture, security, and performance. SHIP emphasizes evidence synthesis, release risk, rollback planning, and structured decision output.
-
-The fast-path planner maps to PLAN, coder maps to BUILD, and judge maps to a combined VERIFY/REVIEW requirement set. This lets both product surfaces share one core policy without changing their state machines.
-
-### Task features
-
-The router derives a closed set of task features from explicit stage inputs and inexpensive deterministic evidence:
-
-- artifact size and estimated context demand;
-- number and types of touched files;
-- languages and frameworks already detected in the repository;
-- work kind: feature, bug fix, refactor, migration, test-only, documentation, configuration, release, or unknown;
-- risk signals: authentication, authorization, secrets, payments, persistence, concurrency, infrastructure, dependency changes, or public API changes;
-- failure signals: compile error, test assertion, crash, timeout, race, performance regression, flaky test, or checker-only design rejection;
-- multimodal requirement when image input is actually present.
-
-Deterministic classification may return `unknown`; unknown is a valid conservative state. A later optional classifier may fill this schema, but it may not create new feature names or model candidates.
-
-## Stage and feature suitability
-
-The following mapping expresses what the system should optimize, not a permanent ranking of brands.
-
-| Stage | Work features that matter most | Strong candidate characteristics | Required separation |
-| --- | --- | --- | --- |
-| DEFINE / planner | ambiguous product request, large repository, cross-cutting requirements | requirements, architecture, long context, clarification discipline | may match PLAN; must not implement |
-| PLAN | multi-file feature, migration, public contract, complex dependency order | architecture, repository comprehension, precise validation | must not implement |
-| BUILD / coder | source edits, refactors, tests, migrations, framework-specific work | coding, tool use, context fit, reliable test iteration | cannot approve its own output |
-| VERIFY / judge | acceptance criteria, deterministic tests, regression proof | verification, structured output, evidence discipline | must differ from BUILD identity; prefer different family |
-| DEBUG | failing tests, compiler errors, runtime crashes, races, performance symptoms | debugging, causal reasoning, code/log comprehension | read-only and different from BUILD identity |
-| REVIEW | compare PRD and plan to diff; security, architecture, performance | review, architecture, long context, adversarial stance | must differ from BUILD; provider-family diversity preferred |
-| SHIP | release evidence, residual risk, rollback | release, review, structured output | read-only; publication remains human-gated |
-
-## Provisional mapping for the current local registry
-
-The local registry provides objective metadata but not trusted quality benchmarks. Therefore these are seed mappings to validate, not immutable claims.
-
-- `anthropic/claude-fable-5` is a reasonable DEFINE/PLAN and large-diff REVIEW seed because Pi reports a one-million-token context window and 128K maximum output. Its actual quality scores must come from a built-in profile with documented provenance and later local evaluation.
-- Direct Anthropic Opus, Sonnet, and Fable models are alternate architect, debugger, reviewer, and shipper candidates when profiled. Smaller Haiku models are natural economy candidates for triage or low-risk verification, not automatic choices for complex approval.
-- `openai-codex/gpt-5.5` is a reasonable BUILD seed because it is already the product's configured coding model on a coding-agent provider. It must become a preference, not a hard architectural rule.
-- `openai-codex/gpt-5.6-sol`, `terra`, and `luna` are eligible only through explicit profiles or evaluated family rules. Their names alone do not establish which one is premium, balanced, or economical.
-- OpenRouter exposes many viable families and aliases. It should participate when the user's policy permits gateway models, cost metadata is known, and the profile confidence is sufficient. `openrouter/auto` may be an explicit user choice but is not a transparent default because it hides the resolved model unless the adapter records it.
-- When BUILD uses an OpenAI-family model, the default checker preference should favor an eligible non-OpenAI family. When BUILD uses Anthropic, the inverse applies. If no diverse checker exists, policy decides whether to allow same-family/different-model fallback or fail closed.
-
-For an initial shadow evaluation on this machine, retain `anthropic/claude-fable-5` as the DEFINE/PLAN seed and `openai-codex/gpt-5.5` as the BUILD seed. Compare the direct Claude Fable, Opus, and Sonnet families as independent VERIFY/DEBUG/REVIEW candidates for an OpenAI BUILD. Compare the GPT-5.6 Codex family as independent checker candidates for an Anthropic BUILD. Do not encode a permanent ordering among Opus, Sonnet, Fable, Sol, Terra, or Luna until repository-specific evaluations support it. This gives the project a safe baseline and a genuine cross-family experiment without turning unverified model branding into architecture.
-
-## Routing policy
-
-### Modes
-
-`quality` maximizes stage capability and evidence confidence within hard cost ceilings. `balanced` trades modest quality score for lower estimated cost and latency. `economy` selects the least expensive candidate above stage minimums. `pinned` uses only explicit stage pins. `custom` accepts project-defined weights.
-
-Default mode is `balanced` for interactive runs and remains configurable. High-risk REVIEW and SHIP apply a quality floor even in economy mode.
-
-### Eligibility
-
-A model is eligible only when it is callable on the active surface; accepts all required input types; supports required structured tools through that surface; has enough context and output capacity; satisfies provider allow/deny, privacy, and cost rules; has sufficient profile confidence; and satisfies maker/checker separation. BUILD also requires mutation-capable agent tools, but that is a stage environment constraint rather than a model property.
-
-### Scoring
-
-For each eligible model, pure core policy computes:
-
-    capability fit
-    + task-feature fit
-    + profile-confidence bonus
-    + bounded observed-evidence adjustment
-    + provider-diversity bonus
-    - estimated cost penalty
-    - latency penalty when available
-    - fallback/recent-failure penalty
-
-Scores are integer basis points to avoid floating-point drift. Tie breakers are explicit pin order, higher confidence, lower estimated cost, provider/model lexical order. Every component is present in the explanation.
-
-### Thinking level
-
-Thinking level is selected independently from model identity. Stage policy defines a target range, the adapter reports supported levels, and budget policy clamps the choice. DEFINE/PLAN/DEBUG/REVIEW normally prefer high reasoning; simple BUILD and VERIFY work may use medium or high; high-risk work may require `xhigh` or `max` only when the model and budget support it. Unsupported levels are clamped and journaled, never silently assumed.
-
-### Fallback
-
-The router returns an ordered candidate list. The adapter attempts each candidate and records model-not-found, authentication, rate-limit, provider, or unsupported-feature failure categories without persisting secrets. A fallback never relaxes hard safety constraints. If no eligible model remains, the run pauses with a report of constraints and remediation choices. It does not quietly use an arbitrary model.
-
-## Proposed configuration
-
-Existing `roles.*` exact configs remain compatible as pins/fallbacks during migration. New configuration is additive:
-
-    {
-      "routing": {
-        "mode": "balanced",
-        "allowInferredProfiles": false,
-        "separation": {
-          "checkerMustDifferFromBuilder": true,
-          "preferDifferentProviderFamily": true,
-          "requireDifferentProviderFamilyFor": ["review", "ship"]
-        },
-        "limits": {
-          "maxEstimatedUsdPerRun": 8,
-          "maxAttemptsPerStage": 3
-        },
-        "stages": {
-          "build": {
-            "prefer": ["openai-codex/gpt-5.5"],
-            "minimumScores": { "coding": 75, "structuredOutput": 60 }
-          },
-          "review": {
-            "minimumScores": { "review": 80, "architecture": 70 }
-          }
-        },
-        "profiles": {
-          "my-provider/my-model": {
-            "family": "my-model-family",
-            "confidence": 90,
-            "scores": { "coding": 85, "debugging": 80, "review": 65 }
-          }
-        }
-      }
-    }
-
-Repository configuration may set model policy and profiles but must not define trusted provider endpoints or credentials. User config wins for explicit deny rules and spending ceilings so an untrusted repository cannot loosen them. Project config may tighten user safety policy but cannot broaden it.
-
-## Core interfaces
-
-`src/core/modelRouting.ts` will own pure shared types and selection. The target interfaces are:
-
-    export interface DiscoveredModel {
-      provider: string;
-      model: string;
-      family?: string;
-      api?: string;
-      callable: boolean;
-      reasoning: boolean;
-      supportedThinking: ThinkingLevel[];
-      input: Array<"text" | "image">;
-      contextWindow: number;
-      maxOutputTokens: number;
-      cost?: ModelCost;
-    }
-
-    export interface RoutingRequest {
-      stage: RoutingStage;
-      task: TaskFeatures;
-      models: readonly DiscoveredModel[];
-      profiles: Readonly<Record<string, ModelCapabilityProfile>>;
-      policy: RoutingPolicy;
-      priorSelections: readonly ModelSelectionIdentity[];
-      evidence?: RoutingEvidenceSnapshot;
-    }
-
-    export interface RankedModelCandidate {
-      identity: ModelSelectionIdentity;
-      thinking: ThinkingLevel;
-      score: number;
-      scoreBreakdown: ScoreComponent[];
-      profile: ResolvedProfileSummary;
-    }
-
-    export interface RoutingDecision {
-      stage: RoutingStage;
-      policyVersion: string;
-      eligible: RankedModelCandidate[];
-      excluded: ExcludedCandidate[];
-      taskFeatures: TaskFeatures;
-    }
-
-`rankModels(request)` is pure. Adapter modules normalize Pi or MCP data and perform model switching. Core must never read credentials, call providers, inspect Pi registries, or write artifacts.
-
-## Durable state and explainability
-
-Each model selection record expands to include routing mode, policy version, profile version/provenance, task features, eligible rank, score breakdown, exclusions summary, selected thinking level, attempted candidates, and fallback reason. Large candidate lists may live in `routing.jsonl` while `state.json` retains the active selection summary. `journal.md` keeps a concise human-readable line.
-
-The UI shows stage, selected model, why it won, estimated per-turn price band when known, and separation status. A `/lifecycle models` or equivalent read-only command shows ranked and excluded candidates without starting paid model work. A dry-run command must make routing testable before users trust automation.
-
-## Evaluation and hill-climbing loop
-
-Every completed stage emits a local trace containing model identity, profile/policy version, token and cost observations when available, duration, verdict, fallback count, BUILD iteration, rejection category, and final run outcome. It must not record prompts containing secrets or full source by default.
-
-Evaluation metrics include plan approval/revision rate, first-pass verification rate, false approval discovered later, rejection usefulness, debug-to-fix convergence, total BUILD passes, total cost, time to accepted result, structured-tool compliance, and human override rate. Because a checker verdict is not ground truth, the evidence model weights downstream outcomes more strongly than self-reported approval.
-
-The first hill-climbing release produces recommendations only. It may say that a profile is underperforming for a stage or that a cheaper candidate meets the same quality floor. Applying a change requires explicit user review, writes a versioned policy update, and supports rollback. No unattended loop edits its own production scoring weights.
-
-## Cost, limits, and circuit breakers
-
-Routing must estimate cost from prompt-size bands and Pi cost metadata when available. Unknown cost is a policy state, not zero. User-level daily and per-run ceilings override project settings. The loop stops or asks before crossing a ceiling. It exits early when no work is present, caps fallbacks and BUILD attempts, and avoids re-running full planning after transient provider errors.
-
-Circuit breakers include three failed model switches in one stage, repeated identical checker rejection without changed evidence, no improvement after configured BUILD passes, cost ceiling reached, unavailable required independent checker, corrupt routing state, and policy/profile version mismatch on resume. Every breaker creates an actionable handoff in durable state.
-
-## Security and trust boundaries
-
-Project files are untrusted input. They cannot add provider credentials, redirect endpoints, weaken user deny rules, raise user cost ceilings, or disable mandatory separation set by the user. Profile strings and model metadata are data, not prompt instructions. Routing explanations redact secrets and endpoint headers. Read-only stages retain the existing edit/write and reviewed-bash guards regardless of model selection.
-
-A model selected through an opaque gateway must expose the resolved model identity when possible. If it cannot, strict separation treats its family as unknown and policy determines whether it is eligible. Publication, commit, and PR behavior remains separately gated; routing never grants action authority.
+The same normalized input and policy produce the same ordered result. No LLM is called merely to choose another LLM.
 
 ## Surface behavior
 
-Pi uses `ctx.modelRegistry.getAvailable()` and normalizes the full `Model` metadata. It may use `isUsingOAuth()` only to categorize cost/auth policy without persisting tokens. Pi remains the source of truth for local callability.
+| Surface | Callable-model source | What routing can do |
+| --- | --- | --- |
+| Pi | `ctx.modelRegistry.getAvailable()` | Rank locally callable models, switch stage model/thinking, persist run evidence |
+| MCP | Trusted user `mcp.providers` and `mcp.models` | Preview and call server-side planner/checker candidates |
+| Cursor with MCP | Cursor picker plus MCP | User chooses Cursor maker; MCP independently routes its planner/checker |
+| Cursor without MCP | User-observed picker | Instructions recommend and record manual handoffs |
 
-The MCP server cannot read Pi's registry. It receives a configured MCP model catalog built from trusted user configuration and provider capabilities. Exact planner/judge roles remain valid through migration. Repository config cannot redirect MCP credentials.
+Pi ignores `mcp.*` because Pi owns credentials and callability. MCP cannot inspect Pi’s registry, Cursor’s picker, or repository files. Cursor supplies the maker identity as a declaration; the server can enforce its policy against that value but cannot attest which host model Cursor actually ran.
 
-Cursor's Markdown-only fallback cannot switch models programmatically. It should render the same ranked recommendation and ask the user to switch when needed. It must preserve maker/checker separation in instructions and artifacts.
+## Routing engines
 
-## Migration and compatibility
+| Engine | Active behavior | Preview |
+| --- | --- | --- |
+| `legacy` | Exact role and lifecycle candidate configuration | Capability ranking remains available |
+| `capability-shadow` | Exact routes remain active | Capability ranking is recorded for comparison |
+| `capability` | Ranked eligible candidates are active | Preview matches active policy |
 
-Phase 1 adds the pure model catalog, profiles, policy, dry-run, and explanations while preserving exact legacy behavior behind `routing.engine: "legacy"`. Existing configurations remain valid.
+Shadow mode is the default because model quality, cost, latency, and availability are local to the user. A package test suite cannot establish the best route for every registry or provider.
 
-Before active Phase 2 starts, complete the paid interactive validation still pending in `plans/0003-loop-engineering-lifecycle.md`. This establishes a trustworthy baseline for comparison and prevents a new router from hiding defects in the recently shipped lifecycle.
+## Inputs
 
-Phase 2 adopts capability routing for lifecycle stages and BUILD. A role pin wins when explicitly configured; otherwise automatic policy ranks local candidates. The fast path migrates planner, coder, and judge to the same core router without changing its Plan -> Code -> Judge state machine. This intentionally changes the current `AGENTS.md` invariant that BUILD is always GPT-5.5. Approval of this PRD authorizes a separately reviewed update to that invariant: BUILD must use a configured or capability-selected implementer, while checker independence remains mandatory. The runtime change and the documentation contract change must land together.
+### Objective model facts
 
-Phase 3 records metrics and provides report-only recommendations. Automatic policy promotion remains out of scope.
+An adapter normalizes only facts it can prove:
 
-Phase 4 brings MCP and Cursor semantics to parity and changes the fresh-install default to capability routing only after shadow-mode comparisons and manual paid-model validation meet acceptance criteria.
+- provider and model identity;
+- optional family and API type;
+- whether it is callable on that surface;
+- reasoning support and supported thinking levels;
+- text/image input support;
+- context window and maximum output;
+- input, output, cache-read, and cache-write prices when known;
+- privacy classification when trusted policy supplies one.
 
-## Functional requirements
+Credentials, request headers, raw authentication state, and secret values never enter core routing or its evidence.
 
-FR1. The router uses only models proven callable by the active adapter.
+### Capability profile
 
-FR2. The router supports every lifecycle stage plus fast planner, coder, and judge mappings.
+Provider metadata cannot prove that a model is good at architecture or review. A versioned `ModelCapabilityProfile` supplies explicit scores for:
 
-FR3. Users can pin, prefer, deny, and profile provider/model identities and families.
+- `requirements`
+- `architecture`
+- `coding`
+- `debugging`
+- `verification`
+- `review`
+- `release`
+- `structuredOutput`
+- `longContext`
+- `speed`
+- `economy`
 
-FR4. User policy can set mode, cost limits, profile confidence, context requirements, and separation strength.
+Scores and confidence use basis points from `0` to `10000`. Profiles record provenance (`user`, `project`, `builtin`, `observed`, or `inferred`), a version, and an optional family.
 
-FR5. BUILD is dynamically selectable and no longer architecturally pinned to GPT-5.5.
+Inferred profiles are disabled by default. When enabled, they remain low confidence and must still satisfy the stage’s minimum confidence and capability floors.
 
-FR6. VERIFY, judge, DEBUG, REVIEW, and SHIP cannot select the exact BUILD model; configured stages can require a different family.
+### Stage requirements
 
-FR7. The decision contains ordered eligible candidates, excluded candidates with reasons, score breakdowns, and selected thinking level.
+| Stage | Primary capability goal | Default thinking |
+| --- | --- | --- |
+| DEFINE | Requirements, ambiguity handling, structured specification | `high` |
+| PLAN | Architecture, decomposition, validation design | `high` |
+| BUILD | Coding, debugging, reliable tool use | `medium` |
+| VERIFY | Acceptance evidence and test interpretation | `medium` |
+| DEBUG | Causal diagnosis | `high` |
+| REVIEW | Adversarial correctness and architecture review | `high` |
+| SHIP | Release risk and rollback synthesis | `high` |
+| Fast judge | Combined verification and review | `high` |
 
-FR8. Adapters record switch failures and try only the ordered eligible list.
+High-risk work raises the requested thinking level when the candidate supports it. Unsupported levels are clamped to a supported level and explained.
 
-FR9. Resume uses the persisted policy/profile version or pauses for explicit migration; it never silently re-routes a completed stage under a new policy.
+### Task features
 
-FR10. A read-only dry-run command explains routing without invoking a paid model.
+Task features use a closed schema:
 
-FR11. Unknown metadata, unknown cost, and unknown profile confidence have explicit conservative behavior.
+- estimated input and output tokens;
+- required input types;
+- low, medium, or high risk;
+- feature, bug fix, refactor, migration, test, documentation, configuration, release, or unknown work;
+- touched-file count and languages;
+- bounded risk and failure signals.
 
-FR12. Runtime evidence and policy recommendations are local, versioned, inspectable, and human-approved.
+Unknown is a valid conservative value. Task text cannot create a provider, capability name, policy field, or tool permission.
 
-## Acceptance criteria
+## Eligibility comes before scoring
 
-1. With Fable and all GPT-5.6 candidates removed from a test registry, lifecycle routing still selects suitable configured models when profiles and hard requirements permit.
-2. With several available models, the same normalized request produces byte-for-byte equivalent ranked identities and score components across repeated runs.
-3. A BUILD selection prevents the exact same model from VERIFY, judge, DEBUG, REVIEW, and SHIP; strict policy also prevents the same family.
-4. A model with the highest capability score is excluded when it violates context, cost, privacy, input, or separation constraints, and the dry-run explains the exclusion.
-5. Explicit pins reproduce legacy fixed-role behavior.
-6. Unsupported thinking levels are clamped with a journal explanation.
-7. Pi fallback tries only eligible candidates and persists failure categories.
-8. Existing lifecycle state-machine, read-only tool, restoration, approval, and publication tests remain green.
-9. Fast `/orchestrate` retains its existing transitions while using shared routing.
-10. MCP ignores project endpoint/key overrides and can use a trusted configured catalog.
-11. A shadow-mode report compares legacy and capability choices without switching models.
-12. Routing evidence can produce a recommendation but cannot mutate active policy without explicit approval.
+A candidate is excluded when any hard rule fails:
 
-## Success metrics
+- not callable on the active surface;
+- provider, model, or family denied;
+- not selected by an active pin;
+- missing or low-confidence profile;
+- capability score below a stage floor;
+- required text/image input unsupported;
+- context or output capacity too small;
+- required reasoning unsupported;
+- cost unknown under an exclude policy;
+- estimated cost over the ceiling;
+- privacy class disallowed;
+- exact identity matches the latest maker;
+- family separation is required but a distinct family cannot be proven.
 
-The primary metric is accepted outcomes per dollar within the same safety level. Supporting metrics are fewer “model unavailable” aborts, lower manual route configuration, first-pass verifier success, fewer total BUILD passes, useful rejection rate, lower fallback rate, lower cost for low-risk work, and zero maker/checker identity violations. Quality metrics take precedence over raw throughput.
+The preview returns a typed exclusion code and a human-readable detail for every excluded candidate.
 
-## Risks and mitigations
+## Scoring
 
-Capability profiles can become stale. Mitigate with versions, provenance, confidence, last-validated date, user overrides, and evaluation reports.
+Eligible candidates receive named components:
 
-Local evidence can reinforce a weak checker that approves everything. Weight downstream failures and human overrides more than raw approval rate, and never let evidence bypass hard constraints.
+```text
+capability fit
++ task-feature fit
++ profile-confidence bonus
++ provider-family diversity
+- estimated-cost penalty
+- unknown-cost penalty
+```
 
-Cost estimates may be wrong or missing. Treat unknown as configurable conservative cost and reconcile with observed usage when available.
+Stage pins and preferences influence deterministic ordering. Tie-breaking is explicit and stable. The selected decision contains:
 
-Zero cost metadata may mean subscription-backed access rather than unlimited free usage. Preserve authentication/cost provenance where the adapter can safely identify it, and apply request or usage limits independently from dollar estimates.
+- policy version;
+- selected provider, model, and family;
+- selected and requested thinking level;
+- total score and component breakdown;
+- eligible and excluded candidates;
+- separation result;
+- estimated cost when known;
+- ordered fallback history;
+- content digests that bind the policy, config, candidates, and decision.
 
-Provider-family identity can be ambiguous through gateways and aliases. Normalize explicit family metadata and fail closed under strict separation.
+## Maker/checker separation
 
-Task classification can overfit. Keep the feature schema small, accept `unknown`, expose explanations, and make model-based classification optional.
+Checker stages are VERIFY, DEBUG, REVIEW, SHIP, and fast judge.
 
-Dynamic routing can make runs less reproducible. Persist the complete decision and policy/profile versions, support pins, and reuse saved selections on resume unless unavailable.
+The exact latest BUILD model is ineligible for those stages when separation is enabled. Policy may also require a different family for selected checker stages. A family is accepted only from trusted model/profile metadata; strict policy does not infer it from a model-name substring.
 
-## Delivery plan map
+If no eligible checker remains, the run stops with remediation choices. It does not silently fall back to the maker.
 
-Implementation is deliberately split into four local ExecPlans under `plans/`, which are not committed:
+## Fallback
 
-1. `plans/0004-capability-routing-foundation.md` introduces normalized discovery, profiles, configuration, pure eligibility/scoring, and dry-run explanations.
-2. `plans/0005-adopt-routing-across-pi-workflows.md` integrates the router into lifecycle and fast Pi paths, including dynamic BUILD and hard maker/checker separation.
-3. `plans/0006-routing-evidence-budgets-and-improvement.md` adds durable traces, cost controls, circuit breakers, shadow comparisons, and human-reviewed recommendations.
-4. `plans/0007-routing-mcp-cursor-rollout.md` brings policy semantics to MCP and Cursor, completes migration, documentation, packaging, and release validation.
+The router returns an ordered list. The adapter tries only eligible candidates and stays inside attempt, selection-failure, paid-fallback, and cost budgets.
 
-Each plan is independently verifiable and keeps the existing state machines authoritative.
+Fallback categories are typed and sanitized, such as:
 
-The plans are not four fully independent parallel projects. Their safe dependency graph is:
+- unavailable or unconfigured model;
+- authentication or provider failure;
+- rate limit or timeout;
+- unsupported API or input;
+- empty, truncated, or invalid structured output.
 
-    Plan 0003 paid baseline ---------+
-                                      +--> Plan 0005 active Pi adoption --> Plan 0006 evidence/budgets --+
-    Plan 0004 routing foundation ----+                                                        |          |
-                                      +--> Plan 0007 MCP/Cursor prototypes --------------------+----------+--> Plan 0007 rollout decision
+A fallback never relaxes privacy, cost, context, capability, pin, or separation requirements. Client abort stops fallback immediately.
 
-Plan 0003's remaining paid baseline and Plan 0004 can run concurrently because one validates existing behavior while the other builds shadow-only pure policy. Plan 0005 must wait for both. After Plan 0005 freezes the active selection and decision schemas, Plan 0006 production work and bounded Plan 0007 MCP/Cursor adapter prototypes may use separate worktrees in parallel. Plan 0007's final integration, migration, documentation, and default-engine decision must wait for Plan 0006 because those surfaces must incorporate the final budget, evidence, and rollback contracts.
+For MCP, an invalid judge JSON response can fall through to the next eligible checker. Provider response bodies, endpoint URLs, credentials, and headers are not exposed in the error history.
 
-Within any parallel wave, each coding agent uses a separate branch worktree. One lane owns each shared file. In particular, `src/core/config.ts`, `src/core/modelRouting.ts`, `src/index.ts`, `extensions/lifecycle.ts`, `src/lifecycle/artifacts.ts`, `README.md`, and `AGENTS.md` must never be edited concurrently by two lanes. Interface-owning changes merge first; dependent lanes rebase and run the full validation contract before integration.
+## Cost policy
 
-## Open product decisions
+Unknown cost is a policy state, never zero. `routing.unknownCost` may exclude, penalize, or allow an unknown-price candidate. Stateful Pi workflows additionally enforce cumulative stage, run, and day ledgers for estimated and observed cost.
 
-Before capability routing becomes the fresh-install default, maintainers must choose the built-in profile distribution mechanism, the minimum evidence sample count for recommendations, the default treatment of unknown OpenRouter cost/profile data, and whether strict different-family review is the default or an opt-in. The plans use conservative defaults: built-in versioned profiles, ten completed stage samples before recommendations, unknown cost treated as non-economy, and different-family preference with exact-model separation required.
+Default routing budgets:
 
-## Sources and repository evidence
+| Budget | Default |
+| --- | ---: |
+| Estimated per stage | 3 USD |
+| Estimated per run | 8 USD |
+| Observed per run | 8 USD |
+| Estimated per day | 24 USD |
+| Observed per day | 24 USD |
+| Paid fallbacks per run | 2 |
 
-External research: [Addy Osmani](https://addyosmani.com/blog/loop-engineering/), [LangChain](https://www.langchain.com/blog/the-art-of-loop-engineering), and [cobusgreyling/loop-engineering](https://github.com/cobusgreyling/loop-engineering).
+When a provider does not report observed usage, evidence records `unknown`. Corrupt ledger state fails closed.
 
-Repository evidence: `src/core/config.ts`, `src/core/lifecycleRouting.ts`, `extensions/lifecycle.ts`, `extensions/orchestrator.ts`, `mcp/llm.ts`, `mcp/server.ts`, `src/core/lifecycle.ts`, `src/core/loop.ts`, and the corresponding files under `test/`.
+## Evidence and reviewed improvement
+
+Lifecycle decisions are written to `routing.jsonl`; bounded run outcomes are written to `evidence.jsonl`. Compatible privacy-minimal evidence may also enter the trusted user evidence store.
+
+Evidence may contain:
+
+- model and family identities;
+- stage, task category, and bounded feature fields;
+- policy/profile versions and decision digests;
+- score, selected thinking, and fallback categories;
+- token/cost values or `unknown`;
+- verdict, BUILD pass, and run outcome.
+
+It excludes prompts, source, diffs, artifact text, credentials, headers, endpoints, repository remotes, and personal paths.
+
+The improvement loop is report-only:
+
+1. `/lifecycle-routing-report` evaluates compatible evidence after the minimum sample count.
+2. `/lifecycle-routing-apply N` shows the exact global user-policy change and asks for confirmation.
+3. Application writes a private transaction record.
+4. `/lifecycle-routing-rollback ID` restores it only if newer policy has not overwritten the same fields.
+
+No unattended process rewrites its own production scoring weights.
+
+## Trust boundaries
+
+Project configuration is repository-controlled input.
+
+On MCP it cannot:
+
+- add providers, endpoints, credentials, or catalog models;
+- select credential-receiving legacy roles;
+- broaden privacy classes or relabel trusted providers;
+- remove trusted deny rules;
+- raise trusted cost, attempt, evidence, or circuit-breaker ceilings;
+- weaken mandatory maker/checker separation.
+
+Project policy may narrow the trusted catalog and lower ceilings. Provider URLs require HTTPS. API keys accept only a literal or exact `$ENV_VAR` reference; configuration is never evaluated as shell.
+
+Routing chooses a model. It does not choose tools, approve a plan, authorize a worktree, expand graph limits, commit, push, or publish.
+
+## Configuration example
+
+```json
+{
+  "routing": {
+    "engine": "capability-shadow",
+    "mode": "balanced",
+    "allowInferredProfiles": false,
+    "unknownCost": "penalize",
+    "privacy": {
+      "allowed": ["local", "private"],
+      "allowUnknown": false,
+      "providers": {
+        "acme": "private"
+      }
+    },
+    "deny": {
+      "providers": [],
+      "models": [],
+      "families": []
+    },
+    "separation": {
+      "checkerMustDifferFromBuilder": true,
+      "preferDifferentProviderFamily": true,
+      "requireDifferentProviderFamilyFor": ["review", "ship"]
+    },
+    "stages": {
+      "build": {
+        "prefer": ["family:team-coder"],
+        "minimumScores": {
+          "coding": 7500
+        },
+        "thinking": "medium"
+      },
+      "review": {
+        "minimumScores": {
+          "review": 8000,
+          "architecture": 7000
+        },
+        "thinking": "high"
+      }
+    }
+  }
+}
+```
+
+See the [configuration reference](configuration.md) for the complete catalog, profile, budget, and migration examples.
+
+## Migration
+
+### Pi
+
+1. Preview each stage with `/lifecycle-models [stage]`.
+2. Add explicit profiles for locally callable candidates.
+3. Review exclusions, thinking, cost, and separation.
+4. Keep `capability-shadow` until the comparison is acceptable.
+5. Set `routing.engine: "capability"` to activate ranking.
+6. Return to `legacy` for exact-route rollback.
+
+An unfinished lifecycle freezes its routing identity. After a policy change, run `/lifecycle migrate-routing` and confirm before resume adopts it.
+
+### MCP
+
+1. Keep working `roles.planner` and `roles.judge` for rollback.
+2. Add trusted user providers, models, and profiles.
+3. Add exact `plan` and `fast-judge` pins when required.
+4. Preview both stages with `orchestrator_models`, including the real Cursor `coderIdentity` for the judge.
+5. Activate `capability`.
+6. Return to `legacy` to restore exact roles.
+
+## Current limitations
+
+- Capability profiles are explicit local claims, not universal benchmark truth.
+- Cursor’s actual host model cannot be attested by MCP.
+- Gateway models may hide the resolved family; strict family separation can therefore exclude them.
+- MCP routing covers its server-side PLAN and fast-judge calls, not Cursor’s coder.
+- Evidence produces recommendations, not automatic policy promotion.
+- The fresh default remains shadow mode because the project does not ship a representative paid-provider quality corpus.
+
+## Source map
+
+- `src/core/modelRouting.ts` — pure eligibility, scoring, thinking, and explanations
+- `src/core/taskFeatures.ts` — deterministic task-feature extraction
+- `src/core/routingBudget.ts` — budget and circuit-breaker policy
+- `src/core/routingEvidence.ts` — privacy-minimal evidence and recommendations
+- `src/adapters/piModelCatalog.ts` — Pi registry normalization
+- `src/adapters/piCapabilityRouting.ts` — Pi routing adapter
+- `mcp/routing.ts` — trusted MCP catalog routing
+- `mcp/routedCompletion.ts` — bounded completion fallback
+- `src/core/config.ts` — precedence, defaults, validation, and trust constraints
+
+## Related documents
+
+- [Setup](setup.md)
+- [User guide](user-guide.md)
+- [Configuration reference](configuration.md)
+- [Structured graph architecture](graph-architecture.md)

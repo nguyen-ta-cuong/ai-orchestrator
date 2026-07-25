@@ -1,32 +1,51 @@
-# AI Orchestrator setup
+# Set up AI Orchestrator
 
-This guide installs AI Orchestrator for Pi, Cursor with MCP, or Cursor without MCP. For day-to-day operation after installation, see the [user guide](user-guide.md).
+Install AI Orchestrator in Pi, Cursor with MCP, or Cursor without MCP. After installation, continue to the [user guide](user-guide.md).
 
 ## Requirements
 
 - Node.js 20 or newer.
-- Ripgrep (`rg`) for bounded nested BUILD-worker search.
-- Pi workflows: Pi installed, with the models you intend to use authenticated in Pi's local registry.
-- Cursor with MCP: trusted provider credentials and at least one trusted planner/checker model.
-- Git is recommended. The lifecycle coordinates one active run per Git worktree and checker prompts use the current diff.
+- Ripgrep (`rg`) for bounded BUILD-worker search.
+- Git, strongly recommended for diff review and lifecycle worktree coordination.
+- Pi workflows: Pi with the models you intend to use authenticated in its local registry.
+- Cursor with MCP: a trusted provider credential and at least one planner/checker model that is independent of the Cursor coder.
 
-Choose one setup:
-
-| Environment | Install command | Credentials |
+| Environment | Install | Credentials |
 | --- | --- | --- |
 | Pi | `pi install npm:@miracle3010/ai-orchestrator` | Managed by Pi |
-| Cursor with MCP | `npx @miracle3010/ai-orchestrator install-cursor` | Trusted user MCP config |
+| Cursor with MCP | `npx @miracle3010/ai-orchestrator install-cursor` | Trusted user config |
 | Cursor without MCP | `npx @miracle3010/ai-orchestrator install-cursor --no-mcp` | None used by AI Orchestrator |
 
-## Install for Pi
+## Pi
 
-Install the published package after reviewing it; Pi packages and their extensions run with full system access:
+Pi packages and extensions run with system access. Review the package before installing it:
 
 ```sh
 pi install npm:@miracle3010/ai-orchestrator
 ```
 
-For a source checkout, install dependencies first and give Pi the absolute package path:
+Restart Pi in the repository where you want to work. Confirm that the package and local model registry are visible without invoking a model:
+
+```text
+/lifecycle-models plan
+```
+
+Then run a small approved task:
+
+```text
+/orchestrate add a focused unit test for the existing parser
+```
+
+Pi uses its own authenticated model registry and ignores `mcp.*`. If no eligible model is shown:
+
+1. Authenticate the intended provider/model in Pi.
+2. Run `/lifecycle-models <stage>` again.
+3. Read the exact exclusion reason.
+4. Add or adjust a profile, pin, preference, privacy rule, cost rule, or stage floor in user/project configuration.
+
+Built-in names are preferences and compatibility defaults, not required models.
+
+### Install a source checkout in Pi
 
 ```sh
 cd /absolute/path/to/ai-orchestrator
@@ -35,15 +54,9 @@ npm run build
 pi install /absolute/path/to/ai-orchestrator
 ```
 
-Start or restart Pi in the repository where you want to work. Pi discovers the packaged `extensions/` and `skills/` directories. Confirm discovery without invoking a model:
+Pi discovers `extensions/` and `skills/` from the package manifest.
 
-```text
-/lifecycle-models plan
-```
-
-Pi uses its own authenticated model registry and ignores all `mcp.*` configuration. If preview reports no eligible model, authenticate or configure the intended model in Pi, then inspect the exclusions shown by `/lifecycle-models <stage>`.
-
-## Install for Cursor
+## Cursor with MCP
 
 Run the installer from the Cursor project:
 
@@ -54,52 +67,40 @@ npx @miracle3010/ai-orchestrator install-cursor
 A fresh install creates:
 
 ```text
-.cursor/rules/ai-orchestrator.mdc
-.cursor/skills/orchestrate/SKILL.md
-.cursor/mcp.json                     only when absent
+.cursor/
+├── mcp.json
+├── rules/
+│   └── ai-orchestrator.mdc
+└── skills/
+    └── orchestrate/
+        └── SKILL.md
 ```
 
-The installer never overwrites customized rule, skill, or MCP files. When `.cursor/mcp.json` already exists, merge the printed server snippet manually. The published `npx` install writes a portable version-pinned MCP command.
+The installer:
 
-To install from a source checkout, build it and run its installer from the target Cursor project:
+- writes only missing files;
+- leaves customized rule, skill, and MCP files untouched;
+- prints an MCP server snippet when `.cursor/mcp.json` already exists;
+- uses a portable version-pinned `npx` server command when invoked from the published package.
 
-```sh
-cd /absolute/path/to/ai-orchestrator
-npm install
-npm run build
+Restart or reload Cursor, enable the `ai-orchestrator` server, and confirm that these eight tools are available:
 
-cd /path/to/your-project
-node /absolute/path/to/ai-orchestrator/bin/ai-orchestrator.js install-cursor
+```text
+orchestrator_models
+orchestrator_run_start
+orchestrator_run_get
+orchestrator_run_advance
+orchestrator_run_recover
+orchestrator_run_cancel
+orchestrator_plan
+orchestrator_judge
 ```
 
-A source-checkout install writes machine-specific absolute paths; do not commit those paths for teammates.
+Prefer `orchestrator_run_*`. Those tools persist server-owned state across MCP restarts. `orchestrator_plan` and `orchestrator_judge` are compatibility tools for clients that still manage their own counters and recovery.
 
-Other installation modes:
+### Configure trusted providers and models
 
-```sh
-# Install under ~/.cursor instead of the current project
-npx @miracle3010/ai-orchestrator install-cursor --global
-
-# Install instructions only; do not create mcp.json
-npx @miracle3010/ai-orchestrator install-cursor --no-mcp
-```
-
-Restart or reload Cursor after installation. For MCP mode, enable the `ai-orchestrator` server and confirm that these tools are available:
-
-- `orchestrator_models`
-- `orchestrator_run_start`
-- `orchestrator_run_get`
-- `orchestrator_run_advance`
-- `orchestrator_run_cancel`
-- `orchestrator_run_recover`
-- `orchestrator_plan`
-- `orchestrator_judge`
-
-Prefer the stateful `orchestrator_run_*` tools. The plan/judge tools remain available for clients that still manage their own compatibility loop.
-
-### Configure trusted MCP providers and models
-
-Secure the trusted user directory and config file **before** adding provider credentials. This creates a private `{}` file only when one does not already exist:
+Create a private user config without replacing an existing file:
 
 ```sh
 mkdir -p ~/.ai-orchestrator
@@ -110,11 +111,15 @@ fi
 chmod 600 ~/.ai-orchestrator/config.json
 ```
 
-Edit `~/.ai-orchestrator/config.json`. Provider endpoints, API keys, model catalogs, profiles, and the active MCP routing engine belong in this trusted user file—not in repository config.
+Provider endpoints, API keys, the MCP model catalog, capability profiles, and the active MCP routing engine belong in this trusted user file:
 
-Durable MCP authority defaults to `~/.ai-orchestrator/mcp-runs/`, partitioned by the canonical repository digest. Configure `mcp.runs.userStoreDir` only in trusted user config. `projectMirror` defaults to `false`; when the user enables it, a repository may disable it but cannot enable or redirect it. The mirror contains status/digests only. `terminalRetentionDays` defaults to 30 and a repository may only shorten it; terminal authority remains inspectable and is not automatically deleted by this release.
+```text
+~/.ai-orchestrator/config.json
+```
 
-The following is a minimal capability-routing shape. Replace the provider URL, API type, model metadata, prices, and capability claims with values verified for your provider:
+Do not put them in `<project>/.ai-orchestrator.json`; the MCP loader ignores project provider and model entries.
+
+This example defines one server-side model. Replace every capability, limit, price, family, URL, and API type with metadata you have verified:
 
 ```json
 {
@@ -164,8 +169,8 @@ The following is a minimal capability-routing shape. Replace the provider URL, A
         "version": "team-eval-v1",
         "scores": {
           "architecture": 9000,
-          "verification": 8000,
-          "review": 8000,
+          "verification": 8500,
+          "review": 8500,
           "structuredOutput": 9000,
           "longContext": 8500
         }
@@ -183,32 +188,84 @@ The following is a minimal capability-routing shape. Replace the provider URL, A
 }
 ```
 
-Set the referenced environment variable in the environment that launches Cursor:
+Expose the key to the process that launches Cursor:
 
 ```sh
 export ACME_API_KEY='replace-me'
 ```
 
-An API key may instead be a literal value, but the user config then contains credentials and must retain private permissions. AI Orchestrator preserves credential-safe permissions when it applies or rolls back trusted-user routing recommendations.
+Supported APIs are:
 
-Supported MCP APIs are `anthropic-messages`, `openai-responses`, and `openai-completions`. Provider URLs must use HTTPS. API-key references must be an exact `$ENV_VAR`; `${VAR}` and shell expressions are rejected.
+- `anthropic-messages`
+- `openai-responses`
+- `openai-completions`
 
-Start with `"engine": "capability-shadow"` if you already have working exact `roles.planner` and `roles.judge` routes and want observational previews before activation. A fresh catalog-only setup should use `"capability"`; shadow mode still calls the exact legacy routes.
+Provider URLs must use HTTPS. An API key may be a literal or an exact `$ENV_VAR` reference. `${VAR}` and shell expressions are rejected.
 
-### Verify MCP routing
+Use `routing.engine: "capability"` for a new catalog-only setup. `capability-shadow` still calls the exact legacy planner/judge roles, so use it only when those routes are already configured and working and you want to compare capability ranking before activation.
+
+See the [configuration reference](configuration.md) for multiple candidates, family separation, budgets, storage, and rollback.
+
+### Verify the MCP path
 
 In Cursor:
 
-1. Call `orchestrator_models` for `stage: "plan"` and confirm the expected eligible candidate and privacy/cost policy.
-2. Call `orchestrator_plan` with a harmless task and repository context.
-3. Record the exact Cursor coding model as canonical `provider/model`.
-4. Call `orchestrator_models` for `stage: "fast-judge"` with that `coderIdentity` and verify independent checking is satisfied.
+1. Call `orchestrator_models` with `stage: "plan"` and a harmless task.
+2. Confirm the eligible candidate, score, privacy, and cost treatment.
+3. Select a coding-capable Cursor model and record its exact `provider/model` identity.
+4. Call `orchestrator_models` with `stage: "fast-judge"` and that `coderIdentity`.
+5. Confirm that maker/checker separation is satisfied.
+6. Start a small run with `orchestrator_run_start`, inspect the returned plan, and approve it only if correct.
 
-The MCP server can route only its server-side planner and checker. It cannot switch Cursor's selected coding model.
+The MCP server routes only its server-side planner and checker. It cannot inspect your repository or switch Cursor’s selected host model.
 
-## Build and validate a source checkout
+### Install a source checkout in Cursor
 
-Run validation serially because the build cleans and regenerates `dist/`:
+Build the package first, then run the installer from the target project:
+
+```sh
+cd /absolute/path/to/ai-orchestrator
+npm install
+npm run build
+
+cd /path/to/your-project
+node /absolute/path/to/ai-orchestrator/bin/ai-orchestrator.js install-cursor
+```
+
+This local install writes machine-specific absolute paths. Do not commit them unchanged for teammates.
+
+## Cursor without MCP
+
+Install only the workflow rule and skill:
+
+```sh
+npx @miracle3010/ai-orchestrator install-cursor --no-mcp
+```
+
+No MCP file is created. The installed instructions require:
+
+1. a written and approved plan;
+2. a recorded coding-model identity;
+3. implementation and tests;
+4. a manually selected independent checker;
+5. bounded retry/re-plan counters;
+6. a fail-closed stop when independent checking cannot be proven.
+
+Markdown cannot switch models or enforce the state machine. You own the handoffs and records.
+
+## Global Cursor installation
+
+Install beneath `~/.cursor/` instead of the current project:
+
+```sh
+npx @miracle3010/ai-orchestrator install-cursor --global
+```
+
+Project-local rules may still change Cursor behavior. Review both scopes.
+
+## Validate a source checkout
+
+Run these commands serially because the build cleans `dist/`:
 
 ```sh
 npm install
@@ -218,9 +275,9 @@ npm run build
 npm pack --dry-run
 ```
 
-Do not run `npm test` concurrently with `npm run build` or `npm pack`; packaged-binary tests may read `dist/` while it is being regenerated.
+Do not run tests concurrently with `npm run build` or `npm pack`.
 
-## Update or remove
+## Update
 
 Update or remove the Pi package, then restart Pi:
 
@@ -229,18 +286,28 @@ pi update npm:@miracle3010/ai-orchestrator
 pi remove npm:@miracle3010/ai-orchestrator
 ```
 
-`pi update` by itself updates Pi, not installed packages. Use `pi update --extensions` to update all unpinned installed packages.
+For Cursor, run the installer again after updating the npm version. Customized files are reported but not overwritten; merge reviewed changes manually.
 
-For Cursor, re-run the installer after an npm version update. Customized files are reported, not overwritten; review and merge new guidance manually. To remove it:
+## Remove
 
-- Delete only the AI Orchestrator server entry and installed rule/skill under project `.cursor/`; preserve unrelated servers, rules, and skills.
-- Remove global installation from `~/.cursor/` with the same care.
-- After all Pi and Cursor installations are removed, delete `~/.ai-orchestrator/config.json` only if no other installation needs its provider credentials or routing policy.
-- Review and remove `~/.ai-orchestrator/<routing.evidence.userStoreDir>/` when its budget, evidence, recommendation records, and possible `events.jsonl.quarantine` history are no longer required. The default directory is `routing-evidence`; also check previously configured locations after a path change.
-- Do not delete `<git-worktree>/.ai-orchestrator/{active-run.json,current.lock}` or `<run-start-cwd>/<lifecycle.artifactsDir>/` for an active lifecycle run unless you intend to abandon its durable state. The artifact directory defaults to `.ai-orchestrator/runs`, but it is relative to the directory where the run started. Remove terminal run artifacts only after retaining any evidence your project requires.
+Remove only the files and entries owned by AI Orchestrator:
 
-## Next steps
+- the `ai-orchestrator` entry in `.cursor/mcp.json`;
+- `.cursor/rules/ai-orchestrator.mdc`;
+- `.cursor/skills/orchestrate/`;
+- the equivalent global files under `~/.cursor/`, if installed.
 
-- Read the [user guide](user-guide.md) for workflows, approvals, resume, routing operations, and publication gates.
-- Read the [README configuration reference](../README.md#configuration-and-trust-boundaries) for all catalog and routing fields.
-- For setup failures, use the [README troubleshooting section](../README.md#troubleshooting).
+Before deleting durable data:
+
+- stop or finish any active lifecycle run;
+- retain run artifacts required by your project;
+- inspect `~/.ai-orchestrator/mcp-runs/`, `routing-evidence/`, and `graph-releases/`;
+- keep `config.json` while any installation needs its credentials or policy.
+
+Never delete an active `.ai-orchestrator/active-run.json`, `current.lock`, or run directory merely to bypass a blocked state. Resolve or explicitly abandon the run.
+
+## Next
+
+- [Run your first workflow](user-guide.md)
+- [Configure routing and execution](configuration.md)
+- [Understand the graph runtime](graph-architecture.md)
