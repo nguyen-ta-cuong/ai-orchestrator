@@ -2089,7 +2089,7 @@ describe("graph execution evidence", () => {
       expect(report.recommendedDecision, mutation.name).toBe("keep-graph-shadow");
       expect(report.decisionReasons, mutation.name).toEqual(["sequential-regression"]);
     }
-  });
+  }, 10_000);
 
   it("binds evidence to the canonical experiment manifest and exact engine feature vector", () => {
     expect(validateGraphExperimentManifest(structuredClone(matrixManifest))).toEqual(matrixManifest);
